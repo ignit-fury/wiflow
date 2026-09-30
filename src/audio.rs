@@ -57,6 +57,14 @@ pub fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
+pub fn i16_to_f32(s: i16) -> f32 {
+    s as f32 / 32768.0
+}
+
+pub fn u16_to_f32(s: u16) -> f32 {
+    (s as f32 - 32768.0) / 32768.0
+}
+
 pub struct AudioCapture {
     stream: cpal::Stream,
     consumer: HeapCons<f32>,
@@ -89,6 +97,7 @@ impl AudioCapture {
             .into_iter()
             .next()
             .ok_or_else(|| AudioError("no supported config".into()))?;
+        let sample_format = cfg.sample_format();
         let min_rate = cfg.min_sample_rate().0;
         let max_rate = cfg.max_sample_rate().0;
         // Clamp to 16kHz: 192kHz devices blew the 70s ringbuf to ~53MB (Phase 1 review).
@@ -100,8 +109,9 @@ impl AudioCapture {
         // blocking the audio thread).
         let (mut producer, consumer): (HeapProd<f32>, HeapCons<f32>) =
             HeapRb::<f32>::new(sample_rate as usize * 70).split();
-        let stream = device
-            .build_input_stream(
+        // NOTE: `producer` is moved into exactly one match arm (only one arm runs).
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
                     for &s in data {
@@ -110,8 +120,30 @@ impl AudioCapture {
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
-            )
-            .map_err(|e| AudioError(e.to_string()))?;
+            ),
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    for &s in data {
+                        let _ = producer.try_push(i16_to_f32(s));
+                    }
+                },
+                |err| warn!("audio stream error: {err}"),
+                None,
+            ),
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    for &s in data {
+                        let _ = producer.try_push(u16_to_f32(s));
+                    }
+                },
+                |err| warn!("audio stream error: {err}"),
+                None,
+            ),
+            fmt => return Err(AudioError(format!("unsupported sample format: {fmt:?}"))),
+        }
+        .map_err(|e| AudioError(e.to_string()))?;
         stream.play().map_err(|e| AudioError(e.to_string()))?;
         info!("capture started @ {sample_rate}Hz");
         Ok(Self {
@@ -163,5 +195,19 @@ mod tests {
     #[test]
     fn test_start_bogus_device_is_err() {
         assert!(AudioCapture::start(Some("no-such-device-xyz".into())).is_err());
+    }
+
+    #[test]
+    fn test_i16_to_f32_endpoints() {
+        assert_eq!(i16_to_f32(0), 0.0);
+        assert!((i16_to_f32(i16::MAX) - 1.0).abs() < 0.001);
+        assert!((i16_to_f32(i16::MIN) + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_u16_to_f32_endpoints() {
+        assert!((u16_to_f32(32768) - 0.0).abs() < 0.001);
+        assert!((u16_to_f32(u16::MAX) - 1.0).abs() < 0.01);
+        assert!((u16_to_f32(u16::MIN) + 1.0).abs() < 0.01);
     }
 }
