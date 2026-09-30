@@ -34,3 +34,10 @@
 
 ## Next Step
 - Phase 1 done. Next: user approves → start task.md Phase 2 (VAD).
+
+## Phase 2 VAD — Complete (2026-09-30)
+- Deps: `webrtc-vad 0.4` added (links C code, no network at runtime); `global-hotkey 0.6` stub dropped until Phase 5; ringbuf split producer/consumer.
+- Wiring: simulate branch resamples to 16k → `Vad::trim_silence` → logs `vad kept X/Y`; empty → "no speech detected"; wav dump now writes trimmed 16k audio.
+- Carried fixes: removed crate-level `#![allow(dead_code)]` (clippy clean without it); `resample_to_16k` zero-rate guard + test → 18/18 tests pass.
+- Live VAD numbers: 2000ms run `kept 31951/31951` rms=0.020; silent 1200ms run `kept 19133/19133` rms=0.002 — VAD keeps near-silent room tone, no "no speech detected" observed; threshold tuning needed before STT.
+- Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 18/18.

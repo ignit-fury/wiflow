@@ -20,22 +20,23 @@
 - [x] Bench: CPU % while recording on M1 — 5% CPU observed
 - [x] Gates green: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 8/8
 
-## Phase 2 — VAD
-- [ ] `vad.rs`: `webrtc-vad` impl, 30ms frames, trim silence + 200ms padding
-- [ ] Unit tests: silence-only → discard; speech+silence → trimmed
-- [ ] Golden wavs in `tests/data/` (not committed if large — document source)
-- [ ] Audio hardening tickets (from 2026-09-30 final review, all in `src/audio.rs` unless noted):
-  - [ ] Pick sample rate clamped to 16kHz instead of range max (`audio.rs:99`) — 192kHz devices blow up ringbuf (~53MB) and break 16kHz contract
-  - [ ] Rename `samples_16k_mono` → `samples_mono` (stores native rate until resample lands) + add `resample_to_16k()`; update `main.rs` field uses
-  - [ ] Format negotiation: handle I16/U16-only devices (`i16→f32`/`u16→f32` conversion) instead of clean Err
-  - [ ] Lock-free capture: `HeapRb::split()` producer/consumer + `try_lock`, remove `Mutex` from realtime callback
-  - [ ] `Instant` instead of `SystemTime` for hold-duration clock (NTP skew)
-  - [ ] `warn!` on lock-poison in `stop()` instead of silent empty default
-  - [ ] Log `dump_wav` IO errors (`src/main.rs`) instead of `let _`
-  - [ ] Fix simulate clock divergence: sleep bound vs `on_key_up(hold)` (`src/main.rs:57 vs 66`)
-  - [ ] `assert!(!devs.is_empty())`, drop `#[allow(clippy::len_zero)]` (`src/audio.rs:160`)
-  - [ ] Extra tests: stray `on_key_up` without down (`Ignored`), backwards time, bogus device name → Err
-  - [ ] Decide `global-hotkey` stub: wire behind feature or drop dep until Phase 5; fix doc drift
+## Phase 2 — VAD (complete 2026-09-30)
+- [x] `vad.rs`: `webrtc-vad` impl, 30ms frames, trim silence + 200ms padding
+- [x] Unit tests: silence-only → discard; speech+silence → trimmed (6 vad tests, 18 total)
+- [x] Golden wavs in `tests/data/` (not committed if large — document source) — deviation: synthetic in-code fixtures instead of binary blobs (deterministic, no blobs in repo)
+- [x] Audio hardening tickets (from 2026-09-30 final review, all in `src/audio.rs` unless noted):
+  - [x] Pick sample rate clamped to 16kHz instead of range max (`audio.rs:99`) — 192kHz devices blow up ringbuf (~53MB) and break 16kHz contract
+  - [x] Rename `samples_16k_mono` → `samples_mono` (stores native rate until resample lands) + add `resample_to_16k()`; update `main.rs` field uses
+  - [x] Format negotiation: handle I16/U16-only devices (`i16→f32`/`u16→f32` conversion) instead of clean Err
+  - [x] Lock-free capture: `HeapRb::split()` producer/consumer + `try_lock`, remove `Mutex` from realtime callback
+  - [x] `Instant` instead of `SystemTime` for hold-duration clock (NTP skew)
+  - [x] `warn!` on lock-poison in `stop()` instead of silent empty default
+  - [x] Log `dump_wav` IO errors (`src/main.rs`) instead of `let _`
+  - [x] Fix simulate clock divergence: sleep bound vs `on_key_up(hold)` (`src/main.rs:57 vs 66`)
+  - [x] `assert!(!devs.is_empty())`, drop `#[allow(clippy::len_zero)]` (`src/audio.rs:160`)
+  - [x] Extra tests: stray `on_key_up` without down (`Ignored`), backwards time, bogus device name → Err
+  - [x] Decide `global-hotkey` stub: wire behind feature or drop dep until Phase 5; fix doc drift — dropped stub dep, rewired stub text to Phase 5
+- VAD live numbers 2026-09-30: speech-intent run (2000ms, quiet room, no speaker) `vad kept 31951/31951` rms=0.020 → would transcribe; silent run (1200ms) `vad kept 19133/19133` rms=0.002 → would transcribe, NO "no speech detected" — VAD keeps near-silence room tone, honest finding, needs threshold tuning before STT lands
 
 ## Phase 3 — Local STT (whisper-rs Metal)
 - [ ] `stt.rs`: model manager (download base.en with progress + SHA), transcribe i16
