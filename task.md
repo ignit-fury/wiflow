@@ -28,18 +28,21 @@
   - [x] Pick sample rate clamped to 16kHz instead of range max (`audio.rs:99`) — 192kHz devices blow up ringbuf (~53MB) and break 16kHz contract
   - [x] Rename `samples_16k_mono` → `samples_mono` (stores native rate until resample lands) + add `resample_to_16k()`; update `main.rs` field uses
   - [x] Format negotiation: handle I16/U16-only devices (`i16→f32`/`u16→f32` conversion) instead of clean Err
-  - [x] Lock-free capture: `HeapRb::split()` producer/consumer + `try_lock`, remove `Mutex` from realtime callback
-  - [x] `Instant` instead of `SystemTime` for hold-duration clock (NTP skew)
-  - [x] `warn!` on lock-poison in `stop()` instead of silent empty default
+  - [x] Lock-free capture: `HeapRb::split()` producer/consumer + `try_push` (no `Mutex` anywhere — stronger than try_lock), remove `Mutex` from realtime callback
+  - [x] `Instant` instead of `SystemTime` for hold-duration clock (NTP skew; backwards-time test N/A under `Instant`)
+  - [x] `warn!` on lock-poison in `stop()` instead of silent empty default — then Mutex eliminated by split, so no poison path remains in final code (outcome correct)
   - [x] Log `dump_wav` IO errors (`src/main.rs`) instead of `let _`
   - [x] Fix simulate clock divergence: sleep bound vs `on_key_up(hold)` (`src/main.rs:57 vs 66`)
   - [x] `assert!(!devs.is_empty())`, drop `#[allow(clippy::len_zero)]` (`src/audio.rs:160`)
-  - [x] Extra tests: stray `on_key_up` without down (`Ignored`), backwards time, bogus device name → Err
+  - [x] Extra tests: stray `on_key_up` without down (`Ignored`), bogus device name → Err (backwards-time N/A under `Instant`)
   - [x] Decide `global-hotkey` stub: wire behind feature or drop dep until Phase 5; fix doc drift — dropped stub dep, rewired stub text to Phase 5
 - VAD live numbers 2026-09-30: speech-intent run (2000ms, quiet room, no speaker) `vad kept 31951/31951` rms=0.020 → would transcribe; silent run (1200ms) `vad kept 19133/19133` rms=0.002 → would transcribe, NO "no speech detected" — VAD keeps near-silence room tone, honest finding, needs threshold tuning before STT lands
 
 ## Phase 3 — Local STT (whisper-rs Metal)
 - [ ] Pre-req (from Phase 2 review 2026-09-30): energy/RMS gate before STT — VAD keeps 100% near-silence room tone (`rms=0.002` → kept all), so silence-only holds must discard before transcribe (skip when `rms < threshold` or kept-energy floor; add low-noise unit fixture + silent-hold live assertion)
+- [ ] Pre-req (from Phase 2 final review): harden VAD 16kHz contract — `trim_silence` rate requirement is doc-comment-only; enforce by signature (pass rate or pipeline helper `resample_to_16k → trim_silence → f32_to_i16 → whisper`) so Phase 3 STT wiring cannot feed wrong rate silently
+- [ ] Pre-req (from Phase 2 final review): ring-full observability — silent drop-newest on `try_push` full; add `AtomicUsize` dropped-counter, `warn!` in `stop()` if >0
+- [ ] Pre-req (from Phase 2 final review): `audio::f32_to_i16` helper (clamp + round, mirror of `i16_to_f32`) with endpoint test, so `stt.rs` consumes `kept` without inline casts
 - [ ] `stt.rs`: model manager (download base.en with progress + SHA), transcribe i16
 - [ ] Feature `metal` on aarch64, CPU fallback documented
 - [ ] WER check on golden files, RTF log, OOM → fallback to base
