@@ -50,6 +50,13 @@
 - [x] Wire transcribe end-to-end (Task 4): `--model` flag, `ensure_model → Stt::load → transcribe` with `model loaded in {n}ms, transcribed in {n}ms (RTF {x})` + `TRANSCRIPT:` stdout; ignored live-model test (`tone transcript: "(dramatic music)"` — sine hallucinates, honest data); live-mic spoken run BLOCKED by hardware (default I/O = AirPods in case → silence; see memory.md); gates green: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26 passed + 1 ignored (27 total)
 
 ## Phase 4 — Inject + History
+- [ ] Pre-reqs (from Phase 3 final review 2026-09-30, all small):
+  - [ ] Lazy `Stt` singleton (`OnceLock`) — 5.7s Metal init per hold dominates shorts
+  - [ ] `dump_wav` should dogfood `audio::f32_to_i16` (currently hand-rolled truncating cast)
+  - [ ] `--model` override should `verify_model`-warn before load; consider SHA256 pin for base.en
+  - [ ] Log `raw N → 16k M → kept K` (current kept/total mixes rates); RTF denominator → kept-audio duration
+  - [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances)
+  - [ ] User-session spoken validation (sandbox mic blocked; TTS substitute only so far)
 - [ ] `inject.rs`: clipboard save → set text → Cmd+V via `enigo` → restore
 - [ ] `history.rs`: last-50 JSON/SQLite, copy/clear
 - [ ] Manual test matrix: VS Code, Safari, Slack, Terminal, password field (clipboard-only)
