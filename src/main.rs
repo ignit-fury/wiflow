@@ -33,7 +33,7 @@ fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::e
     };
     let mut w = hound::WavWriter::create(path, spec)?;
     for &s in samples {
-        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        w.write_sample(crate::audio::f32_to_i16(s))?;
     }
     w.finalize()?;
     Ok(())
@@ -70,7 +70,12 @@ fn main() {
         );
         let mut vad = vad::Vad::new();
         let kept = vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
-        info!("vad kept {}/{} samples", kept.len(), out.samples_mono.len());
+        info!(
+            "vad kept {}/{} raw @ {}Hz",
+            kept.len(),
+            out.samples_mono.len(),
+            out.sample_rate
+        );
         if kept.is_empty() {
             info!("no speech detected");
             return;
@@ -82,7 +87,15 @@ fn main() {
                     kept.len()
                 );
                 let model_path = match &args.model {
-                    Some(p) => p.clone(),
+                    Some(p) => {
+                        if !stt::verify_model(p) {
+                            warn!(
+                                "custom model fails size check, attempting load anyway: {}",
+                                p.display()
+                            );
+                        }
+                        p.clone()
+                    }
                     None => match stt::ensure_model() {
                         Ok(p) => p,
                         Err(e) => {
@@ -104,7 +117,8 @@ fn main() {
                 match stt.transcribe(&kept) {
                     Ok(text) => {
                         let ms = t1.elapsed().as_millis();
-                        let rtf = ms as f64 / duration_ms.max(1) as f64;
+                        let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
+                        let rtf = ms as f64 / kept_ms.max(1.0);
                         info!("model loaded in {load_ms}ms, transcribed in {ms}ms (RTF {rtf:.2})");
                         println!("TRANSCRIPT: {text}");
                     }

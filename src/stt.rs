@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub struct Stt {
@@ -51,6 +52,20 @@ impl Stt {
         }
         Ok(text.trim().to_string())
     }
+}
+
+static STT: OnceLock<Result<Mutex<Stt>, String>> = OnceLock::new();
+
+/// Load once per process: 5.7s Metal init must not repeat per hold.
+/// First call wins — later calls with a different path return the cached instance.
+/// (Stores Result: `get_or_try_init` is nightly-only on this toolchain, so the
+/// stable `get_or_init` caches the Err too — second bad-path call stays Err.)
+// Task 4 wires this into the hold path; allow dead code until then.
+#[allow(dead_code)]
+pub fn shared_stt(model_path: &Path) -> Result<&'static Mutex<Stt>, String> {
+    STT.get_or_init(|| Stt::load(model_path).map(Mutex::new))
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
 pub const MODEL_URL: &str =
@@ -120,6 +135,13 @@ mod tests {
         assert!(verify_model(&p));
         std::fs::remove_file(&p).unwrap();
         assert!(!verify_model(&p));
+    }
+
+    #[test]
+    fn test_shared_stt_bad_path_is_err() {
+        assert!(shared_stt(std::path::Path::new("/nonexistent/ggml.bin")).is_err());
+        // Second call with same bad path: still Err, no panic, no hang.
+        assert!(shared_stt(std::path::Path::new("/nonexistent/ggml.bin")).is_err());
     }
 
     #[test]
