@@ -58,21 +58,21 @@ fn main() {
         let out = cap.stop();
         info!(
             "captured {} samples @ {}Hz device-ms={} rms={:.3}",
-            out.samples_16k_mono.len(),
+            out.samples_mono.len(),
             out.sample_rate,
             out.duration_ms,
-            audio::rms(&out.samples_16k_mono)
+            audio::rms(&out.samples_mono)
         );
-        match ptt.on_key_up(hold) {
+        // Use the MEASURED clock, not the requested hold: sleep bound (3000ms) and
+        // stream-setup latency diverge from `hold` (Phase 1 review).
+        match ptt.on_key_up(out.duration_ms) {
             PttEvent::Transcribe { duration_ms } => {
                 info!("would transcribe {duration_ms}ms");
                 if args.dump_wav {
-                    let _ = dump_wav(
-                        "/tmp/wiflow_hold.wav",
-                        &out.samples_16k_mono,
-                        out.sample_rate,
-                    );
-                    info!("dumped /tmp/wiflow_hold.wav");
+                    match dump_wav("/tmp/wiflow_hold.wav", &out.samples_mono, out.sample_rate) {
+                        Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
+                        Err(e) => warn!("wav dump failed: {e}"),
+                    }
                 }
             }
             e => info!("discarded: {:?}", e),

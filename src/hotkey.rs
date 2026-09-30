@@ -112,4 +112,10 @@ mod tests {
             e => panic!("expected clamped Transcribe, got {:?}", e),
         }
     }
+
+    #[test]
+    fn test_stray_key_up_ignored() {
+        let mut p = PushToTalk::new(300, 60_000);
+        assert!(matches!(p.on_key_up(5000), PttEvent::Ignored));
+    }
 }

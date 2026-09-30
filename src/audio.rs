@@ -19,7 +19,9 @@ impl std::error::Error for AudioError {}
 
 #[derive(Debug)]
 pub struct CapturedAudio {
-    pub samples_16k_mono: Vec<f32>,
+    /// Mono samples at NATIVE device rate (see `sample_rate`).
+    /// Resampling to 16kHz happens in `vad::resample_to_16k`, not here.
+    pub samples_mono: Vec<f32>,
     pub sample_rate: u32,
     pub duration_ms: u64,
 }
@@ -59,16 +61,8 @@ pub fn rms(samples: &[f32]) -> f32 {
 pub struct AudioCapture {
     stream: cpal::Stream,
     ring: Arc<Mutex<HeapRb<f32>>>,
-    started_ms: u64,
+    started: std::time::Instant,
     sample_rate: u32,
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 impl AudioCapture {
@@ -96,7 +90,10 @@ impl AudioCapture {
             .into_iter()
             .next()
             .ok_or_else(|| AudioError("no supported config".into()))?;
-        let sample_rate = cfg.max_sample_rate().0.max(cfg.min_sample_rate().0);
+        let min_rate = cfg.min_sample_rate().0;
+        let max_rate = cfg.max_sample_rate().0;
+        // Clamp to 16kHz: 192kHz devices blew the 70s ringbuf to ~53MB (Phase 1 review).
+        let sample_rate = 16_000.clamp(min_rate, max_rate);
         let config = cfg.with_sample_rate(cpal::SampleRate(sample_rate)).config();
         let ring = Arc::new(Mutex::new(HeapRb::<f32>::new(sample_rate as usize * 70)));
         let ring_clone = ring.clone();
@@ -119,21 +116,23 @@ impl AudioCapture {
         Ok(Self {
             stream,
             ring,
-            started_ms: now_ms(),
+            started: std::time::Instant::now(),
             sample_rate,
         })
     }
 
     pub fn stop(self) -> CapturedAudio {
         drop(self.stream);
-        let samples: Vec<f32> = self
-            .ring
-            .lock()
-            .map(|rb| rb.iter().copied().collect())
-            .unwrap_or_default();
-        let duration_ms = now_ms().saturating_sub(self.started_ms);
+        let samples: Vec<f32> = match self.ring.lock() {
+            Ok(rb) => rb.iter().copied().collect(),
+            Err(e) => {
+                warn!("audio ring lock poisoned, returning empty capture: {e}");
+                Vec::new()
+            }
+        };
+        let duration_ms = self.started.elapsed().as_millis() as u64;
         CapturedAudio {
-            samples_16k_mono: samples,
+            samples_mono: samples,
             sample_rate: self.sample_rate,
             duration_ms,
         }
@@ -157,13 +156,17 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::len_zero)]
     fn test_list_devices_returns_vec() {
         let devs = list_devices();
         assert!(
-            devs.len() >= 1,
+            !devs.is_empty(),
             "expected at least default device, got {:?}",
             devs
         );
+    }
+
+    #[test]
+    fn test_start_bogus_device_is_err() {
+        assert!(AudioCapture::start(Some("no-such-device-xyz".into())).is_err());
     }
 }
