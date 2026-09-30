@@ -39,6 +39,7 @@
 - VAD live numbers 2026-09-30: speech-intent run (2000ms, quiet room, no speaker) `vad kept 31951/31951` rms=0.020 → would transcribe; silent run (1200ms) `vad kept 19133/19133` rms=0.002 → would transcribe, NO "no speech detected" — VAD keeps near-silence room tone, honest finding, needs threshold tuning before STT lands
 
 ## Phase 3 — Local STT (whisper-rs Metal)
+- [ ] Pre-req (from Phase 2 review 2026-09-30): energy/RMS gate before STT — VAD keeps 100% near-silence room tone (`rms=0.002` → kept all), so silence-only holds must discard before transcribe (skip when `rms < threshold` or kept-energy floor; add low-noise unit fixture + silent-hold live assertion)
 - [ ] `stt.rs`: model manager (download base.en with progress + SHA), transcribe i16
 - [ ] Feature `metal` on aarch64, CPU fallback documented
 - [ ] WER check on golden files, RTF log, OOM → fallback to base
