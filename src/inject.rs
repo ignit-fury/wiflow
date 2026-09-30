@@ -23,9 +23,21 @@ pub fn inject_text(text: &str) -> Result<InjectReport, String> {
     let saved = cb.get_text().unwrap_or_default();
     cb.set_text(text)
         .map_err(|e| format!("clipboard set: {e:?}"))?;
-    let mut en = Enigo::new(&Settings::default()).map_err(|e| enigo_err("enigo init", e))?;
-    en.key(Key::Meta, Direction::Press)
-        .map_err(|e| enigo_err("meta press", e))?;
+    // Restore guarantee: every early-Err after the set point restores `saved`
+    // before returning, so the caller fallback (`leave_on_clipboard`) never
+    // destroys evidence of the pre-paste clipboard. Untestable headless —
+    // enigo needs a GUI session (existing round-trip test covers happy path).
+    let mut en = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = cb.set_text(saved);
+            return Err(enigo_err("enigo init", e));
+        }
+    };
+    if let Err(e) = en.key(Key::Meta, Direction::Press) {
+        let _ = cb.set_text(saved);
+        return Err(enigo_err("meta press", e));
+    }
     let paste = en.key(Key::Unicode('v'), Direction::Click);
     let _ = en.key(Key::Meta, Direction::Release);
     paste.map_err(|e| enigo_err("paste key", e))?;
