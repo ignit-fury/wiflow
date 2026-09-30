@@ -1,9 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{
-    traits::{Consumer, RingBuffer},
-    HeapRb,
+    traits::{Consumer, Producer, Split},
+    HeapCons, HeapProd, HeapRb,
 };
-use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 // Phase 1: AudioCapture/rms consumed by Task 4 wiring.
@@ -60,7 +59,7 @@ pub fn rms(samples: &[f32]) -> f32 {
 
 pub struct AudioCapture {
     stream: cpal::Stream,
-    ring: Arc<Mutex<HeapRb<f32>>>,
+    consumer: HeapCons<f32>,
     started: std::time::Instant,
     sample_rate: u32,
 }
@@ -95,16 +94,18 @@ impl AudioCapture {
         // Clamp to 16kHz: 192kHz devices blew the 70s ringbuf to ~53MB (Phase 1 review).
         let sample_rate = 16_000.clamp(min_rate, max_rate);
         let config = cfg.with_sample_rate(cpal::SampleRate(sample_rate)).config();
-        let ring = Arc::new(Mutex::new(HeapRb::<f32>::new(sample_rate as usize * 70)));
-        let ring_clone = ring.clone();
+        // Split halves: producer owns the write side, so the realtime callback
+        // never locks. Capacity 70s exceeds the 60s PTT auto-stop, therefore
+        // drop-newest on full is unreachable in practice (and preferable to
+        // blocking the audio thread).
+        let (mut producer, consumer): (HeapProd<f32>, HeapCons<f32>) =
+            HeapRb::<f32>::new(sample_rate as usize * 70).split();
         let stream = device
             .build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    if let Ok(mut rb) = ring_clone.lock() {
-                        for &s in data {
-                            let _ = rb.push_overwrite(s);
-                        }
+                    for &s in data {
+                        let _ = producer.try_push(s);
                     }
                 },
                 |err| warn!("audio stream error: {err}"),
@@ -115,21 +116,15 @@ impl AudioCapture {
         info!("capture started @ {sample_rate}Hz");
         Ok(Self {
             stream,
-            ring,
+            consumer,
             started: std::time::Instant::now(),
             sample_rate,
         })
     }
 
-    pub fn stop(self) -> CapturedAudio {
+    pub fn stop(mut self) -> CapturedAudio {
         drop(self.stream);
-        let samples: Vec<f32> = match self.ring.lock() {
-            Ok(rb) => rb.iter().copied().collect(),
-            Err(e) => {
-                warn!("audio ring lock poisoned, returning empty capture: {e}");
-                Vec::new()
-            }
-        };
+        let samples: Vec<f32> = self.consumer.pop_iter().collect();
         let duration_ms = self.started.elapsed().as_millis() as u64;
         CapturedAudio {
             samples_mono: samples,
