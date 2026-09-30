@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod daemon;
 mod history;
 mod hotkey;
 mod inject;

@@ -4,13 +4,8 @@ pub enum PttEvent {
     Started,
     IgnoredRepeat,
     Ignored,
-    Transcribe {
-        duration_ms: u64,
-    },
-    DiscardedShort {
-        duration_ms: u64,
-    },
-    #[allow(dead_code)]
+    Transcribe { duration_ms: u64 },
+    DiscardedShort { duration_ms: u64 },
     Cancelled,
 }
 
@@ -57,7 +52,6 @@ impl PushToTalk {
         }
     }
 
-    #[allow(dead_code)]
     pub fn on_cancel(&mut self) -> PttEvent {
         if self.down_at.take().is_some() {
             PttEvent::Cancelled
