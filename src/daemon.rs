@@ -201,12 +201,9 @@ fn pipeline_on_worker(
     }) {
         tracing::warn!("history push failed: {e}");
     }
-    if let Err(e) = crate::inject::inject_text(&text) {
-        tracing::warn!("inject failed ({e}) — text left on clipboard, press Cmd+V");
-        crate::inject::leave_on_clipboard(&text);
-        let _ = proxy.send_event(DaemonEvent::Failed(format!("injected to clipboard: {e}")));
-        return;
-    }
+    // Inject MUST run on the MAIN thread (user_event Done handler): enigo's
+    // HIToolbox keycode mapping is main-queue-only — dispatch_assert_queue
+    // traps (EXC_BREAKPOINT) on background threads (crash report 2026-09-30).
     let _ = proxy.send_event(DaemonEvent::Done {
         text,
         duration_ms,

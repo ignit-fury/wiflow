@@ -173,6 +173,7 @@ fn main() {
             }
             e => info!("discarded: {:?}", e),
         }
+        stt::shutdown();
         return;
     }
     println!(

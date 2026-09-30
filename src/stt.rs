@@ -72,6 +72,21 @@ pub fn transcribe_shared(model_path: &Path, samples: &[f32]) -> Result<String, S
         .transcribe(samples)
 }
 
+/// Drop the cached WhisperContext before process exit: whisper.cpp's C++
+/// static device destructor (`ggml_metal_device_free` → `ggml_metal_rsets_free`)
+/// aborts (SIGABRT) when the residency set still holds entries from a leaked
+/// context (crash report 2026-09-30, repro: load via static + exit without drop).
+/// No-op when nothing was loaded. Call before every normal exit path.
+pub fn shutdown() {
+    if let Some(slot) = STT.get() {
+        let mut guard = match slot.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *guard = None;
+    }
+}
+
 pub const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 /// Verified 2026-09-30 via HEAD (HTTP 200, content-length).

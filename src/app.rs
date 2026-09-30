@@ -403,6 +403,7 @@ impl DaemonApp {
         }
         if *id == ids.quit {
             tracing::info!("quit via menu");
+            crate::stt::shutdown();
             std::process::exit(0);
         }
         if let Some((dev, _)) = ids.mic_items.iter().find(|(_, mid)| mid == id) {
@@ -474,6 +475,28 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     tracing::debug!("cycle done, no text (discard/silence)");
                 } else {
                     tracing::info!("dictated {duration_ms}ms (RTF {rtf:.2}): {text:?}");
+                    // Main-thread-only: enigo HIToolbox TIS calls trap off-main
+                    // (crash report 2026-09-30). The 200ms restore sleep inside
+                    // inject_text briefly blocks this thread — accepted for v1.
+                    match crate::inject::inject_text(&text) {
+                        Ok(r) => tracing::info!(
+                            "injected via {} (clipboard restored: {})",
+                            r.pasted_via,
+                            r.clipboard_restored
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "inject failed ({e}) — text left on clipboard, press Cmd+V"
+                            );
+                            crate::inject::leave_on_clipboard(&text);
+                            self.set_state(
+                                AppState::Error,
+                                Some(format!("injected to clipboard: {e}")),
+                            );
+                            self.sync_tray();
+                            return;
+                        }
+                    }
                 }
                 self.set_state(AppState::Idle, None);
                 self.sync_tray();
