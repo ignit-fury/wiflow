@@ -3,6 +3,10 @@ use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapCons, HeapProd, HeapRb,
 };
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tracing::{info, warn};
 
 // Phase 1: AudioCapture/rms consumed by Task 4 wiring.
@@ -65,11 +69,18 @@ pub fn u16_to_f32(s: u16) -> f32 {
     (s as f32 - 32768.0) / 32768.0
 }
 
+// Task 1 pre-req — wired in Task 4; allow dead_code until then.
+#[allow(dead_code)]
+pub fn f32_to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
 pub struct AudioCapture {
     stream: cpal::Stream,
     consumer: HeapCons<f32>,
     started: std::time::Instant,
     sample_rate: u32,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl AudioCapture {
@@ -107,6 +118,8 @@ impl AudioCapture {
         // never locks. Capacity 70s exceeds the 60s PTT auto-stop, therefore
         // drop-newest on full is unreachable in practice (and preferable to
         // blocking the audio thread).
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let dropped_cb = dropped.clone();
         let (mut producer, consumer): (HeapProd<f32>, HeapCons<f32>) =
             HeapRb::<f32>::new(sample_rate as usize * 70).split();
         // NOTE: `producer` is moved into exactly one match arm (only one arm runs).
@@ -115,7 +128,9 @@ impl AudioCapture {
                 &config,
                 move |data: &[f32], _| {
                     for &s in data {
-                        let _ = producer.try_push(s);
+                        if producer.try_push(s).is_err() {
+                            dropped_cb.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 |err| warn!("audio stream error: {err}"),
@@ -125,7 +140,9 @@ impl AudioCapture {
                 &config,
                 move |data: &[i16], _| {
                     for &s in data {
-                        let _ = producer.try_push(i16_to_f32(s));
+                        if producer.try_push(i16_to_f32(s)).is_err() {
+                            dropped_cb.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 |err| warn!("audio stream error: {err}"),
@@ -135,7 +152,9 @@ impl AudioCapture {
                 &config,
                 move |data: &[u16], _| {
                     for &s in data {
-                        let _ = producer.try_push(u16_to_f32(s));
+                        if producer.try_push(u16_to_f32(s)).is_err() {
+                            dropped_cb.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 |err| warn!("audio stream error: {err}"),
@@ -151,11 +170,16 @@ impl AudioCapture {
             consumer,
             started: std::time::Instant::now(),
             sample_rate,
+            dropped,
         })
     }
 
     pub fn stop(mut self) -> CapturedAudio {
         drop(self.stream);
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            warn!("dropped {dropped} samples (ring full)");
+        }
         let samples: Vec<f32> = self.consumer.pop_iter().collect();
         let duration_ms = self.started.elapsed().as_millis() as u64;
         CapturedAudio {
@@ -209,5 +233,14 @@ mod tests {
         assert!((u16_to_f32(32768) - 0.0).abs() < 0.001);
         assert!((u16_to_f32(u16::MAX) - 1.0).abs() < 0.01);
         assert!((u16_to_f32(u16::MIN) + 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_f32_to_i16_endpoints() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), 32767);
+        assert_eq!(f32_to_i16(-1.0), -32767);
+        assert_eq!(f32_to_i16(2.0), 32767);
+        assert_eq!(f32_to_i16(-2.0), -32767);
     }
 }

@@ -1,3 +1,4 @@
+use crate::audio::rms;
 use webrtc_vad::{SampleRate, Vad as WebrtcVad, VadMode};
 
 pub const VAD_SAMPLE_RATE: u32 = 16_000;
@@ -28,6 +29,27 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
             samples[lo] * (1.0 - frac) + samples[hi] * frac
         })
         .collect()
+}
+
+/// Below this RMS the input is room tone, not speech (measured room: 0.002).
+// Task 1 pre-req — wired in Task 4; allow dead_code until then.
+#[allow(dead_code)]
+pub const MIN_SPEECH_RMS: f32 = 0.01;
+
+#[allow(dead_code)]
+pub fn has_speech_energy(samples: &[f32]) -> bool {
+    rms(samples) >= MIN_SPEECH_RMS
+}
+
+/// Single enforced entry point for STT input: energy gate → resample → trim.
+/// Guarantees the 16kHz contract by construction (fixes Phase 2 review finding).
+#[allow(dead_code)]
+pub fn transcribe_ready(samples: &[f32], from_rate: u32, vad: &mut Vad) -> Vec<f32> {
+    if !has_speech_energy(samples) {
+        return Vec::new();
+    }
+    let s16 = resample_to_16k(samples, from_rate);
+    vad.trim_silence(&s16)
 }
 
 pub struct Vad {
@@ -138,5 +160,34 @@ mod tests {
         assert!(!out.is_empty(), "loud complex tone must survive trim");
         assert!(out.len() < sig.len(), "edge silence must be trimmed");
         assert!(out.len() >= 16_000 - PAD_FRAMES * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn test_energy_gate_rejects_quiet() {
+        assert!(!has_speech_energy(&vec![0.0; 1600]));
+        assert!(!has_speech_energy(&vec![0.001; 1600]));
+    }
+
+    #[test]
+    fn test_energy_gate_accepts_loud() {
+        let loud: Vec<f32> = (0..1600).map(|i| 0.5 * (i as f32 * 0.02).sin()).collect();
+        assert!(has_speech_energy(&loud));
+    }
+
+    #[test]
+    fn test_pipeline_rejects_silence_at_any_rate() {
+        let mut v = Vad::new();
+        assert!(transcribe_ready(&vec![0.0; 4410], 44_100, &mut v).is_empty());
+    }
+
+    #[test]
+    fn test_pipeline_keeps_tone_core() {
+        let mut sig = vec![0.0; 16_000];
+        sig.extend(complex_tone_16k(1));
+        sig.extend(vec![0.0; 16_000]);
+        let mut v = Vad::new();
+        let out = transcribe_ready(&sig, 16_000, &mut v);
+        assert!(!out.is_empty());
+        assert!(out.len() < sig.len());
     }
 }
