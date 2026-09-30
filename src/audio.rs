@@ -6,8 +6,7 @@ use ringbuf::{
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-// Phase 1: AudioCapture/rms consumed by Task 4 wiring; allow dead_code until then.
-#[allow(dead_code)]
+// Phase 1: AudioCapture/rms consumed by Task 4 wiring.
 #[derive(Debug)]
 pub struct AudioError(pub String);
 
@@ -18,7 +17,6 @@ impl std::fmt::Display for AudioError {
 }
 impl std::error::Error for AudioError {}
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CapturedAudio {
     pub samples_16k_mono: Vec<f32>,
@@ -50,7 +48,6 @@ pub fn list_devices() -> Vec<String> {
     out
 }
 
-#[allow(dead_code)]
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -59,7 +56,6 @@ pub fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
-#[allow(dead_code)]
 pub struct AudioCapture {
     stream: cpal::Stream,
     ring: Arc<Mutex<HeapRb<f32>>>,
@@ -67,7 +63,6 @@ pub struct AudioCapture {
     sample_rate: u32,
 }
 
-#[allow(dead_code)]
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -76,7 +71,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 impl AudioCapture {
     pub fn start(device_name: Option<String>) -> Result<Self, AudioError> {
         let host = cpal::default_host();

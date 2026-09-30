@@ -1,17 +1,37 @@
-use clap::Parser;
-
 mod audio;
 mod hotkey;
 
+use clap::Parser;
+use hotkey::{PttEvent, PushToTalk};
+use tracing::{info, warn};
+
 #[derive(Parser, Debug)]
-#[command(name = "wiflow-dictation", about = "Push-to-talk dictation prototype")]
+#[command(name = "wiflow-dictation")]
 struct Args {
-    /// List audio input devices and exit
     #[arg(long)]
     list_devices: bool,
-    /// Dump captured audio to wav on release (debug)
     #[arg(long)]
     dump_wav: bool,
+    #[arg(long)]
+    device: Option<String>,
+    /// Simulate hold of N ms without global hotkey (for headless test)
+    #[arg(long)]
+    simulate_hold_ms: Option<u64>,
+}
+
+fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec)?;
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+    }
+    w.finalize()?;
+    Ok(())
 }
 
 fn main() {
@@ -23,5 +43,44 @@ fn main() {
         }
         return;
     }
-    println!("wiflow-dictation phase1 scaffold ok");
+    let mut ptt = PushToTalk::new(300, 60_000);
+    if let Some(hold) = args.simulate_hold_ms {
+        info!("simulate hold {hold}ms (no hotkey needed)");
+        assert!(matches!(ptt.on_key_down(0), PttEvent::Started));
+        let cap = match audio::AudioCapture::start(args.device.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("capture failed (expected in CI without mic): {e}");
+                return;
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_millis(hold.min(3000)));
+        let out = cap.stop();
+        info!(
+            "captured {} samples @ {}Hz device-ms={} rms={:.3}",
+            out.samples_16k_mono.len(),
+            out.sample_rate,
+            out.duration_ms,
+            audio::rms(&out.samples_16k_mono)
+        );
+        match ptt.on_key_up(hold) {
+            PttEvent::Transcribe { duration_ms } => {
+                info!("would transcribe {duration_ms}ms");
+                if args.dump_wav {
+                    let _ = dump_wav(
+                        "/tmp/wiflow_hold.wav",
+                        &out.samples_16k_mono,
+                        out.sample_rate,
+                    );
+                    info!("dumped /tmp/wiflow_hold.wav");
+                }
+            }
+            e => info!("discarded: {:?}", e),
+        }
+        return;
+    }
+    println!("Phase1: global-hotkey wiring lands here. Use --simulate-hold-ms 1500 for now.");
+    println!(
+        "Next: global-hotkey 0.6 GlobalHotKeyManager + winit event loop (Task 4 follow-up on user approval)."
+    );
 }

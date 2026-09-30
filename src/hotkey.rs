@@ -1,16 +1,19 @@
-// Phase 1: PushToTalk/PttEvent consumed by Task 4 wiring; allow dead_code until then.
-#[allow(dead_code)]
+// Phase 1: PushToTalk/PttEvent consumed by Task 4 wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PttEvent {
     Started,
     IgnoredRepeat,
     Ignored,
-    Transcribe { duration_ms: u64 },
-    DiscardedShort { duration_ms: u64 },
+    Transcribe {
+        duration_ms: u64,
+    },
+    DiscardedShort {
+        duration_ms: u64,
+    },
+    #[allow(dead_code)]
     Cancelled,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PushToTalk {
     min_ms: u64,
@@ -18,7 +21,6 @@ pub struct PushToTalk {
     down_at: Option<u64>,
 }
 
-#[allow(dead_code)]
 impl PushToTalk {
     pub fn new(min_ms: u64, max_ms: u64) -> Self {
         Self {
@@ -28,6 +30,7 @@ impl PushToTalk {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
         self.down_at.is_some()
     }
@@ -54,6 +57,7 @@ impl PushToTalk {
         }
     }
 
+    #[allow(dead_code)]
     pub fn on_cancel(&mut self) -> PttEvent {
         if self.down_at.take().is_some() {
             PttEvent::Cancelled
