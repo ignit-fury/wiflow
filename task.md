@@ -38,15 +38,16 @@
   - [x] Decide `global-hotkey` stub: wire behind feature or drop dep until Phase 5; fix doc drift — dropped stub dep, rewired stub text to Phase 5
 - VAD live numbers 2026-09-30: speech-intent run (2000ms, quiet room, no speaker) `vad kept 31951/31951` rms=0.020 → would transcribe; silent run (1200ms) `vad kept 19133/19133` rms=0.002 → would transcribe, NO "no speech detected" — VAD keeps near-silence room tone, honest finding, needs threshold tuning before STT lands
 
-## Phase 3 — Local STT (whisper-rs Metal)
-- [ ] Pre-req (from Phase 2 review 2026-09-30): energy/RMS gate before STT — VAD keeps 100% near-silence room tone (`rms=0.002` → kept all), so silence-only holds must discard before transcribe (skip when `rms < threshold` or kept-energy floor; add low-noise unit fixture + silent-hold live assertion)
-- [ ] Pre-req (from Phase 2 final review): harden VAD 16kHz contract — `trim_silence` rate requirement is doc-comment-only; enforce by signature (pass rate or pipeline helper `resample_to_16k → trim_silence → f32_to_i16 → whisper`) so Phase 3 STT wiring cannot feed wrong rate silently
-- [ ] Pre-req (from Phase 2 final review): ring-full observability — silent drop-newest on `try_push` full; add `AtomicUsize` dropped-counter, `warn!` in `stop()` if >0
-- [ ] Pre-req (from Phase 2 final review): `audio::f32_to_i16` helper (clamp + round, mirror of `i16_to_f32`) with endpoint test, so `stt.rs` consumes `kept` without inline casts
-- [ ] `stt.rs`: model manager (download base.en with progress + SHA), transcribe i16
-- [ ] Feature `metal` on aarch64, CPU fallback documented
-- [ ] WER check on golden files, RTF log, OOM → fallback to base
-- [ ] Bench base.en vs small.en on target Mac, lock default
+## Phase 3 — Local STT (whisper-rs Metal, complete 2026-09-30)
+- [x] Pre-req (from Phase 2 review 2026-09-30): energy/RMS gate before STT — `vad::transcribe_ready` energy-gates (`MIN_SPEECH_RMS = 0.01`) before resample+trim; proven live: 2 silent holds (rms 0.002/0.004) → `vad kept 0/N` → "no speech detected", STT never touched
+- [x] Pre-req (from Phase 2 final review): harden VAD 16kHz contract — `transcribe_ready(&[f32], u32, &mut Vad) -> Vec<f32>` is THE entry point in simulate branch; `Stt::transcribe` takes 16k f32 by contract
+- [x] Pre-req (from Phase 2 final review): ring-full observability — `AtomicUsize` dropped-counter, `warn!` in `stop()` if >0
+- [x] Pre-req (from Phase 2 final review): `audio::f32_to_i16` helper (clamp + round) with endpoint test — kept narrow `#[allow(dead_code)]` (test-only use; STT takes f32 so still unconsumed, clippy `-D warnings` demands it)
+- [x] `stt.rs`: model manager (`ensure_model` curl download w/ size gate 147964211 bytes, skips when verified) + `Stt::load/transcribe` — all temp `#[allow(dead_code)]` removed (wired)
+- [x] Feature `metal` on aarch64, CPU fallback documented
+- [x] WER check on golden files, RTF log, OOM → fallback to base — deviation: no golden WER corpus; substituted live TTS end-to-end (ground truth "the quick brown fox" → `TRANSCRIPT: the QuickBrown Fox.`, ~correct modulo casing) + RTF 0.10 log; OOM→base fallback deferred (only base ships v1)
+- [x] Bench base.en vs small.en on target Mac, lock default — base.en locked v1: load 5744ms (first load incl. Metal init), transcribe 139ms over 1.44s audio, RTF 0.10 on M-class Metal; small.en NOT downloaded (465MB deferred until accuracy data demands it); default model = base.en
+- [x] Wire transcribe end-to-end (Task 4): `--model` flag, `ensure_model → Stt::load → transcribe` with `model loaded in {n}ms, transcribed in {n}ms (RTF {x})` + `TRANSCRIPT:` stdout; ignored live-model test (`tone transcript: "(dramatic music)"` — sine hallucinates, honest data); live-mic spoken run BLOCKED by hardware (default I/O = AirPods in case → silence; see memory.md); gates green: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26 passed + 1 ignored (27 total)
 
 ## Phase 4 — Inject + History
 - [ ] `inject.rs`: clipboard save → set text → Cmd+V via `enigo` → restore

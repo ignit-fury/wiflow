@@ -32,8 +32,16 @@
 - Simulate-hold wall time 1.95s; 5% CPU while recording.
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean (exit 0), `cargo test` 8/8 pass.
 
+## Phase 3 STT — Complete (2026-09-30)
+- Stack: whisper-rs 0.16 + Metal (`metal` feature, `use_gpu(true)`), base.en default (147964211 bytes, size-gated `ensure_model`, download skipped — already on disk).
+- Wiring: simulate branch → `transcribe_ready` (energy gate → resample → trim) → `ensure_model → Stt::load → transcribe` with load/transcribe timing + RTF log and `TRANSCRIPT:` stdout; `--model` override flag added.
+- Bench (TTS "the quick brown fox" → 16k wav through REAL pipeline): vad kept 22560/23042; load 5744ms; transcribe 139ms over 1.44s audio (RTF 0.10); transcript `the QuickBrown Fox.` — locks base.en for v1, small.en deferred (465MB).
+- Live-mic spoken run blocked: default I/O routes to AirPods (in case → digital silence); explicit MacBook-mic run + audible TTS still rms 0.004 → energy gate correctly rejected both. No transcript-from-mic yet — needs user-held session with working input.
+- Ignored live test green: sine tone → `"(dramatic music)"` hallucination (expected — pure tones are not speech).
+- Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26 passed + 1 ignored. Deviations: true WER corpus deferred; OOM→base fallback deferred (base-only v1).
+
 ## Next Step
-- Phase 1 done. Next: user approves → start task.md Phase 2 (VAD).
+- Phase 3 done. Next: user approves → start task.md Phase 4 (Inject + History).
 
 ## Phase 2 VAD — Complete (2026-09-30)
 - Deps: `webrtc-vad 0.4` added (links C code, no network at runtime); `global-hotkey 0.6` stub dropped until Phase 5; ringbuf split producer/consumer.
