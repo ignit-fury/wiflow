@@ -50,16 +50,28 @@
 - [x] Wire transcribe end-to-end (Task 4): `--model` flag, `ensure_model → Stt::load → transcribe` with `model loaded in {n}ms, transcribed in {n}ms (RTF {x})` + `TRANSCRIPT:` stdout; ignored live-model test (`tone transcript: "(dramatic music)"` — sine hallucinates, honest data); live-mic spoken run BLOCKED by hardware (default I/O = AirPods in case → silence; see memory.md); gates green: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26 passed + 1 ignored (27 total)
 
 ## Phase 4 — Inject + History
-- [ ] Pre-reqs (from Phase 3 final review 2026-09-30, all small):
-  - [ ] Lazy `Stt` singleton (`OnceLock`) — 5.7s Metal init per hold dominates shorts
-  - [ ] `dump_wav` should dogfood `audio::f32_to_i16` (currently hand-rolled truncating cast)
-  - [ ] `--model` override should `verify_model`-warn before load; consider SHA256 pin for base.en
-  - [ ] Log `raw N → 16k M → kept K` (current kept/total mixes rates); RTF denominator → kept-audio duration
-  - [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances)
-  - [ ] User-session spoken validation (sandbox mic blocked; TTS substitute only so far)
-- [ ] `inject.rs`: clipboard save → set text → Cmd+V via `enigo` → restore
-- [ ] `history.rs`: last-50 JSON/SQLite, copy/clear
-- [ ] Manual test matrix: VS Code, Safari, Slack, Terminal, password field (clipboard-only)
+- [x] Pre-reqs (from Phase 3 final review 2026-09-30):
+  - [x] Lazy `Stt` singleton (`OnceLock`) — Task 1 added `shared_stt`, Task 4 wired it into Transcribe arm via `Mutex` guard (`let mut stt = stt_lock.lock().unwrap_or_else(|e| e.into_inner())`, guard derefs mutably — compiles as-is)
+  - [x] `dump_wav` dogfoods `audio::f32_to_i16`
+  - [x] `--model` override `verify_model`-warns before load (SHA256 pin deferred)
+  - [x] RTF denominator → kept-audio duration (`kept_ms` from 16k kept len)
+  - [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances) — still set, deferred to pre-ship
+  - [ ] Log `raw N → 16k M → kept K` (current `kept/total` log mixes rates) — cosmetic, deferred
+  - [ ] User-session spoken validation (sandbox mic silent; TTS substitute only so far)
+- [x] `inject.rs`: clipboard save → set text → Cmd+V via `enigo` → restore (Task 2: real round-trip in GUI session; Task 4 wired into Transcribe arm with empty-skip + clipboard fallback + warn; `--no-inject` flag for headless/CI)
+- [x] `history.rs`: last-50 JSON at `~/Library/Application Support/wiflow/history.json` (plain JSON, user-deletable), copy/clear deferred to UI phase (Task 3 core + Task 4 `push_history` wiring; live entry blocked — both Task 4 runs hit no-speech path, see below)
+- [x] Wiring gates (2026-09-30): `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean (one narrow `#[allow(dead_code)]` kept on `load_history`, clippy-demanded read API for future UI), `cargo test` 34 passed + 1 ignored, 0 failed
+- [x] Live runs (2026-09-30): `--no-inject` 2000ms → no-speech path (rms 0.003, vad kept 0/88064), history.json correctly ABSENT (nothing to record); WITH-inject 2000ms → no-speech path (rms 0.005), inject not attempted, no panic. Honest outcome: inject-Ok vs fallback still unproven from live mic — needs USER spoken run below.
+- [ ] Manual test matrix (USER — needs spoken audio + focused app; clipboard fallback expected in password fields):
+  - [ ] USER Terminal check first (paste target):
+    ```bash
+    cargo run -- --simulate-hold-ms 3000   # speak, then check text appeared in the FOCUSED app
+    ```
+    Requires Accessibility permission for enigo (System Settings → Privacy & Security → Accessibility → add Terminal/binary), else inject warns + leaves text on clipboard (press Cmd+V).
+  - [ ] USER VS Code: focus editor, run as above, check text appears at cursor
+  - [ ] USER Safari: focus address bar / text field, check paste
+  - [ ] USER Slack: focus message box, check paste
+  - [ ] USER Password field: expect clipboard-only + warn (secure fields reject synthetic paste — by design, text stays on clipboard)
 
 ## Phase 5 — Menu-bar UI + Packaging
 - [ ] Tray icon states, recording pill, toasts, settings window, onboarding (mic + accessibility)

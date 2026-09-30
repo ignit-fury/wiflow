@@ -1,5 +1,13 @@
 # Memory — Decisions & Context
 
+## Phase 4 Inject + History — Wired (2026-09-30)
+- Deps: arboard 3.6, enigo 0.6, serde 1, serde_json 1 (all $0, offline, no network).
+- Wiring: `--no-inject` flag; Transcribe arm → empty-skip → `push_history` (warn-only on failure) → inject or skip; `Stt::load` → `shared_stt` singleton + `Mutex` guard; `now_ms()` wall-clock for `at_ms` (`Instant` would be wrong for a timestamp).
+- History file: `~/Library/Application Support/wiflow/history.json`, plain JSON last-50, user-deletable (local-only, clearable per rules).
+- Inject outcome: UNPROVEN live — both runs hit no-speech path (silent room rms 0.003/0.005, vad kept 0), so neither history entry nor inject-vs-fallback was exercised; no panic. USER spoken run + 5-app matrix (incl. Accessibility note + password-field clipboard expectation) recorded in task.md.
+- Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean (narrow allow kept on `load_history` only), `cargo test` 34 passed + 1 ignored, 0 failed.
+- Deferred: SHA256 model pin, `set_single_segment` revisit, `raw→16k→kept` log split, history copy/clear UI (Phase 5).
+
 ## Locked Decisions
 - 2026-09-30 — Language: Rust. Why: speed (realtime audio), single binary, portable core to Win/Linux later.
 - 2026-09-30 — Platform order: macOS arm64 first. Why: user target, Metal speeds Whisper 3-5x, menu-bar pattern proven.
