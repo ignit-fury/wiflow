@@ -1,4 +1,6 @@
 mod audio;
+#[allow(dead_code)]
+mod history;
 mod hotkey;
 #[allow(dead_code)]
 mod inject;
