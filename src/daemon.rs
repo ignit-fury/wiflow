@@ -2,16 +2,27 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use winit::event_loop::EventLoopProxy;
 
 use crate::hotkey::{PttEvent, PushToTalk};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HotkeyPreset {
     RightOption,
     Fn,
+    #[default]
     CtrlSpace,
+}
+
+/// Idle-tooltip hint for the winning preset (no hardcoded hotkey anywhere else).
+pub fn preset_hint(preset: HotkeyPreset) -> &'static str {
+    match preset {
+        HotkeyPreset::RightOption => "hold Right Option",
+        HotkeyPreset::Fn => "hold Fn",
+        HotkeyPreset::CtrlSpace => "hold Ctrl+Space",
+    }
 }
 
 pub fn preset_hotkey(preset: HotkeyPreset) -> HotKey {
@@ -35,7 +46,9 @@ pub enum DaemonEvent {
     Failed(String),
 }
 
-/// Register Right-Option; fall back to Fn when the OS swallows it.
+/// Register the preferred preset; fall back when the OS swallows it.
+/// macOS rejects single-key holds (AltRight/Fn report "Unknown scancode"),
+/// so a CtrlSpace default registers immediately; Fn-only fallback otherwise.
 /// Returns the manager (must be kept alive), the hotkey, and which preset won.
 pub fn register_ptt_hotkey(
     prefer: HotkeyPreset,
@@ -81,10 +94,17 @@ fn now_ms() -> u64 {
 
 /// Forward global-hotkey presses to the winit loop as `DaemonEvent`s.
 /// Runs on its own thread; `receiver().recv()` blocks here, never on winit.
-pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, hotkey_id: u32) {
+/// Forwards ANY known PTT preset id (not just the startup winner) so a
+/// menu-driven hotkey switch needs no bridge restart and loses no events.
+pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>) {
+    let ids = [
+        preset_hotkey(HotkeyPreset::RightOption).id(),
+        preset_hotkey(HotkeyPreset::Fn).id(),
+        preset_hotkey(HotkeyPreset::CtrlSpace).id(),
+    ];
     std::thread::spawn(move || {
         while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
-            if ev.id != hotkey_id {
+            if !ids.contains(&ev.id) {
                 continue;
             }
             let out = match ev.state {
@@ -124,7 +144,7 @@ fn pipeline_on_worker(
         });
         return;
     }
-    let model_path = match crate::stt::ensure_model() {
+    let model_path = match ensure_model_for_config() {
         Ok(p) => p,
         Err(e) => {
             let _ = proxy.send_event(DaemonEvent::Failed(format!("model unavailable: {e}")));
@@ -173,6 +193,14 @@ fn pipeline_on_worker(
     });
 }
 
+/// Model variant follows the live menu config (read per cycle, never cached):
+/// SmallEn downloads small.en on first use, BaseEn uses base.en.
+fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
+    match crate::config::load_config().model {
+        crate::config::ModelChoice::SmallEn => crate::stt::ensure_model_variant("small"),
+        crate::config::ModelChoice::BaseEn => crate::stt::ensure_model_variant("base"),
+    }
+}
 /// Worker entry: owns `PushToTalk` + the live `AudioCapture`, so every
 /// `Duration`-blocking call (device open, capture stop, model download,
 /// transcribe, inject) runs here, never on the winit thread.
@@ -182,15 +210,19 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
     for ctl in rx {
         match ctl {
             Control::Down => match ptt.on_key_down(now_ms()) {
-                PttEvent::Started => match crate::audio::AudioCapture::start(None) {
-                    Ok(cap) => capture = Some(cap),
-                    Err(e) => {
-                        tracing::warn!("capture failed: {e}");
-                        capture = None;
-                        let _ =
-                            proxy.send_event(DaemonEvent::Failed(format!("capture failed: {e}")));
+                PttEvent::Started => {
+                    // Menu-selected mic, re-read per hold (never cached).
+                    let mic = crate::config::load_config().mic_name;
+                    match crate::audio::AudioCapture::start(mic) {
+                        Ok(cap) => capture = Some(cap),
+                        Err(e) => {
+                            tracing::warn!("capture failed: {e}");
+                            capture = None;
+                            let _ = proxy
+                                .send_event(DaemonEvent::Failed(format!("capture failed: {e}")));
+                        }
                     }
-                },
+                }
                 e => tracing::debug!("ptt down ignored: {e:?}"),
             },
             Control::Up => match ptt.on_key_up(now_ms()) {

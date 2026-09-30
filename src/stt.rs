@@ -96,8 +96,35 @@ pub fn verify_model(path: &Path) -> bool {
 /// Download base.en on first use (curl ships with macOS — no HTTP dep).
 /// Skips download when a size-verified model already exists.
 pub fn ensure_model() -> Result<PathBuf, String> {
-    let path = model_path();
-    if verify_model(&path) {
+    ensure_model_variant("base")
+}
+
+pub const SMALL_MODEL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin";
+/// Size-gated like base.en; verified 2026-09-30 via HEAD (HTTP 200).
+/// Never downloaded by tests — size-gate assertions only.
+pub const SMALL_MODEL_SIZE: u64 = 487_614_201;
+pub const SMALL_MODEL_NAME: &str = "ggml-small.en.bin";
+
+/// Variant-aware paths: "small" or anything else (default "base").
+pub fn model_path_for(variant: &str) -> (PathBuf, &'static str, u64) {
+    if variant == "small" {
+        (
+            models_dir().join(SMALL_MODEL_NAME),
+            SMALL_MODEL_URL,
+            SMALL_MODEL_SIZE,
+        )
+    } else {
+        (model_path(), MODEL_URL, MODEL_SIZE)
+    }
+}
+
+pub fn ensure_model_variant(variant: &str) -> Result<PathBuf, String> {
+    let (path, url, size) = model_path_for(variant);
+    if std::fs::metadata(&path)
+        .map(|m| m.len() == size)
+        .unwrap_or(false)
+    {
         return Ok(path);
     }
     if let Some(parent) = path.parent() {
@@ -106,10 +133,14 @@ pub fn ensure_model() -> Result<PathBuf, String> {
     let status = std::process::Command::new("curl")
         .args(["-fSL", "-C", "-", "-o"])
         .arg(&path)
-        .arg(MODEL_URL)
+        .arg(url)
         .status()
         .map_err(|e| format!("spawn curl: {e:?}"))?;
-    if !status.success() || !verify_model(&path) {
+    if !status.success()
+        || !std::fs::metadata(&path)
+            .map(|m| m.len() == size)
+            .unwrap_or(false)
+    {
         return Err(format!("download failed: {status}"));
     }
     Ok(path)
@@ -146,6 +177,35 @@ mod tests {
         assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
         // Retry allowed: second call re-attempts (no poisoned cache).
         assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
+    }
+
+    #[test]
+    fn test_model_path_for_variants() {
+        let (base_path, base_url, base_size) = model_path_for("base");
+        assert_eq!(base_path.file_name().unwrap(), MODEL_NAME);
+        assert_eq!(base_url, MODEL_URL);
+        assert_eq!(base_size, MODEL_SIZE);
+        let (small_path, small_url, small_size) = model_path_for("small");
+        assert_eq!(small_path.file_name().unwrap(), SMALL_MODEL_NAME);
+        assert_eq!(small_url, SMALL_MODEL_URL);
+        assert_eq!(small_size, SMALL_MODEL_SIZE);
+        // Unknown variant falls back to base (never a download-by-typo).
+        assert_eq!(model_path_for("bogus").1, MODEL_URL);
+    }
+
+    #[test]
+    fn test_small_model_size_gate() {
+        // Sparse file: size-gate only, no 465MB download, instant.
+        let p = std::env::temp_dir().join("wiflow_small_gate_test.bin");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(SMALL_MODEL_SIZE).unwrap();
+        drop(f);
+        let (path, _, size) = model_path_for("small");
+        assert_eq!(path.file_name().unwrap(), SMALL_MODEL_NAME);
+        assert!(std::fs::metadata(&p)
+            .map(|m| m.len() == size)
+            .unwrap_or(false));
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

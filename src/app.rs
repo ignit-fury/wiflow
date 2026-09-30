@@ -1,3 +1,4 @@
+use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::{
     event::{DeviceEvent, ElementState},
@@ -5,7 +6,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::daemon::{Control, DaemonEvent, HotkeyPreset};
+use crate::config::{Config, ModelChoice};
+use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
+use crate::history::HistoryEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -16,12 +19,22 @@ pub enum AppState {
 }
 
 impl AppState {
-    pub fn tooltip(&self) -> &'static str {
+    /// Idle text names the WINNING preset — never a hardcoded hotkey.
+    pub fn tooltip(&self, preset: HotkeyPreset) -> String {
         match self {
-            AppState::Idle => "Wiflow — hold Right Option to dictate",
-            AppState::Recording => "Wiflow — recording… release to transcribe",
-            AppState::Transcribing => "Wiflow — transcribing…",
-            AppState::Error => "Wiflow — error (see menu)",
+            AppState::Idle => format!("Wiflow — {} to dictate", preset_hint(preset)),
+            AppState::Recording => "Wiflow — recording… release to transcribe".to_string(),
+            AppState::Transcribing => "Wiflow — transcribing…".to_string(),
+            AppState::Error => "Wiflow — error (see menu)".to_string(),
+        }
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            AppState::Idle => "Idle",
+            AppState::Recording => "Recording",
+            AppState::Transcribing => "Transcribing",
+            AppState::Error => "Error",
         }
     }
 }
@@ -54,10 +67,191 @@ pub fn make_icon(state: AppState) -> Icon {
     Icon::from_rgba(icon_rgba(state), 32, 32).expect("generated icon is valid RGBA")
 }
 
+#[derive(Debug, Clone)]
+pub struct MenuIds {
+    status: MenuId,
+    mic_items: Vec<(String, MenuId)>,
+    model_base: MenuId,
+    model_small: MenuId,
+    hk_right: MenuId,
+    hk_fn: MenuId,
+    hk_ctrl: MenuId,
+    launch_login: MenuId,
+    history_items: Vec<(String, MenuId)>,
+    perm_mic: MenuId,
+    perm_a11y: MenuId,
+    quit: MenuId,
+}
+
+/// Pure id scheme for the whole menu tree: deterministic strings, no
+/// platform objects — testable off the main thread (muda forbids
+/// `Menu::new` elsewhere on macOS). `build_menu` stamps these ids via
+/// `with_id`, so the handler and the test see the same values.
+fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
+    MenuIds {
+        status: MenuId::new("wiflow:status"),
+        mic_items: devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.clone(), MenuId::new(format!("wiflow:mic:{i}"))))
+            .collect(),
+        model_base: MenuId::new("wiflow:model:base"),
+        model_small: MenuId::new("wiflow:model:small"),
+        hk_right: MenuId::new("wiflow:hk:right"),
+        hk_fn: MenuId::new("wiflow:hk:fn"),
+        hk_ctrl: MenuId::new("wiflow:hk:ctrl"),
+        launch_login: MenuId::new("wiflow:launch"),
+        history_items: history
+            .iter()
+            .rev()
+            .take(8)
+            .enumerate()
+            .map(|(i, e)| (e.text.clone(), MenuId::new(format!("wiflow:hist:{i}"))))
+            .collect(),
+        perm_mic: MenuId::new("wiflow:perm:mic"),
+        perm_a11y: MenuId::new("wiflow:perm:a11y"),
+        quit: MenuId::new("wiflow:quit"),
+    }
+}
+
+fn truncate_label(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut s: String = flat.chars().take(max).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Build the full tray menu tree. Pure inputs (config + device list +
+/// history snapshot + state label) so tests can pass fakes.
+pub fn build_menu(
+    config: &Config,
+    devices: &[String],
+    history: &[HistoryEntry],
+    state_label: &str,
+) -> (Menu, MenuIds) {
+    let menu = Menu::new();
+    let ids = ids_for(devices, history);
+
+    let status = MenuItem::with_id(
+        ids.status.clone(),
+        format!("Status: {state_label}"),
+        false,
+        None,
+    );
+
+    let mic_menu = Submenu::new("Microphone", true);
+    for (i, dev) in devices.iter().enumerate() {
+        let checked = match &config.mic_name {
+            Some(n) => n == dev,
+            None => i == 0,
+        };
+        let item = CheckMenuItem::with_id(ids.mic_items[i].1.clone(), dev, true, checked, None);
+        mic_menu.append(&item).expect("menu append");
+    }
+
+    let model_menu = Submenu::new("Model", true);
+    let model_base = CheckMenuItem::with_id(
+        ids.model_base.clone(),
+        "Base — English (~140 MB)",
+        true,
+        config.model == ModelChoice::BaseEn,
+        None,
+    );
+    let model_small = CheckMenuItem::with_id(
+        ids.model_small.clone(),
+        "Small — English (~465 MB)",
+        true,
+        config.model == ModelChoice::SmallEn,
+        None,
+    );
+    model_menu
+        .append_items(&[&model_base, &model_small])
+        .expect("menu append");
+
+    let hk_menu = Submenu::new("Push-to-talk hotkey", true);
+    let hk_right = CheckMenuItem::with_id(
+        ids.hk_right.clone(),
+        "Right Option",
+        true,
+        config.hotkey_preset == HotkeyPreset::RightOption,
+        None,
+    );
+    let hk_fn = CheckMenuItem::with_id(
+        ids.hk_fn.clone(),
+        "Fn",
+        true,
+        config.hotkey_preset == HotkeyPreset::Fn,
+        None,
+    );
+    let hk_ctrl = CheckMenuItem::with_id(
+        ids.hk_ctrl.clone(),
+        "Ctrl+Space",
+        true,
+        config.hotkey_preset == HotkeyPreset::CtrlSpace,
+        None,
+    );
+    hk_menu
+        .append_items(&[&hk_right, &hk_fn, &hk_ctrl])
+        .expect("menu append");
+
+    let launch_login = CheckMenuItem::with_id(
+        ids.launch_login.clone(),
+        "Launch at Login",
+        true,
+        config.launch_at_login,
+        None,
+    );
+
+    let hist_menu = Submenu::new("History", true);
+    if history.is_empty() {
+        let empty = MenuItem::new("(empty)", false, None);
+        hist_menu.append(&empty).expect("menu append");
+    } else {
+        for (text, hid) in &ids.history_items {
+            let item = MenuItem::with_id(hid.clone(), truncate_label(text, 40), true, None);
+            hist_menu.append(&item).expect("menu append");
+        }
+    }
+
+    let perm_menu = Submenu::new("Permissions", true);
+    let perm_mic = MenuItem::with_id(ids.perm_mic.clone(), "Microphone…", true, None);
+    let perm_a11y = MenuItem::with_id(ids.perm_a11y.clone(), "Accessibility…", true, None);
+    perm_menu
+        .append_items(&[&perm_mic, &perm_a11y])
+        .expect("menu append");
+
+    let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
+
+    menu.append(&status).expect("menu append");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("menu append");
+    menu.append(&mic_menu).expect("menu append");
+    menu.append(&model_menu).expect("menu append");
+    menu.append(&hk_menu).expect("menu append");
+    menu.append(&launch_login).expect("menu append");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("menu append");
+    menu.append(&hist_menu).expect("menu append");
+    menu.append(&perm_menu).expect("menu append");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("menu append");
+    menu.append(&quit).expect("menu append");
+
+    (menu, ids)
+}
+
 struct DaemonApp {
     tray: TrayIcon,
     // Kept alive: dropping the manager unregisters the global hotkey.
-    _hotkey_manager: global_hotkey::GlobalHotKeyManager,
+    hotkey_manager: global_hotkey::GlobalHotKeyManager,
+    hotkey: global_hotkey::hotkey::HotKey,
+    preset: HotkeyPreset,
+    config: Config,
+    devices: Vec<String>,
     proxy: EventLoopProxy<DaemonEvent>,
     tx: std::sync::mpsc::Sender<Control>,
     state: AppState,
@@ -65,18 +259,22 @@ struct DaemonApp {
     note: Option<String>,
     applied_state: AppState,
     applied_tooltip: String,
+    menu_ids: MenuIds,
+    menu_dirty: bool,
 }
 
 impl DaemonApp {
     fn set_state(&mut self, state: AppState, note: Option<String>) {
         self.state = state;
         self.note = note;
+        // Status item shows the state → menu needs a rebuild.
+        self.menu_dirty = true;
     }
 
     fn current_tooltip(&self) -> String {
         self.note
             .clone()
-            .unwrap_or_else(|| self.state.tooltip().to_string())
+            .unwrap_or_else(|| self.state.tooltip(self.preset))
     }
 
     /// Push icon/tooltip to the tray only when something changed.
@@ -95,6 +293,132 @@ impl DaemonApp {
             }
             self.applied_tooltip = tooltip;
         }
+    }
+
+    fn rebuild_menu(&mut self) {
+        let history = crate::history::load_history();
+        let (menu, ids) = build_menu(
+            &self.config,
+            &self.devices,
+            &history,
+            self.state.status_label(),
+        );
+        self.tray.set_menu(Some(Box::new(menu)));
+        self.menu_ids = ids;
+        self.menu_dirty = false;
+    }
+
+    fn save(&mut self) {
+        if let Err(e) = crate::config::save_config(&self.config) {
+            tracing::warn!("save config failed: {e}");
+        }
+    }
+
+    /// Note only when it won't clobber the recording indicator.
+    fn warn_note(&mut self, msg: String) {
+        tracing::warn!("{msg}");
+        if self.state != AppState::Recording {
+            self.note = Some(msg);
+        }
+    }
+
+    fn switch_hotkey(&mut self, want: HotkeyPreset) {
+        if want == self.preset {
+            return;
+        }
+        let old = self.hotkey;
+        let _ = self.hotkey_manager.unregister(old);
+        match self.hotkey_manager.register(preset_hotkey(want)) {
+            Ok(()) => {
+                self.hotkey = preset_hotkey(want);
+                self.preset = want;
+                self.config.hotkey_preset = want;
+                self.save();
+                self.menu_dirty = true;
+                tracing::info!("ptt hotkey switched to {want:?}");
+            }
+            Err(e) => {
+                // Old id is gone from the manager — re-register it so PTT survives.
+                if let Err(e2) = self.hotkey_manager.register(old) {
+                    tracing::warn!("hotkey restore failed: {e2:?}");
+                }
+                self.warn_note(format!("hotkey switch failed: {e:?}"));
+            }
+        }
+    }
+
+    fn handle_menu_event(&mut self, id: &MenuId) {
+        let ids = self.menu_ids.clone();
+        if *id == ids.status {
+            return;
+        }
+        if *id == ids.model_base {
+            self.config.model = ModelChoice::BaseEn;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("model set to base.en (takes effect next hold)");
+            return;
+        }
+        if *id == ids.model_small {
+            self.config.model = ModelChoice::SmallEn;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("model set to small.en (takes effect next hold)");
+            return;
+        }
+        if *id == ids.hk_right {
+            self.switch_hotkey(HotkeyPreset::RightOption);
+            return;
+        }
+        if *id == ids.hk_fn {
+            self.switch_hotkey(HotkeyPreset::Fn);
+            return;
+        }
+        if *id == ids.hk_ctrl {
+            self.switch_hotkey(HotkeyPreset::CtrlSpace);
+            return;
+        }
+        if *id == ids.launch_login {
+            let enable = !self.config.launch_at_login;
+            let exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
+            match crate::config::set_launch_at_login(enable, &exe, true) {
+                Ok(()) => {
+                    self.config.launch_at_login = enable;
+                    self.save();
+                    self.menu_dirty = true;
+                    tracing::info!("launch at login: {enable}");
+                }
+                Err(e) => self.warn_note(format!("launch-at-login failed: {e}")),
+            }
+            return;
+        }
+        if *id == ids.perm_mic {
+            crate::config::permissions::open_mic_settings();
+            return;
+        }
+        if *id == ids.perm_a11y {
+            crate::config::permissions::open_accessibility_settings();
+            return;
+        }
+        if *id == ids.quit {
+            tracing::info!("quit via menu");
+            std::process::exit(0);
+        }
+        if let Some((dev, _)) = ids.mic_items.iter().find(|(_, mid)| mid == id) {
+            self.config.mic_name = Some(dev.clone());
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("mic set to {dev} (takes effect next hold)");
+            return;
+        }
+        if let Some((text, _)) = ids.history_items.iter().find(|(_, hid)| hid == id) {
+            crate::inject::leave_on_clipboard(text);
+            self.note = Some("history copied to clipboard".to_string());
+            tracing::info!("history entry copied to clipboard");
+            return;
+        }
+        tracing::debug!("menu event for unknown id: {id:?}");
     }
 }
 
@@ -163,9 +487,11 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Task 3 fills menu items; drain here so clicks never pile up.
         while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
-            tracing::debug!("menu event (unhandled until Task 3): {ev:?}");
+            self.handle_menu_event(&ev.id);
+        }
+        if self.menu_dirty {
+            self.rebuild_menu();
         }
         self.sync_tray();
     }
@@ -174,24 +500,35 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
 fn app_main(
     event_loop: EventLoop<DaemonEvent>,
     proxy: winit::event_loop::EventLoopProxy<DaemonEvent>,
+    mut config: Config,
 ) -> ! {
-    // Task 3 fills menu items; the skeleton call lives here.
-    let menu = muda::Menu::new();
+    let devices = crate::audio::list_devices();
+    let history = crate::history::load_history();
+    let (menu, ids) = build_menu(&config, &devices, &history, AppState::Idle.status_label());
     let tray = TrayIconBuilder::new()
-        .with_tooltip(AppState::Idle.tooltip())
+        .with_tooltip(AppState::Idle.tooltip(config.hotkey_preset))
         .with_icon(make_icon(AppState::Idle))
         .with_menu(Box::new(menu))
         .build()
         .expect("tray icon");
-    tracing::info!("tray built (idle)");
+    tracing::info!(
+        "tray built (idle, {} mics, {} history)",
+        devices.len(),
+        history.len()
+    );
 
-    let (manager, hotkey, won) = crate::daemon::register_ptt_hotkey(HotkeyPreset::RightOption)
+    let (manager, hotkey, won) = crate::daemon::register_ptt_hotkey(config.hotkey_preset)
         .unwrap_or_else(|e| {
             eprintln!("no push-to-talk hotkey: {e}");
             std::process::exit(1);
         });
     tracing::info!("ptt hotkey registered: {won:?} (id {})", hotkey.id());
-    crate::daemon::spawn_hotkey_bridge(proxy.clone(), hotkey.id());
+    // Persist the actual winner so tooltip + next launch agree.
+    config.hotkey_preset = won;
+    if let Err(e) = crate::config::save_config(&config) {
+        tracing::warn!("save config failed: {e}");
+    }
+    crate::daemon::spawn_hotkey_bridge(proxy.clone());
 
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();
@@ -199,13 +536,19 @@ fn app_main(
 
     let mut app = DaemonApp {
         tray,
-        _hotkey_manager: manager,
+        hotkey_manager: manager,
+        hotkey,
+        preset: won,
+        config,
+        devices,
         proxy,
         tx,
         state: AppState::Idle,
         note: None,
         applied_state: AppState::Idle,
-        applied_tooltip: AppState::Idle.tooltip().to_string(),
+        applied_tooltip: AppState::Idle.tooltip(won),
+        menu_ids: ids,
+        menu_dirty: false,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
@@ -214,12 +557,12 @@ fn app_main(
     std::process::exit(0);
 }
 
-pub fn run() -> ! {
+pub fn run(initial: Config) -> ! {
     let event_loop = EventLoop::<DaemonEvent>::with_user_event()
         .build()
         .expect("winit event loop");
     let proxy = event_loop.create_proxy();
-    app_main(event_loop, proxy)
+    app_main(event_loop, proxy, initial)
 }
 
 #[cfg(test)]
@@ -228,10 +571,22 @@ mod tests {
 
     #[test]
     fn test_tooltips_cover_all_states() {
-        assert!(AppState::Idle.tooltip().contains("hold"));
-        assert!(AppState::Recording.tooltip().contains("recording"));
-        assert!(AppState::Transcribing.tooltip().contains("transcribing"));
-        assert!(AppState::Error.tooltip().contains("error"));
+        let p = HotkeyPreset::CtrlSpace;
+        assert!(AppState::Idle.tooltip(p).contains("hold"));
+        assert!(AppState::Recording.tooltip(p).contains("recording"));
+        assert!(AppState::Transcribing.tooltip(p).contains("transcribing"));
+        assert!(AppState::Error.tooltip(p).contains("error"));
+    }
+
+    #[test]
+    fn test_idle_tooltip_reflects_winning_preset() {
+        assert!(AppState::Idle
+            .tooltip(HotkeyPreset::CtrlSpace)
+            .contains("Ctrl+Space"));
+        assert!(AppState::Idle
+            .tooltip(HotkeyPreset::RightOption)
+            .contains("Right Option"));
+        assert!(AppState::Idle.tooltip(HotkeyPreset::Fn).contains("Fn"));
     }
 
     #[test]
@@ -283,5 +638,53 @@ mod tests {
         ] {
             let _ = make_icon(state);
         }
+    }
+
+    fn sample_history() -> Vec<HistoryEntry> {
+        vec![HistoryEntry {
+            text: "hello world".into(),
+            at_ms: 1_700_000_000_000,
+            duration_ms: 1500,
+            rtf: 0.1,
+        }]
+    }
+
+    #[test]
+    fn test_menu_ids_distinct() {
+        // Pure id scheme — no platform menus (muda forbids Menu::new off
+        // the main thread on macOS). build_menu stamps these same ids via
+        // with_id, so distinctness here covers the handler dispatch.
+        let devices = vec!["Mic A".to_string(), "Mic B".to_string()];
+        let ids = ids_for(&devices, &sample_history());
+        let mut all = vec![
+            ids.status,
+            ids.model_base,
+            ids.model_small,
+            ids.hk_right,
+            ids.hk_fn,
+            ids.hk_ctrl,
+            ids.launch_login,
+            ids.perm_mic,
+            ids.perm_a11y,
+            ids.quit,
+        ];
+        all.extend(ids.mic_items.into_iter().map(|(_, id)| id));
+        all.extend(ids.history_items.into_iter().map(|(_, id)| id));
+        let mut seen = std::collections::HashSet::new();
+        for id in &all {
+            assert!(seen.insert(id.clone()), "duplicate menu id: {id:?}");
+        }
+    }
+
+    #[test]
+    fn test_menu_ids_stable_across_rebuilds() {
+        // Rebuilds (state change, history push) must keep ids so in-flight
+        // clicks still dispatch instead of falling to "unknown id".
+        let devices = vec!["Mic A".to_string()];
+        let a = ids_for(&devices, &sample_history());
+        let b = ids_for(&devices, &sample_history());
+        assert_eq!(a.status, b.status);
+        assert_eq!(a.quit, b.quit);
+        assert_eq!(a.hk_ctrl, b.hk_ctrl);
     }
 }

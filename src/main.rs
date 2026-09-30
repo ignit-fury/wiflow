@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod config;
 mod daemon;
 mod history;
 mod hotkey;
@@ -61,7 +62,7 @@ fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.app {
-        app::run();
+        app::run(config::load_config());
     }
     if args.list_devices {
         for d in audio::list_devices() {

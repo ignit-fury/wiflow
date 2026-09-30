@@ -34,8 +34,8 @@ pub fn push_history_to(path: &Path, entry: HistoryEntry) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir history: {e:?}"))?;
     }
-    let json = serde_json::to_string_pretty(&all).map_err(|e| format!("encode history: {e:?}"))?;
-    std::fs::write(path, json).map_err(|e| format!("write history: {e:?}"))
+    // Crash-safe: tmp + rename, never a partial history.json.
+    crate::config::atomic_write_json(path, &all)
 }
 
 /// Read API for future UI; kept narrow — clippy demands without a bin caller.
