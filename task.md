@@ -91,7 +91,9 @@
 - [ ] `dirs`-crate path centralization (HOME fallback accepted for v1)
 - [ ] SHA256 model pin (size gate only in v1)
 - [ ] Layout-aware paste (Dvorak/IME-aware injection)
-- [ ] ggml-metal teardown abort fix (GGML_ASSERT after work, results unaffected)
+- [x] Exit crashes fixed (2026-10-01, commit 15e26fe): two root causes from crash reports + on-demand repro — (1) enigo `key()` on worker thread tripped HIToolbox main-queue assert (`dispatch_assert_queue_fail` → SIGTRAP); inject now runs in the winit `user_event` Done handler (main thread), live-verified (inject Ok + app alive). (2) leaked WhisperContext (static) kept ggml residency-set entries; whisper.cpp C++ static device destructor aborted (SIGABRT) at exit; `stt::shutdown()` drops the ctx before every normal exit path, test-verified (leak + shutdown → exit 0). Rejected-TTS note: mic can't hear `say` output on this machine — the repro used synthetic tone via test.
+- [x] Trace-trap crash user-reported in `--app` runs — same two root causes as above, both fixed
+- [x] Zombie-incident note: a cancelled subagent wrote unvetted changes (WhisperState reuse, post_process capitalization, Tiny model variant) interleaved with crash-fix edits; reverted, only reviewed fixes shipped. Candidates for proper reviewed tasks: WhisperState reuse (~200ms/transcribe saved), post_process sentence capitalization, Tiny model variant.
 - [ ] True WER corpus eval (TTS substitute in v1)
 - [ ] small.en bench (465 MB deferred until accuracy data demands it)
 - [ ] Groq cloud fallback behind setting (`cloud` feature, user key)

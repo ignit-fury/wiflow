@@ -1,5 +1,13 @@
 # Memory — Decisions & Context
 
+## Crash Fixes — Exit SIGTRAP + SIGABRT (2026-10-01, commit 15e26fe)
+- User-reported: `--app` runs crashed with `zsh: trace trap` after dictation cycles (enigo had permission, inject never completed).
+- Root cause 1 (SIGTRAP): enigo `key()` ran on the WORKER thread; its HIToolbox keycode mapping (`TSMGetInputSourceProperty` → `islGetInputSourceListWithAdditions`) is main-queue-only — `dispatch_assert_queue_fail` → `EXC_BREAKPOINT`. Diagnosed via macOS crash report (`~/Library/Logs/DiagnosticReports/wiflow-dictation-*.ips`) + on-demand repro (app + posted Ctrl+Space + TTS → died after "has the permission"). Fix: inject moved from `daemon::pipeline_on_worker` into `app::user_event` Done handler (main thread). Verified live: "injected via clipboard+Cmd+V (restored: true)" + app stayed alive.
+- Root cause 2 (SIGABRT): static `STT` leaks the WhisperContext; whisper.cpp's C++ static `unique_ptr<ggml_metal_device>` destructor runs at `exit()` → `ggml_metal_device_free` → `ggml_metal_rsets_free` asserts on the non-empty residency set (180s keep-alive buffers still referenced by the leaked backend). Test processes drop the ctx explicitly → clean; that's why tests never caught it. Fix: `stt::shutdown()` (takes Stt out of the static, poison-tolerant) called before every normal exit path (simulate branch + menu Quit). Verified: throwaway test leak + shutdown → exit 0.
+- Lesson: crash reports in `~/Library/Logs/DiagnosticReports/` carry the exact faulting stack — check them FIRST before log archaeology.
+- Zombie incident: a cancelled subagent later wrote unvetted changes (WhisperState reuse, post_process capitalization, Tiny model variant) interleaved with the fixes and got swept into a fix commit; reset + recommit cleaned it. Candidates for proper reviewed tasks: WhisperState reuse (~200ms/transcribe), post_process sentence capitalization, Tiny variant.
+- macOS constraint remembered: single-key global hotkeys (AltRight/Fn) fail "Unknown scancode"; CtrlSpace works. PTT mode unchanged.
+
 ## Phase 4 Inject + History — Wired (2026-09-30)
 - Deps: arboard 3.6, enigo 0.6, serde 1, serde_json 1 (all $0, offline, no network).
 - Wiring: `--no-inject` flag; Transcribe arm → empty-skip → `push_history` (warn-only on failure) → inject or skip; `Stt::load` → `shared_stt` singleton + `Mutex` guard; `now_ms()` wall-clock for `at_ms` (`Instant` would be wrong for a timestamp).
