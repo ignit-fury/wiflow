@@ -1,3 +1,4 @@
+mod app;
 mod audio;
 mod history;
 mod hotkey;
@@ -27,6 +28,9 @@ struct Args {
     /// Skip cursor injection (headless/CI runs)
     #[arg(long)]
     no_inject: bool,
+    /// Launch the menu-bar app (tray + global hotkey daemon)
+    #[arg(long)]
+    app: bool,
 }
 
 fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +59,9 @@ fn now_ms() -> u64 {
 fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    if args.app {
+        app::run();
+    }
     if args.list_devices {
         for d in audio::list_devices() {
             println!("{d}");
@@ -118,22 +125,12 @@ fn main() {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                let stt_lock = match stt::shared_stt(&model_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("stt load failed: {e}");
-                        return;
-                    }
-                };
-                let mut stt = stt_lock.lock().unwrap_or_else(|e| e.into_inner());
-                let load_ms = t0.elapsed().as_millis();
-                let t1 = std::time::Instant::now();
-                match stt.transcribe(&kept) {
+                match stt::transcribe_shared(&model_path, &kept) {
                     Ok(text) => {
-                        let ms = t1.elapsed().as_millis();
+                        let ms = t0.elapsed().as_millis();
                         let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
                         let rtf = ms as f64 / kept_ms.max(1.0);
-                        info!("model loaded in {load_ms}ms, transcribed in {ms}ms (RTF {rtf:.2})");
+                        info!("transcribed in {ms}ms (RTF {rtf:.2})");
                         println!("TRANSCRIPT: {text}");
                         if text.trim().is_empty() {
                             info!("empty transcript, nothing to inject");

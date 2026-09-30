@@ -54,16 +54,22 @@ impl Stt {
     }
 }
 
-static STT: OnceLock<Result<Mutex<Stt>, String>> = OnceLock::new();
+static STT: OnceLock<Mutex<Option<(PathBuf, Stt)>>> = OnceLock::new();
 
-/// Load once per process: 5.7s Metal init must not repeat per hold.
-/// First call wins — later calls with a different path return the cached instance.
-/// (Stores Result: `get_or_try_init` is nightly-only on this toolchain, so the
-/// stable `get_or_init` caches the Err too — second bad-path call stays Err.)
-pub fn shared_stt(model_path: &Path) -> Result<&'static Mutex<Stt>, String> {
-    STT.get_or_init(|| Stt::load(model_path).map(Mutex::new))
-        .as_ref()
-        .map_err(|e| e.clone())
+/// Load once, reload on model switch, retry after failure (Err never sticks).
+/// First-implemented fix for the Phase 4 `OnceLock<Result>` Err-sticks finding.
+pub fn transcribe_shared(model_path: &Path, samples: &[f32]) -> Result<String, String> {
+    let slot = STT.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = matches!(&*guard, Some((p, _)) if p == model_path);
+    if !hit {
+        *guard = Some((model_path.to_path_buf(), Stt::load(model_path)?));
+    }
+    guard
+        .as_mut()
+        .expect("slot just filled")
+        .1
+        .transcribe(samples)
 }
 
 pub const MODEL_URL: &str =
@@ -136,10 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_stt_bad_path_is_err() {
-        assert!(shared_stt(std::path::Path::new("/nonexistent/ggml.bin")).is_err());
-        // Second call with same bad path: still Err, no panic, no hang.
-        assert!(shared_stt(std::path::Path::new("/nonexistent/ggml.bin")).is_err());
+    fn test_transcribe_shared_bad_path_is_err() {
+        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
+        // Retry allowed: second call re-attempts (no poisoned cache).
+        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
     }
 
     #[test]
