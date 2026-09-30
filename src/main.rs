@@ -1,5 +1,7 @@
 mod audio;
 mod hotkey;
+#[allow(dead_code)]
+mod inject;
 mod stt;
 mod vad;
 
