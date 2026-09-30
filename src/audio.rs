@@ -69,7 +69,7 @@ pub fn u16_to_f32(s: u16) -> f32 {
     (s as f32 - 32768.0) / 32768.0
 }
 
-// Task 1 pre-req — wired in Task 4; allow dead_code until then.
+// Reserved for i16 whisper path; test-only use so clippy demands narrow allow.
 #[allow(dead_code)]
 pub fn f32_to_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0).round() as i16

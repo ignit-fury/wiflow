@@ -1,12 +1,10 @@
 use std::path::{Path, PathBuf};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-#[allow(dead_code)]
 pub struct Stt {
     ctx: WhisperContext,
 }
 
-#[allow(dead_code)]
 fn num_threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as i32)
@@ -14,7 +12,6 @@ fn num_threads() -> i32 {
         .min(8)
 }
 
-#[allow(dead_code)]
 impl Stt {
     pub fn load(path: &Path) -> Result<Self, String> {
         let mut ctx_params = WhisperContextParameters::new();
@@ -56,27 +53,21 @@ impl Stt {
     }
 }
 
-#[allow(dead_code)]
 pub const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 /// Verified 2026-09-30 via HEAD (HTTP 200, content-length).
-#[allow(dead_code)]
 pub const MODEL_SIZE: u64 = 147_964_211;
-#[allow(dead_code)]
 pub const MODEL_NAME: &str = "ggml-base.en.bin";
 
-#[allow(dead_code)]
 pub fn models_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join("Library/Application Support/wiflow/models")
 }
 
-#[allow(dead_code)]
 pub fn model_path() -> PathBuf {
     models_dir().join(MODEL_NAME)
 }
 
-#[allow(dead_code)]
 pub fn verify_model(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() == MODEL_SIZE)
@@ -85,7 +76,6 @@ pub fn verify_model(path: &Path) -> bool {
 
 /// Download base.en on first use (curl ships with macOS — no HTTP dep).
 /// Skips download when a size-verified model already exists.
-#[allow(dead_code)]
 pub fn ensure_model() -> Result<PathBuf, String> {
     let path = model_path();
     if verify_model(&path) {
@@ -130,5 +120,19 @@ mod tests {
         assert!(verify_model(&p));
         std::fs::remove_file(&p).unwrap();
         assert!(!verify_model(&p));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_transcribe_tone_with_real_model() {
+        let path = model_path();
+        if !verify_model(&path) {
+            eprintln!("skipped: model missing");
+            return;
+        }
+        let mut stt = Stt::load(&path).expect("load");
+        let tone: Vec<f32> = (0..16_000).map(|i| 0.5 * (i as f32 * 0.02).sin()).collect();
+        let text = stt.transcribe(&tone).expect("transcribe must not error");
+        eprintln!("tone transcript: {text:?}");
     }
 }

@@ -32,18 +32,14 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
 }
 
 /// Below this RMS the input is room tone, not speech (measured room: 0.002).
-// Task 1 pre-req — wired in Task 4; allow dead_code until then.
-#[allow(dead_code)]
 pub const MIN_SPEECH_RMS: f32 = 0.01;
 
-#[allow(dead_code)]
 pub fn has_speech_energy(samples: &[f32]) -> bool {
     rms(samples) >= MIN_SPEECH_RMS
 }
 
 /// Single enforced entry point for STT input: energy gate → resample → trim.
 /// Guarantees the 16kHz contract by construction (fixes Phase 2 review finding).
-#[allow(dead_code)]
 pub fn transcribe_ready(samples: &[f32], from_rate: u32, vad: &mut Vad) -> Vec<f32> {
     if !has_speech_energy(samples) {
         return Vec::new();

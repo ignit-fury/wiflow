@@ -16,6 +16,9 @@ struct Args {
     dump_wav: bool,
     #[arg(long)]
     device: Option<String>,
+    /// Override model path (default: auto-download base.en to Application Support)
+    #[arg(long)]
+    model: Option<std::path::PathBuf>,
     /// Simulate hold of N ms without global hotkey (for headless test)
     #[arg(long)]
     simulate_hold_ms: Option<u64>,
@@ -65,10 +68,9 @@ fn main() {
             out.duration_ms,
             audio::rms(&out.samples_mono)
         );
-        let s16 = vad::resample_to_16k(&out.samples_mono, out.sample_rate);
         let mut vad = vad::Vad::new();
-        let kept = vad.trim_silence(&s16);
-        info!("vad kept {}/{} samples", kept.len(), s16.len());
+        let kept = vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
+        info!("vad kept {}/{} samples", kept.len(), out.samples_mono.len());
         if kept.is_empty() {
             info!("no speech detected");
             return;
@@ -79,6 +81,35 @@ fn main() {
                     "would transcribe {duration_ms}ms ({} vad samples)",
                     kept.len()
                 );
+                let model_path = match &args.model {
+                    Some(p) => p.clone(),
+                    None => match stt::ensure_model() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("model unavailable: {e}");
+                            return;
+                        }
+                    },
+                };
+                let t0 = std::time::Instant::now();
+                let mut stt = match stt::Stt::load(&model_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("stt load failed: {e}");
+                        return;
+                    }
+                };
+                let load_ms = t0.elapsed().as_millis();
+                let t1 = std::time::Instant::now();
+                match stt.transcribe(&kept) {
+                    Ok(text) => {
+                        let ms = t1.elapsed().as_millis();
+                        let rtf = ms as f64 / duration_ms.max(1) as f64;
+                        info!("model loaded in {load_ms}ms, transcribed in {ms}ms (RTF {rtf:.2})");
+                        println!("TRANSCRIPT: {text}");
+                    }
+                    Err(e) => warn!("transcribe failed: {e}"),
+                }
                 if args.dump_wav {
                     match dump_wav("/tmp/wiflow_hold.wav", &kept, vad::VAD_SAMPLE_RATE) {
                         Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
