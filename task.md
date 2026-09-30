@@ -1,6 +1,6 @@
 # Tasks — Dictation App (phase 1 complete: audio + hotkey prototype working)
 
-> Rule: no implementation until user says "build". This file tracks docs → prototype → v1.
+> Phase 1 built 2026-09-30 after user approval. Phase 2+ needs approval per phase.
 
 ## Phase 0 — Docs (current)
 - [x] `prd.md` — scope, push-to-talk, $0 rule
@@ -10,10 +10,10 @@
 - [x] `task.md` — this file
 - [x] `memory.md` — decisions log
 - [ ] User reviews 6 docs, locks default hotkey + default model choice
-- [ ] Commit docs to git
+- [x] Commit docs to git
 
 ## Phase 1 — Audio + Hotkey prototype (complete 2026-09-30)
-- [x] `cargo init`, `Cargo.toml` (edition 2021, `cpal`, `ringbuf`, `global-hotkey`, `tray-icon`)
+- [x] `cargo init`, `Cargo.toml` (edition 2021, `cpal`, `ringbuf`, `global-hotkey`, `hound`, `clap`, `tracing`)
 - [x] `audio.rs`: list devices, capture 16kHz mono, RMS meter, wav dump flag — 3 input devices observed (MacBook Air Microphone, BlackHole 16ch, BlackHole 2ch)
 - [x] `hotkey.rs`: push-to-talk state machine (keydown/up, Esc cancel, <300ms discard, 60s auto-stop) — 8/8 tests pass
 - [x] Manual test: hold/release logs durations, no transcribe yet — simulate-hold wall 1.95s, 66048 samples @44100Hz
@@ -24,6 +24,18 @@
 - [ ] `vad.rs`: `webrtc-vad` impl, 30ms frames, trim silence + 200ms padding
 - [ ] Unit tests: silence-only → discard; speech+silence → trimmed
 - [ ] Golden wavs in `tests/data/` (not committed if large — document source)
+- [ ] Audio hardening tickets (from 2026-09-30 final review, all in `src/audio.rs` unless noted):
+  - [ ] Pick sample rate clamped to 16kHz instead of range max (`audio.rs:99`) — 192kHz devices blow up ringbuf (~53MB) and break 16kHz contract
+  - [ ] Rename `samples_16k_mono` → `samples_mono` (stores native rate until resample lands) + add `resample_to_16k()`; update `main.rs` field uses
+  - [ ] Format negotiation: handle I16/U16-only devices (`i16→f32`/`u16→f32` conversion) instead of clean Err
+  - [ ] Lock-free capture: `HeapRb::split()` producer/consumer + `try_lock`, remove `Mutex` from realtime callback
+  - [ ] `Instant` instead of `SystemTime` for hold-duration clock (NTP skew)
+  - [ ] `warn!` on lock-poison in `stop()` instead of silent empty default
+  - [ ] Log `dump_wav` IO errors (`src/main.rs`) instead of `let _`
+  - [ ] Fix simulate clock divergence: sleep bound vs `on_key_up(hold)` (`src/main.rs:57 vs 66`)
+  - [ ] `assert!(!devs.is_empty())`, drop `#[allow(clippy::len_zero)]` (`src/audio.rs:160`)
+  - [ ] Extra tests: stray `on_key_up` without down (`Ignored`), backwards time, bogus device name → Err
+  - [ ] Decide `global-hotkey` stub: wire behind feature or drop dep until Phase 5; fix doc drift
 
 ## Phase 3 — Local STT (whisper-rs Metal)
 - [ ] `stt.rs`: model manager (download base.en with progress + SHA), transcribe i16
