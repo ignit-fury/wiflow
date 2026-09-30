@@ -38,6 +38,8 @@ pub fn push_history_to(path: &Path, entry: HistoryEntry) -> Result<(), String> {
     std::fs::write(path, json).map_err(|e| format!("write history: {e:?}"))
 }
 
+/// Read API for future UI; kept narrow — clippy demands without a bin caller.
+#[allow(dead_code)]
 pub fn load_history() -> Vec<HistoryEntry> {
     load_history_from(&history_path())
 }

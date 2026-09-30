@@ -1,8 +1,6 @@
 mod audio;
-#[allow(dead_code)]
 mod history;
 mod hotkey;
-#[allow(dead_code)]
 mod inject;
 mod stt;
 mod vad;
@@ -26,6 +24,9 @@ struct Args {
     /// Simulate hold of N ms without global hotkey (for headless test)
     #[arg(long)]
     simulate_hold_ms: Option<u64>,
+    /// Skip cursor injection (headless/CI runs)
+    #[arg(long)]
+    no_inject: bool,
 }
 
 fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +42,14 @@ fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::e
     }
     w.finalize()?;
     Ok(())
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -109,13 +118,14 @@ fn main() {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                let mut stt = match stt::Stt::load(&model_path) {
+                let stt_lock = match stt::shared_stt(&model_path) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!("stt load failed: {e}");
                         return;
                     }
                 };
+                let mut stt = stt_lock.lock().unwrap_or_else(|e| e.into_inner());
                 let load_ms = t0.elapsed().as_millis();
                 let t1 = std::time::Instant::now();
                 match stt.transcribe(&kept) {
@@ -125,6 +135,33 @@ fn main() {
                         let rtf = ms as f64 / kept_ms.max(1.0);
                         info!("model loaded in {load_ms}ms, transcribed in {ms}ms (RTF {rtf:.2})");
                         println!("TRANSCRIPT: {text}");
+                        if text.trim().is_empty() {
+                            info!("empty transcript, nothing to inject");
+                        } else {
+                            let entry = history::HistoryEntry {
+                                text: text.clone(),
+                                at_ms: now_ms(),
+                                duration_ms,
+                                rtf,
+                            };
+                            if let Err(e) = history::push_history(entry) {
+                                warn!("history push failed: {e}");
+                            }
+                            if args.no_inject {
+                                info!("--no-inject: skipping cursor injection");
+                            } else {
+                                match inject::inject_text(&text) {
+                                    Ok(r) => info!(
+                                        "injected via {} (clipboard restored: {})",
+                                        r.pasted_via, r.clipboard_restored
+                                    ),
+                                    Err(e) => {
+                                        warn!("inject failed ({e}) — text left on clipboard, press Cmd+V");
+                                        inject::leave_on_clipboard(&text);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => warn!("transcribe failed: {e}"),
                 }
