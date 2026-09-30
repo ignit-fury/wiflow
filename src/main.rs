@@ -1,5 +1,6 @@
 mod audio;
 mod hotkey;
+mod vad;
 
 use clap::Parser;
 use hotkey::{PttEvent, PushToTalk};
