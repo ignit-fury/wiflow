@@ -4,7 +4,7 @@
 - Deps: arboard 3.6, enigo 0.6, serde 1, serde_json 1 (all $0, offline, no network).
 - Wiring: `--no-inject` flag; Transcribe arm → empty-skip → `push_history` (warn-only on failure) → inject or skip; `Stt::load` → `shared_stt` singleton + `Mutex` guard; `now_ms()` wall-clock for `at_ms` (`Instant` would be wrong for a timestamp).
 - History file: `~/Library/Application Support/wiflow/history.json`, plain JSON last-50, user-deletable (local-only, clearable per rules).
-- Inject outcome: UNPROVEN live — both runs hit no-speech path (silent room rms 0.003/0.005, vad kept 0), so neither history entry nor inject-vs-fallback was exercised; no panic. USER spoken run + 5-app matrix (incl. Accessibility note + password-field clipboard expectation) recorded in task.md.
+- Inject outcome: TTS-PROVEN live — `say "the quick brown fox jumps over the lazy dog"` → TRANSCRIPT exact, inject Ok `clipboard+Cmd+V (restored: true)`, history.json 1 entry rtf 0.055 (132096 samples rms 0.036, kept 47926/132096, RTF 0.05). Earlier no-speech observations: silent-room runs rms 0.003/0.005, kept 0, history ABSENT (correct), no panic. Teardown caveat: GGML_ASSERT Metal abort after work, results unaffected. USER spoken run + 5-app matrix (mic acoustics in real apps still user-owned) recorded in task.md.
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean (narrow allow kept on `load_history` only), `cargo test` 34 passed + 1 ignored, 0 failed.
 - Deferred: SHA256 model pin, `set_single_segment` revisit, `raw→16k→kept` log split, history copy/clear UI (Phase 5).
 
