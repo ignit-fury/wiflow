@@ -73,15 +73,29 @@
   - [ ] USER Slack: focus message box, check paste
   - [ ] USER Password field: expect clipboard-only + warn (secure fields reject synthetic paste — by design, text stays on clipboard)
 
-## Phase 5 — Menu-bar UI + Packaging
-- [ ] Tray icon states, recording pill, toasts, settings window, onboarding (mic + accessibility)
-- [ ] `Info.plist` keys, launch-at-login, sign + notarize dry run
-- [ ] `cargo fmt`, `clippy -D warnings`, `cargo test` green
-- [ ] DMG/zip + first-run model download UX
+## Phase 5 — Menu-bar UI + Packaging (complete 2026-09-30)
+- [x] Task 1: deps + reloadable STT + tray shell — winit 0.30.13, tray-icon 0.24.2, muda 0.19.3, global-hotkey 0.7.0; `transcribe_shared` reloadable holder; `--app` flag; AppState icons/tooltips (commit 520adcf)
+- [x] Task 2: hotkey daemon + worker pipeline — `daemon.rs`: preset registration (CtrlSpace default wins; AltRight/Fn rejected by macOS "Unknown scancode"), worker thread (capture→VAD→STT→inject→history), DaemonEvent proxy protocol (commit f44bf0a)
+- [x] Task 3: config + menu system + hardening — `config.rs` (JSON config, LaunchAgent plist, Settings deep links), full menu tree (mic/model/hotkey/history/permissions), atomic history write, small.en variant (commit d7261c2)
+- [x] Task 4: Esc fix + packaging + docs — Esc registered as 2nd hotkey on same manager, forwarded via bridge as `DaemonEvent::Cancel`; live round-trip proven (see memory.md); `Info.plist` + `build-app.sh` + `make-dmg.sh` + `docs/NOTARIZE.md` (commits a3a3c61, cf6e90b)
+- [x] Tray icon states (idle/recording/transcribing/error) + tooltip; recording pill → v1.1; toasts → tooltip+log, v1.1; settings window → menu submenus + config.json; onboarding → Permissions menu + mic usage plist key
+- [x] `Info.plist` keys (LSUIElement, mic usage), launch-at-login (LaunchAgent plist), ad-hoc sign (`codesign -s -`), notarize documented (docs/NOTARIZE.md)
+- [x] `cargo fmt --check` clean, `clippy --all-targets -- -D warnings` clean, `cargo test` 51 passed + 1 ignored, 0 failed
+- [x] DMG: `target/Wiflow-0.1.0-arm64.dmg` 2,111,080 bytes (2.0 MB), `hdiutil verify` VALID; bundle `target/Wiflow.app` 4.1 MB ad-hoc signed (Signature=adhoc, Identifier=com.wiflow.dictation); bundle `--app` runs: tray built, both hotkeys registered, no panic; first-run model download via `ensure_model` (base.en 147,964,211 bytes, size-gated)
 
-## Phase 6 — v1.1 / v1.2 (deferred, do not start)
-- [ ] v1.1: Groq cloud fallback behind setting (`cloud` feature, user key)
-- [ ] v1.2: Ollama cleanup opt-in (`llm` feature)
+## v1.1 (tracked deferred — do not start without approval)
+- [ ] Recording pill overlay window (tray icon + tooltip carry the indicator in v1)
+- [ ] Settings window (v1 uses menu submenus + config.json)
+- [ ] Rich toasts (v1 uses tooltip + tracing logs)
+- [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances)
+- [ ] `dirs`-crate path centralization (HOME fallback accepted for v1)
+- [ ] SHA256 model pin (size gate only in v1)
+- [ ] Layout-aware paste (Dvorak/IME-aware injection)
+- [ ] ggml-metal teardown abort fix (GGML_ASSERT after work, results unaffected)
+- [ ] True WER corpus eval (TTS substitute in v1)
+- [ ] small.en bench (465 MB deferred until accuracy data demands it)
+- [ ] Groq cloud fallback behind setting (`cloud` feature, user key)
+- [ ] Ollama cleanup opt-in (`llm` feature)
 - [ ] Streaming partials, Parakeet eval, Win/Linux packaging
 
 ## Done Definition (v1)

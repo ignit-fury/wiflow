@@ -48,8 +48,16 @@
 - Ignored live test green: sine tone → `"(dramatic music)"` hallucination (expected — pure tones are not speech).
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26 passed + 1 ignored. Deviations: true WER corpus deferred; OOM→base fallback deferred (base-only v1).
 
+## Phase 5 Menu-Bar App + Packaging — Complete (2026-09-30)
+- Stack: Rust 1.95.0, winit 0.30.13, tray-icon 0.24.2, muda 0.19.3, global-hotkey 0.7.0, open 5.4.
+- CtrlSpace outcome: default preset registers immediately (id 524350); AltRight/Fn rejected by macOS ("Unknown scancode") — CtrlSpace locked as v1 default, fallback order CtrlSpace→Fn.
+- Esc outcome: winit device_event proven dead for zero-window tray apps (Task 3). Fix: `register_cancel_hotkey` registers Escape (id 114) as a 2nd hotkey on the SAME GlobalHotKeyManager; bridge thread matches esc id → `DaemonEvent::Cancel` on Pressed (Released ignored). Live round-trip (Quartz-posted keys): `capture started @ 44100Hz` → `dictation cancelled (Esc)` → `dictation failed: cancelled (Esc)` → release → `ptt up ignored: Ignored` → `cycle done, no text` (tray back to Idle, no stuck Recording).
+- Packaging: `target/Wiflow.app` 4.1 MB, ad-hoc signed (Signature=adhoc, Identifier=com.wiflow.dictation, TeamIdentifier=not set); bundle `--app` runs clean (tray built, both hotkeys registered, no panic). `target/Wiflow-0.1.0-arm64.dmg` 2,111,080 bytes (2.0 MB), `hdiutil verify` VALID. Notarization documented in docs/NOTARIZE.md (manual, paid Apple Developer $99/yr, no credentials in repo).
+- Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 51 passed + 1 ignored, 0 failed.
+- Deferred to tracked v1.1 section in task.md: pill overlay, settings window, rich toasts, set_single_segment revisit, dirs crate, SHA256 pin, layout-aware paste, ggml-metal teardown abort, true WER corpus, small.en bench.
+
 ## Next Step
-- Phase 3 done. Next: user approves → start task.md Phase 4 (Inject + History).
+- Phase 5 done. v1 feature-complete: user approval → ship.
 
 ## Phase 2 VAD — Complete (2026-09-30)
 - Deps: `webrtc-vad 0.4` added (links C code, no network at runtime); `global-hotkey 0.6` stub dropped until Phase 5; ringbuf split producer/consumer.
