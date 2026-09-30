@@ -1,5 +1,6 @@
 use clap::Parser;
-use tracing::info;
+
+mod audio;
 
 #[derive(Parser, Debug)]
 #[command(name = "wiflow-dictation", about = "Push-to-talk dictation prototype")]
@@ -16,7 +17,10 @@ fn main() {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.list_devices {
-        info!("list-devices requested (wired in Task 2)");
+        for d in audio::list_devices() {
+            println!("{d}");
+        }
+        return;
     }
     println!("wiflow-dictation phase1 scaffold ok");
 }
