@@ -64,13 +64,22 @@ fn main() {
             out.duration_ms,
             audio::rms(&out.samples_mono)
         );
-        // Use the MEASURED clock, not the requested hold: sleep bound (3000ms) and
-        // stream-setup latency diverge from `hold` (Phase 1 review).
+        let s16 = vad::resample_to_16k(&out.samples_mono, out.sample_rate);
+        let mut vad = vad::Vad::new();
+        let kept = vad.trim_silence(&s16);
+        info!("vad kept {}/{} samples", kept.len(), s16.len());
+        if kept.is_empty() {
+            info!("no speech detected");
+            return;
+        }
         match ptt.on_key_up(out.duration_ms) {
             PttEvent::Transcribe { duration_ms } => {
-                info!("would transcribe {duration_ms}ms");
+                info!(
+                    "would transcribe {duration_ms}ms ({} vad samples)",
+                    kept.len()
+                );
                 if args.dump_wav {
-                    match dump_wav("/tmp/wiflow_hold.wav", &out.samples_mono, out.sample_rate) {
+                    match dump_wav("/tmp/wiflow_hold.wav", &kept, vad::VAD_SAMPLE_RATE) {
                         Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
                         Err(e) => warn!("wav dump failed: {e}"),
                     }
@@ -80,8 +89,7 @@ fn main() {
         }
         return;
     }
-    println!("Phase1: global-hotkey wiring lands here. Use --simulate-hold-ms 1500 for now.");
     println!(
-        "Next: global-hotkey 0.6 GlobalHotKeyManager + winit event loop (Task 4 follow-up on user approval)."
+        "Phase 5: tray + global-hotkey wiring lands here. Use --simulate-hold-ms 1500 for now."
     );
 }

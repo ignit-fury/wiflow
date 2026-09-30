@@ -1,6 +1,3 @@
-// Task 5 wires this module into main; allow dead code until then.
-#![allow(dead_code)]
-
 use webrtc_vad::{SampleRate, Vad as WebrtcVad, VadMode};
 
 pub const VAD_SAMPLE_RATE: u32 = 16_000;
@@ -11,6 +8,9 @@ pub const PAD_FRAMES: usize = 7;
 
 /// Linear-interpolate any mono rate to 16kHz mono.
 pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
+    if from_rate == 0 {
+        return Vec::new();
+    }
     if samples.is_empty() {
         return Vec::new();
     }
@@ -114,6 +114,11 @@ mod tests {
     #[test]
     fn test_resample_empty() {
         assert!(resample_to_16k(&[], 44_100).is_empty());
+    }
+
+    #[test]
+    fn test_resample_zero_rate_is_empty() {
+        assert!(resample_to_16k(&[0.5; 10], 0).is_empty());
     }
 
     #[test]
