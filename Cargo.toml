@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 webrtc-vad = "0.4"
+whisper-rs = { version = "0.16", features = ["metal"] }
 
 [dev-dependencies]
 approx = "0.5"

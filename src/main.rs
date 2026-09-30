@@ -1,5 +1,6 @@
 mod audio;
 mod hotkey;
+mod stt;
 mod vad;
 
 use clap::Parser;
