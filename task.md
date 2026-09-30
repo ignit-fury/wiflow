@@ -1,4 +1,4 @@
-# Tasks — Dictation App (docs-first, no code yet)
+# Tasks — Dictation App (phase 1 complete: audio + hotkey prototype working)
 
 > Rule: no implementation until user says "build". This file tracks docs → prototype → v1.
 
@@ -18,7 +18,7 @@
 - [x] `hotkey.rs`: push-to-talk state machine (keydown/up, Esc cancel, <300ms discard, 60s auto-stop) — 8/8 tests pass
 - [x] Manual test: hold/release logs durations, no transcribe yet — simulate-hold wall 1.95s, 66048 samples @44100Hz
 - [x] Bench: CPU % while recording on M1 — 5% CPU observed
-- [x] Gates green: `cargo fmt --check` clean, `cargo clippy -D warnings` clean, `cargo test` 8/8
+- [x] Gates green: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 8/8
 
 ## Phase 2 — VAD
 - [ ] `vad.rs`: `webrtc-vad` impl, 30ms frames, trim silence + 200ms padding

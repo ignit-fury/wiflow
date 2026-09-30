@@ -12,7 +12,7 @@
 - 2026-09-30 — Docs-first: 6 files before any code, per user request. No build until "build" command.
 
 ## Project Context
-- Repo: `/Users/prempatel/Documents/wiflow`, `main` branch, empty except docs (as of 2026-09-30).
+- Repo: `/Users/prempatel/Documents/wiflow`, `main` branch; Phase 1 prototype (src/main.rs, src/audio.rs, src/hotkey.rs) + docs (as of 2026-09-30).
 - Docs: `prd.md`, `architecture.md`, `rules.md`, `design.md`, `task.md`, `memory.md` (this file).
 - Brainstorming skill used; visual companion never needed (no mockup question arose).
 
@@ -24,7 +24,7 @@
 
 ## Constraints Remembered
 - Terse caveman chat style for conversation; files/commits stay normal prose.
-- Info-only until user says build. No scaffolding, no `cargo init` yet.
+- Phase 1 built and verified (8/8 tests, live mic capture). No Phase 2 work until approved.
 - $0 default, audio stays on device, recording indicator mandatory, Esc cancels.
 
 ## Phase 1 Prototype — Complete (2026-09-30)
@@ -33,4 +33,4 @@
 - Gates: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean (exit 0), `cargo test` 8/8 pass.
 
 ## Next Step
-- User reviews 6 docs → locks hotkey + model default → says "build" → start task.md Phase 1.
+- Phase 1 done. Next: user approves → start task.md Phase 2 (VAD).
