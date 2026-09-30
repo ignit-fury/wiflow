@@ -523,12 +523,26 @@ fn app_main(
             std::process::exit(1);
         });
     tracing::info!("ptt hotkey registered: {won:?} (id {})", hotkey.id());
+    // Esc cancel: winit device_event never delivers Key events to a
+    // zero-window tray app on macOS (proven Task 3), so Esc rides the
+    // same global-hotkey bridge as PTT. Registration failure degrades
+    // to "cancel disabled" — the app stays usable.
+    let esc_hotkey = match crate::daemon::register_cancel_hotkey(&manager) {
+        Ok(hk) => {
+            tracing::info!("esc cancel hotkey registered (id {})", hk.id());
+            hk
+        }
+        Err(e) => {
+            tracing::warn!("esc cancel hotkey NOT registered ({e}) — cancel disabled");
+            global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::Escape)
+        }
+    };
     // Persist the actual winner so tooltip + next launch agree.
     config.hotkey_preset = won;
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("save config failed: {e}");
     }
-    crate::daemon::spawn_hotkey_bridge(proxy.clone());
+    crate::daemon::spawn_hotkey_bridge(proxy.clone(), esc_hotkey.id());
 
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();

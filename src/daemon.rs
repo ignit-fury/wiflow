@@ -74,6 +74,17 @@ pub fn register_ptt_hotkey(
     Err("no push-to-talk hotkey registered".into())
 }
 
+/// Register Esc as a second global hotkey on the SAME manager as PTT.
+/// winit `device_event` never delivers Key events to a zero-window tray app
+/// on macOS (proven Task 3), so Esc must arrive through the hotkey bridge.
+pub fn register_cancel_hotkey(manager: &GlobalHotKeyManager) -> Result<HotKey, String> {
+    let hk = HotKey::new(None, Code::Escape);
+    manager
+        .register(hk)
+        .map_err(|e| format!("esc hotkey register failed: {e:?}"))?;
+    Ok(hk)
+}
+
 /// Commands from the winit thread to the dictation worker.
 /// The winit thread never blocks: it only `send()`s these and renders
 /// `DaemonEvent::Done/Failed` results.
@@ -96,7 +107,9 @@ fn now_ms() -> u64 {
 /// Runs on its own thread; `receiver().recv()` blocks here, never on winit.
 /// Forwards ANY known PTT preset id (not just the startup winner) so a
 /// menu-driven hotkey switch needs no bridge restart and loses no events.
-pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>) {
+/// The Esc id (second hotkey on the same manager) forwards as Cancel on
+/// Pressed only — the release is meaningless for a cancel.
+pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
     let ids = [
         preset_hotkey(HotkeyPreset::RightOption).id(),
         preset_hotkey(HotkeyPreset::Fn).id(),
@@ -104,15 +117,23 @@ pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>) {
     ];
     std::thread::spawn(move || {
         while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
-            if !ids.contains(&ev.id) {
-                continue;
-            }
-            let out = match ev.state {
-                HotKeyState::Pressed => DaemonEvent::PttDown,
-                HotKeyState::Released => DaemonEvent::PttUp,
+            let out = if ev.id == esc_id {
+                match ev.state {
+                    HotKeyState::Pressed => Some(DaemonEvent::Cancel),
+                    HotKeyState::Released => None,
+                }
+            } else if ids.contains(&ev.id) {
+                Some(match ev.state {
+                    HotKeyState::Pressed => DaemonEvent::PttDown,
+                    HotKeyState::Released => DaemonEvent::PttUp,
+                })
+            } else {
+                None
             };
-            if proxy.send_event(out).is_err() {
-                break;
+            if let Some(out) = out {
+                if proxy.send_event(out).is_err() {
+                    break;
+                }
             }
         }
     });
