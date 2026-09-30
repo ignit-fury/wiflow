@@ -60,8 +60,6 @@ static STT: OnceLock<Result<Mutex<Stt>, String>> = OnceLock::new();
 /// First call wins — later calls with a different path return the cached instance.
 /// (Stores Result: `get_or_try_init` is nightly-only on this toolchain, so the
 /// stable `get_or_init` caches the Err too — second bad-path call stays Err.)
-// Task 4 wires this into the hold path; allow dead code until then.
-#[allow(dead_code)]
 pub fn shared_stt(model_path: &Path) -> Result<&'static Mutex<Stt>, String> {
     STT.get_or_init(|| Stt::load(model_path).map(Mutex::new))
         .as_ref()
