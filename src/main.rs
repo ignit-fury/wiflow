@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod audio;
+mod hotkey;
 
 #[derive(Parser, Debug)]
 #[command(name = "wiflow-dictation", about = "Push-to-talk dictation prototype")]
