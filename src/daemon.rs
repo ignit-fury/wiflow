@@ -215,6 +215,7 @@ fn pipeline_on_worker(
 /// SmallEn downloads small.en on first use, BaseEn uses base.en.
 fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
     match crate::config::load_config().model {
+        crate::config::ModelChoice::TinyEn => crate::stt::ensure_model_variant("tiny"),
         crate::config::ModelChoice::SmallEn => crate::stt::ensure_model_variant("small"),
         crate::config::ModelChoice::BaseEn => crate::stt::ensure_model_variant("base"),
     }

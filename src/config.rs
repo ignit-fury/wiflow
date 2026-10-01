@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// Variant names intentionally match the model filenames (ggml-tiny.en.bin etc.).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ModelChoice {
+    TinyEn,
     #[default]
     BaseEn,
     SmallEn,

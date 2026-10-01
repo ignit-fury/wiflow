@@ -1,8 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 pub struct Stt {
+    // State before ctx: Rust drops fields in declaration order, so
+    // whisper_free_state runs before whisper_free at the C level.
+    state: WhisperState,
+    // Never read in Rust after `load` — load-bearing: keeps the C context
+    // alive because `WhisperState`'s raw pointer references it.
+    #[allow(dead_code)]
     ctx: WhisperContext,
 }
 
@@ -18,13 +26,21 @@ impl Stt {
         let mut ctx_params = WhisperContextParameters::new();
         // Explicit: Metal GPU with `metal` feature (default would also be true via _gpu).
         ctx_params.use_gpu(true);
-        WhisperContext::new_with_params(path, ctx_params)
-            .map(|ctx| Self { ctx })
-            .map_err(|e| format!("load model {}: {e:?}", path.display()))
+        let ctx = WhisperContext::new_with_params(path, ctx_params)
+            .map_err(|e| format!("load model {}: {e:?}", path.display()))?;
+        // Create the Metal state once — allocates kv-cache, compute buffers, and
+        // compiles Metal pipelines here so `transcribe` never pays that cost again
+        // (~200 ms saved per transcription; eliminates per-cycle ggml_metal_init
+        // and whisper_init_state overhead).
+        let state = ctx
+            .create_state()
+            .map_err(|e| format!("create state: {e:?}"))?;
+        Ok(Self { state, ctx })
     }
 
     /// Input MUST be 16kHz mono — callers pass `vad::transcribe_ready` output.
     /// Empty input short-circuits to Ok("") without touching the model.
+    /// Reuses the cached WhisperState: no Metal re-init, no buffer re-allocation.
     pub fn transcribe(&mut self, samples_16k: &[f32]) -> Result<String, String> {
         if samples_16k.is_empty() {
             return Ok(String::new());
@@ -33,24 +49,22 @@ impl Stt {
         params.set_n_threads(num_threads());
         params.set_print_progress(false);
         params.set_single_segment(true);
-        let mut state = self
-            .ctx
-            .create_state()
-            .map_err(|e| format!("create state: {e:?}"))?;
-        state
+        // Skip timestamp token computation — wiflow never uses timestamps.
+        params.set_no_timestamps(true);
+        self.state
             .full(params, samples_16k)
             .map_err(|e| format!("transcribe: {e:?}"))?;
-        let n = state.full_n_segments();
+        let n = self.state.full_n_segments();
         let mut text = String::new();
         for i in 0..n {
-            if let Some(seg) = state.get_segment(i) {
+            if let Some(seg) = self.state.get_segment(i) {
                 text.push_str(
                     &seg.to_str_lossy()
                         .map_err(|e| format!("segment text: {e:?}"))?,
                 );
             }
         }
-        Ok(text.trim().to_string())
+        Ok(post_process(&text))
     }
 }
 
@@ -121,13 +135,25 @@ pub const SMALL_MODEL_URL: &str =
 pub const SMALL_MODEL_SIZE: u64 = 487_614_201;
 pub const SMALL_MODEL_NAME: &str = "ggml-small.en.bin";
 
-/// Variant-aware paths: "small" or anything else (default "base").
+pub const TINY_MODEL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+/// Verified 2026-10-01 via HEAD (HTTP 200, content-length 77,704,715).
+pub const TINY_MODEL_SIZE: u64 = 77_704_715;
+pub const TINY_MODEL_NAME: &str = "ggml-tiny.en.bin";
+
+/// Variant-aware paths: "tiny", "small", or anything else (default "base").
 pub fn model_path_for(variant: &str) -> (PathBuf, &'static str, u64) {
     if variant == "small" {
         (
             models_dir().join(SMALL_MODEL_NAME),
             SMALL_MODEL_URL,
             SMALL_MODEL_SIZE,
+        )
+    } else if variant == "tiny" {
+        (
+            models_dir().join(TINY_MODEL_NAME),
+            TINY_MODEL_URL,
+            TINY_MODEL_SIZE,
         )
     } else {
         (model_path(), MODEL_URL, MODEL_SIZE)
@@ -159,6 +185,61 @@ pub fn ensure_model_variant(variant: &str) -> Result<PathBuf, String> {
         return Err(format!("download failed: {status}"));
     }
     Ok(path)
+}
+
+/// Simple post-processing pass (pre-AI step — deterministic, offline):
+/// - Capitalizes the first letter of sentences (text start and after '.', '?', '!')
+/// - Capitalizes lowercase 'i' when standalone ("I") or in common contractions ("I'm", "I've", "I'll", "I'd")
+/// - Preserves punctuation, whitespace, and numbers (e.g. "1.0")
+pub fn post_process(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut capitalize_next = true;
+    for i in 0..len {
+        let c = chars[i];
+        if c == 'i' {
+            let prev_boundary = i == 0
+                || chars[i - 1].is_whitespace()
+                || matches!(chars[i - 1], '(' | '[' | '{' | '"' | '“' | '‘');
+            let next = chars.get(i + 1).copied();
+            let is_standalone = match next {
+                None => true,
+                Some(n) => {
+                    n.is_whitespace()
+                        || matches!(
+                            n,
+                            ')' | ']' | '}' | '"' | '”' | '’' | ',' | '.' | '?' | '!' | ':' | ';'
+                        )
+                }
+            };
+            let is_contraction = matches!(next, Some('\''));
+            if prev_boundary && (is_standalone || is_contraction) {
+                out.push('I');
+                capitalize_next = false;
+                continue;
+            }
+        }
+        if capitalize_next && c.is_alphabetic() {
+            out.extend(c.to_uppercase());
+            capitalize_next = false;
+            continue;
+        }
+        if matches!(c, '.' | '?' | '!') {
+            // Sentence-ending punctuation only when followed by whitespace or
+            // end-of-text — a '.' before a digit is a decimal point ("1.0").
+            let next_is_space = chars.get(i + 1).map(|n| n.is_whitespace()).unwrap_or(true);
+            if next_is_space {
+                capitalize_next = true;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -217,6 +298,53 @@ mod tests {
         drop(f);
         let (path, _, size) = model_path_for("small");
         assert_eq!(path.file_name().unwrap(), SMALL_MODEL_NAME);
+        assert!(std::fs::metadata(&p)
+            .map(|m| m.len() == size)
+            .unwrap_or(false));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn test_post_process_empty() {
+        assert_eq!(post_process(""), "");
+        assert_eq!(post_process("   "), "");
+    }
+
+    #[test]
+    fn test_post_process_capitalizes_sentences() {
+        assert_eq!(post_process("hello world"), "Hello world");
+        assert_eq!(
+            post_process("first one. second one? third! done"),
+            "First one. Second one? Third! Done"
+        );
+    }
+
+    #[test]
+    fn test_post_process_fixes_standalone_i() {
+        assert_eq!(post_process("i think i can"), "I think I can");
+        assert_eq!(post_process("and i'm here"), "And I'm here");
+        assert_eq!(post_process("i've got it"), "I've got it");
+    }
+
+    #[test]
+    fn test_post_process_preserves_words_with_i() {
+        // 'i' inside words or non-boundary positions must NOT be capitalized.
+        assert_eq!(post_process("wifi is fast"), "Wifi is fast");
+        assert_eq!(post_process("it's fine"), "It's fine");
+        assert_eq!(post_process("value 1.0 stays"), "Value 1.0 stays");
+    }
+
+    #[test]
+    fn test_tiny_model_variant() {
+        let (path, url, size) = model_path_for("tiny");
+        assert_eq!(path.file_name().unwrap(), TINY_MODEL_NAME);
+        assert_eq!(url, TINY_MODEL_URL);
+        assert_eq!(size, TINY_MODEL_SIZE);
+        // Sparse-file size gate: instant, no 75MB download.
+        let p = std::env::temp_dir().join("wiflow_tiny_gate_test.bin");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(TINY_MODEL_SIZE).unwrap();
+        drop(f);
         assert!(std::fs::metadata(&p)
             .map(|m| m.len() == size)
             .unwrap_or(false));

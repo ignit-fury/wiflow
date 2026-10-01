@@ -71,6 +71,7 @@ pub fn make_icon(state: AppState) -> Icon {
 pub struct MenuIds {
     status: MenuId,
     mic_items: Vec<(String, MenuId)>,
+    model_tiny: MenuId,
     model_base: MenuId,
     model_small: MenuId,
     hk_right: MenuId,
@@ -95,6 +96,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
             .enumerate()
             .map(|(i, d)| (d.clone(), MenuId::new(format!("wiflow:mic:{i}"))))
             .collect(),
+        model_tiny: MenuId::new("wiflow:model:tiny"),
         model_base: MenuId::new("wiflow:model:base"),
         model_small: MenuId::new("wiflow:model:small"),
         hk_right: MenuId::new("wiflow:hk:right"),
@@ -154,6 +156,13 @@ pub fn build_menu(
     }
 
     let model_menu = Submenu::new("Model", true);
+    let model_tiny = CheckMenuItem::with_id(
+        ids.model_tiny.clone(),
+        "Tiny — English (~75 MB, fastest)",
+        true,
+        config.model == ModelChoice::TinyEn,
+        None,
+    );
     let model_base = CheckMenuItem::with_id(
         ids.model_base.clone(),
         "Base — English (~140 MB)",
@@ -169,7 +178,7 @@ pub fn build_menu(
         None,
     );
     model_menu
-        .append_items(&[&model_base, &model_small])
+        .append_items(&[&model_tiny, &model_base, &model_small])
         .expect("menu append");
 
     let hk_menu = Submenu::new("Push-to-talk hotkey", true);
@@ -350,6 +359,13 @@ impl DaemonApp {
     fn handle_menu_event(&mut self, id: &MenuId) {
         let ids = self.menu_ids.clone();
         if *id == ids.status {
+            return;
+        }
+        if *id == ids.model_tiny {
+            self.config.model = ModelChoice::TinyEn;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("model set to tiny.en (takes effect next hold)");
             return;
         }
         if *id == ids.model_base {
@@ -695,6 +711,7 @@ mod tests {
         let ids = ids_for(&devices, &sample_history());
         let mut all = vec![
             ids.status,
+            ids.model_tiny,
             ids.model_base,
             ids.model_small,
             ids.hk_right,
