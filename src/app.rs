@@ -225,7 +225,7 @@ pub fn build_menu(
     // LLM cleanup (literal dictation cleanup layer via Ollama, $0 local).
     let cleanup_toggle = CheckMenuItem::with_id(
         ids.cleanup_toggle.clone(),
-        "AI Cleanup (Ollama)",
+        "AI Cleanup (Groq→OpenRouter→Ollama)",
         true,
         config.cleanup_enabled,
         None,
@@ -620,6 +620,11 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 self.set_state(AppState::Error, Some(msg));
                 self.sync_tray();
             }
+            DaemonEvent::CleanupIssue(msg) => {
+                // Alert: rate-limit exhausted / Ollama missing — tray warn-note.
+                tracing::warn!("cleanup issue: {msg}");
+                self.warn_note(msg);
+            }
         }
     }
 
@@ -715,6 +720,27 @@ fn app_main(
         tracing::warn!("save config failed: {e}");
     }
     crate::daemon::spawn_hotkey_bridge(proxy.clone(), esc_hotkey.id());
+
+    // Background startup check: when cleanup is enabled, verify Ollama is
+    // running + the model is pulled; alert the user when not (off the UI
+    // thread, once per launch).
+    {
+        let check_proxy = proxy.clone();
+        let check_model = config.cleanup_model.clone();
+        let check_enabled = config.cleanup_enabled;
+        std::thread::spawn(move || {
+            if !check_enabled {
+                return;
+            }
+            match crate::cleanup::check_ollama_ready(&check_model) {
+                Ok(()) => tracing::info!("ollama cleanup ready ({check_model})"),
+                Err(e) => {
+                    tracing::warn!("ollama check: {e}");
+                    let _ = check_proxy.send_event(DaemonEvent::CleanupIssue(e));
+                }
+            }
+        });
+    }
 
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();

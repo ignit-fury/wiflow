@@ -25,12 +25,31 @@ pub struct Config {
     pub model: ModelChoice,
     #[serde(default)]
     pub launch_at_login: bool,
-    /// LLM cleanup (Ollama local, $0): on by default, skips instantly when
-    /// Ollama is unreachable so the deterministic output stands.
+    /// LLM cleanup (provider chain: Groq → OpenRouter → Ollama local): on by
+    /// default, skips instantly when nothing is configured/reachable so the
+    /// deterministic output stands.
     #[serde(default = "default_true")]
     pub cleanup_enabled: bool,
-    #[serde(default)]
+    /// Ollama model for the local fallback.
+    #[serde(default = "default_ollama_model")]
     pub cleanup_model: String,
+    #[serde(default = "default_groq_model")]
+    pub cleanup_groq_model: String,
+    #[serde(default = "default_openrouter_model")]
+    pub cleanup_openrouter_model: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_ollama_model() -> String {
+    "llama3.2:1b".into()
+}
+fn default_groq_model() -> String {
+    "llama-3.3-70b-versatile".into()
+}
+fn default_openrouter_model() -> String {
+    "meta-llama/llama-3.3-70b:free".into()
 }
 
 // Manual Default (not derive): cleanup_enabled must default ON (user intent),
@@ -43,13 +62,11 @@ impl Default for Config {
             model: ModelChoice::default(),
             launch_at_login: false,
             cleanup_enabled: true,
-            cleanup_model: crate::cleanup::DEFAULT_MODEL.into(),
+            cleanup_model: "llama3.2:1b".into(),
+            cleanup_groq_model: "llama-3.3-70b-versatile".into(),
+            cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
         }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 pub fn config_path() -> PathBuf {
@@ -190,6 +207,8 @@ mod tests {
             launch_at_login: true,
             cleanup_enabled: true,
             cleanup_model: "llama3.2:1b".into(),
+            cleanup_groq_model: "llama-3.3-70b-versatile".into(),
+            cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
         }
     }
 

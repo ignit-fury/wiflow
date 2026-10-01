@@ -135,14 +135,13 @@ fn main() {
                         let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
                         let rtf = ms as f64 / kept_ms.max(1.0);
                         info!("transcribed in {ms}ms (RTF {rtf:.2})");
-                        // Same LLM cleanup as the daemon (Ollama, graceful skip).
+                        // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama).
                         let cfg = config::load_config();
-                        let text = cleanup::clean(
-                            &text,
-                            cfg.cleanup_enabled,
-                            &cfg.cleanup_model,
-                            cleanup::DEFAULT_ENDPOINT,
-                        );
+                        let outcome = cleanup::clean_chain(&text, &cfg);
+                        for issue in &outcome.issues {
+                            warn!("cleanup issue: {issue}");
+                        }
+                        let text = outcome.text;
                         if cleanup::is_filler_result(&text) {
                             info!("transcript empty or filler-only after cleanup");
                             return;

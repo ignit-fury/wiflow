@@ -47,6 +47,9 @@ pub enum DaemonEvent {
         rtf: f64,
     },
     Failed(String),
+    /// Cleanup-chain alert (rate-limit exhausted, missing Ollama model):
+    /// surfaced as the tray warn-note so the user can act on it.
+    CleanupIssue(String),
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.
@@ -189,16 +192,14 @@ fn pipeline_on_worker(
     let kept_ms = kept.len() as f64 / crate::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
-    // LLM cleanup (literal dictation cleanup layer, Ollama local $0): skips
-    // instantly when Ollama is unreachable — deterministic output stands.
+    // LLM cleanup chain (Groq → OpenRouter → Ollama local, $0). Issues
+    // (rate limits, missing model) surface as tray alerts.
     let cfg = crate::config::load_config();
-    let cleaned = crate::cleanup::clean(
-        &text,
-        cfg.cleanup_enabled,
-        &cfg.cleanup_model,
-        crate::cleanup::DEFAULT_ENDPOINT,
-    );
-    if crate::cleanup::is_filler_result(&cleaned) {
+    let outcome = crate::cleanup::clean_chain(&text, &cfg);
+    for issue in &outcome.issues {
+        let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
+    }
+    if crate::cleanup::is_filler_result(&outcome.text) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
         let _ = proxy.send_event(DaemonEvent::Done {
@@ -208,7 +209,7 @@ fn pipeline_on_worker(
         });
         return;
     }
-    let text = cleaned;
+    let text = outcome.text;
     if text.trim().is_empty() {
         let _ = proxy.send_event(DaemonEvent::Done {
             text: String::new(),
