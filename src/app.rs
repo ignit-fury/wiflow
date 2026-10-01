@@ -76,6 +76,7 @@ pub struct MenuIds {
     model_small: MenuId,
     hk_right: MenuId,
     hk_fn: MenuId,
+    hk_alt: MenuId,
     hk_ctrl: MenuId,
     launch_login: MenuId,
     history_items: Vec<(String, MenuId)>,
@@ -101,6 +102,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         model_small: MenuId::new("wiflow:model:small"),
         hk_right: MenuId::new("wiflow:hk:right"),
         hk_fn: MenuId::new("wiflow:hk:fn"),
+        hk_alt: MenuId::new("wiflow:hk:alt"),
         hk_ctrl: MenuId::new("wiflow:hk:ctrl"),
         launch_login: MenuId::new("wiflow:launch"),
         history_items: history
@@ -182,18 +184,28 @@ pub fn build_menu(
         .expect("menu append");
 
     let hk_menu = Submenu::new("Push-to-talk hotkey", true);
+    // Single-key holds cannot register on macOS (global-hotkey 0.7 has no
+    // scancode entries for bare modifiers — "Unknown scancode for AltRight").
+    // Items stay visible but disabled so the menu is honest about it.
     let hk_right = CheckMenuItem::with_id(
         ids.hk_right.clone(),
-        "Right Option",
-        true,
+        "Right Option — unavailable on macOS",
+        false,
         config.hotkey_preset == HotkeyPreset::RightOption,
         None,
     );
     let hk_fn = CheckMenuItem::with_id(
         ids.hk_fn.clone(),
-        "Fn",
-        true,
+        "Fn — unavailable on macOS",
+        false,
         config.hotkey_preset == HotkeyPreset::Fn,
+        None,
+    );
+    let hk_alt = CheckMenuItem::with_id(
+        ids.hk_alt.clone(),
+        "Option+Space",
+        true,
+        config.hotkey_preset == HotkeyPreset::AltSpace,
         None,
     );
     let hk_ctrl = CheckMenuItem::with_id(
@@ -204,7 +216,7 @@ pub fn build_menu(
         None,
     );
     hk_menu
-        .append_items(&[&hk_right, &hk_fn, &hk_ctrl])
+        .append_items(&[&hk_right, &hk_fn, &hk_alt, &hk_ctrl])
         .expect("menu append");
 
     let launch_login = CheckMenuItem::with_id(
@@ -383,11 +395,17 @@ impl DaemonApp {
             return;
         }
         if *id == ids.hk_right {
+            // Disabled menu item — unreachable, kept for cross-platform later.
             self.switch_hotkey(HotkeyPreset::RightOption);
             return;
         }
         if *id == ids.hk_fn {
+            // Disabled menu item — unreachable, kept for cross-platform later.
             self.switch_hotkey(HotkeyPreset::Fn);
+            return;
+        }
+        if *id == ids.hk_alt {
+            self.switch_hotkey(HotkeyPreset::AltSpace);
             return;
         }
         if *id == ids.hk_ctrl {
@@ -716,6 +734,7 @@ mod tests {
             ids.model_small,
             ids.hk_right,
             ids.hk_fn,
+            ids.hk_alt,
             ids.hk_ctrl,
             ids.launch_login,
             ids.perm_mic,

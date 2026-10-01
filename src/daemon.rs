@@ -10,10 +10,17 @@ use crate::hotkey::{PttEvent, PushToTalk};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HotkeyPreset {
+    /// Bare Right Option — CANNOT register on macOS: global-hotkey 0.7's
+    /// scancode table has no entry for bare modifiers ("Unknown scancode").
+    /// Kept for cross-platform later; the macOS menu marks it unavailable.
     RightOption,
+    /// Bare Fn — same macOS limitation as RightOption.
     Fn,
     #[default]
     CtrlSpace,
+    /// Option+Space — WORKS on macOS (ALT modifier + Space scancode are
+    /// both supported by the RegisterEventHotKey path).
+    AltSpace,
 }
 
 /// Idle-tooltip hint for the winning preset (no hardcoded hotkey anywhere else).
@@ -22,6 +29,7 @@ pub fn preset_hint(preset: HotkeyPreset) -> &'static str {
         HotkeyPreset::RightOption => "hold Right Option",
         HotkeyPreset::Fn => "hold Fn",
         HotkeyPreset::CtrlSpace => "hold Ctrl+Space",
+        HotkeyPreset::AltSpace => "hold Option+Space",
     }
 }
 
@@ -30,6 +38,7 @@ pub fn preset_hotkey(preset: HotkeyPreset) -> HotKey {
         HotkeyPreset::RightOption => HotKey::new(None, Code::AltRight),
         HotkeyPreset::Fn => HotKey::new(None, Code::Fn),
         HotkeyPreset::CtrlSpace => HotKey::new(Some(Modifiers::CONTROL), Code::Space),
+        HotkeyPreset::AltSpace => HotKey::new(Some(Modifiers::ALT), Code::Space),
     }
 }
 
@@ -56,12 +65,32 @@ pub fn register_ptt_hotkey(
     // NOTE: if/else (not match) — rustc's dead-code pass does not count a
     // variant as constructed when its only constructor sits inside a match
     // arm on the same enum, which falsely flags `CtrlSpace` under -D warnings.
+    // Single-key presets (RightOption/Fn) fall back to WORKING combos, so
+    // stale configs still get a usable hotkey at startup.
     let order = if prefer == HotkeyPreset::Fn {
-        [HotkeyPreset::Fn, HotkeyPreset::RightOption]
+        [
+            HotkeyPreset::Fn,
+            HotkeyPreset::AltSpace,
+            HotkeyPreset::CtrlSpace,
+        ]
     } else if prefer == HotkeyPreset::CtrlSpace {
-        [HotkeyPreset::CtrlSpace, HotkeyPreset::Fn]
+        [
+            HotkeyPreset::CtrlSpace,
+            HotkeyPreset::AltSpace,
+            HotkeyPreset::Fn,
+        ]
+    } else if prefer == HotkeyPreset::AltSpace {
+        [
+            HotkeyPreset::AltSpace,
+            HotkeyPreset::CtrlSpace,
+            HotkeyPreset::Fn,
+        ]
     } else {
-        [HotkeyPreset::RightOption, HotkeyPreset::Fn]
+        [
+            HotkeyPreset::RightOption,
+            HotkeyPreset::AltSpace,
+            HotkeyPreset::CtrlSpace,
+        ]
     };
     let manager = GlobalHotKeyManager::new().map_err(|e| format!("hotkey manager: {e:?}"))?;
     for preset in order {
@@ -296,8 +325,22 @@ mod tests {
         let a = preset_hotkey(HotkeyPreset::RightOption);
         let b = preset_hotkey(HotkeyPreset::Fn);
         let c = preset_hotkey(HotkeyPreset::CtrlSpace);
+        let d = preset_hotkey(HotkeyPreset::AltSpace);
         assert_ne!(a.id(), b.id());
         assert_ne!(a.id(), c.id());
         assert_ne!(b.id(), c.id());
+        assert_ne!(d.id(), a.id());
+        assert_ne!(d.id(), b.id());
+        assert_ne!(d.id(), c.id());
+    }
+
+    #[test]
+    fn test_altspace_hotkey_registers_on_macos() {
+        // ALT modifier + Space scancode are both in global-hotkey 0.7's
+        // macOS RegisterEventHotKey path (unlike bare AltRight/Fn).
+        let manager = GlobalHotKeyManager::new().expect("hotkey manager");
+        let hk = preset_hotkey(HotkeyPreset::AltSpace);
+        manager.register(hk).expect("AltSpace must register");
+        manager.unregister(hk).expect("unregister");
     }
 }
