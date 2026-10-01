@@ -128,7 +128,7 @@ fn main() {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                match stt::transcribe_shared(&model_path, &kept) {
+                match stt::transcribe_shared(&model_path, &kept, &stt::read_prompt()) {
                     Ok(text) => {
                         let ms = t0.elapsed().as_millis();
                         let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;

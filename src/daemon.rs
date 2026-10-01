@@ -178,7 +178,7 @@ fn pipeline_on_worker(
         }
     };
     let t0 = std::time::Instant::now();
-    let text = match crate::stt::transcribe_shared(&model_path, &kept) {
+    let text = match crate::stt::transcribe_shared(&model_path, &kept, &crate::stt::read_prompt()) {
         Ok(t) => t,
         Err(e) => {
             let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
