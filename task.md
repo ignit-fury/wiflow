@@ -96,9 +96,19 @@
 - [x] Zombie-incident candidates now IMPLEMENTED properly (2026-10-01, commit a170b78, user-requested): WhisperState reuse (created once in `load`, reused per transcribe — 84ms/cycle verified, no Metal re-init, ctx field load-bearing), `set_no_timestamps(true)`, tiny.en model variant (77,704,715 bytes verified via HEAD; menu + config + download arm), `post_process` (sentence capitalization + standalone i→I + contractions; decimal points preserved; 4 tests). Gates: fmt/clippy clean, 56 passed + 1 ignored.
 - [ ] True WER corpus eval (TTS substitute in v1)
 - [ ] small.en bench (465 MB deferred until accuracy data demands it)
-- [ ] Groq cloud fallback behind setting (`cloud` feature, user key)
-- [ ] Ollama cleanup opt-in (`llm` feature)
 - [ ] Streaming partials, Parakeet eval, Win/Linux packaging
+- [x] Groq cloud fallback behind setting (2026-10-01, commit 199fb72): `stt_provider` local|groq (default local — privacy: audio leaves device only when opted in); whisper-large-v3 via Groq audio/transcriptions (in-memory wav + multipart, ureq); Err → alert + local fallback. Live-verified.
+- [x] Ollama cleanup opt-in (2026-10-01, commits b8ed491 + 621db54): provider chain Groq → OpenRouter → Ollama; quota alerts (429/402/401 → tray warn-note); background model check at startup + fallback (reachable? pulled? → guidance alerts); keys via env/keys.json (outside repo).
+- [x] Groq cloud STT verified live (2026-10-01): whisper-large-v3 HTTP 200, tone → "." in 515ms (transport + recognition path; synthetic tone = non-speech).
+
+## Phase 6 — Cloud Providers + Context + Settings Models (complete 2026-10-01)
+- [x] Provider switcher: menu submenu Auto (chain) / Groq / OpenRouter / Ollama; `cleanup_provider` config ("auto" default, "" normalized to auto); explicit provider → Ollama fallback on quota only
+- [x] Keys: `keys.json` in app dir (OUTSIDE repo, chmod 600, never committed) + env override (`GROQ_API_KEY`/`OPENROUTER_API_KEY`); user's Groq key stored, validated live
+- [x] Image models set (Groq live-validated): Post-Processing `openai/gpt-oss-20b`, Fallback `qwen/qwen3.8-27b` (explicit retry — image said qwen3.6-27b, real id corrected), Context `qwen/qwen3.8-27b`
+- [x] Context synthesis: user's context-synthesis prompt verbatim (`src/context_prompt.txt`), focused-app via osascript, two-sentence context → `<context>` block → cleanup hint; LIVE: ctx(Terminal) → correct two sentences, chain → "The deploy is Wednesday. Can you make sure staging is green?" (self-correction via gpt-oss-20b!)
+- [x] Transcription: `stt_provider` local|groq + `stt_language` auto-detect (config; whisper language param + Groq multipart field)
+- [x] Live Groq cleanup with user's key: gpt-oss-20b cleaned filler/stutter/self-correction perfectly, 0 issues, ~1.2s
+- [x] Gates: fmt + clippy clean, 76 passed + 1 ignored
 
 ## Done Definition (v1)
 - Offline push-to-talk <2s on M1 base, $0 default, permissions handled, history works, docs updated, release signed.
