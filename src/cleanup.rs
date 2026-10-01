@@ -4,6 +4,11 @@ use std::time::Duration;
 /// The literal dictation cleanup layer system prompt (verbatim, user-provided).
 const SYSTEM_PROMPT: &str = include_str!("cleanup_prompt.txt");
 
+/// The literal context-synthesis system prompt (verbatim, user-provided):
+/// two sentences describing what the user is doing and what they are about
+/// to dictate, used only as a formatting hint by the cleanup model.
+const CONTEXT_PROMPT: &str = include_str!("context_prompt.txt");
+
 pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
 pub const EMPTY_SENTINEL: &str = "EMPTY";
@@ -99,6 +104,7 @@ fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<Stri
                 &key,
                 model,
                 transcript,
+                None,
             )
         }
         Provider::OpenRouter => {
@@ -110,9 +116,10 @@ fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<Stri
                 &key,
                 model,
                 transcript,
+                None,
             )
         }
-        Provider::Ollama => ollama_generate(transcript, model),
+        Provider::Ollama => ollama_chat(transcript, None, model),
     }
 }
 
@@ -267,7 +274,14 @@ pub fn is_quota_error(err: &str) -> bool {
 }
 
 /// OpenAI-compatible chat completion (Groq + OpenRouter share the shape).
-fn chat_completion(url: &str, key: &str, model: &str, transcript: &str) -> Result<String, String> {
+/// `system: None` uses the cleanup SYSTEM_PROMPT (existing behavior).
+fn chat_completion(
+    url: &str,
+    key: &str,
+    model: &str,
+    user_content: &str,
+    system: Option<&str>,
+) -> Result<String, String> {
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let resp = agent
         .post(url)
@@ -276,8 +290,8 @@ fn chat_completion(url: &str, key: &str, model: &str, transcript: &str) -> Resul
         .send_json(json!({
             "model": model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": transcript}
+                {"role": "system", "content": system.unwrap_or(SYSTEM_PROMPT)},
+                {"role": "user", "content": user_content}
             ],
             "temperature": 0.0,
         }))
@@ -292,7 +306,7 @@ fn chat_completion(url: &str, key: &str, model: &str, transcript: &str) -> Resul
         .ok_or_else(|| format!("unparseable response: {}", truncate(&v.to_string())))
 }
 
-fn ollama_generate(transcript: &str, model: &str) -> Result<String, String> {
+fn ollama_chat(prompt: &str, system: Option<&str>, model: &str) -> Result<String, String> {
     // Background model check first: distinguish "not running" from
     // "model not pulled" so the alert tells the user exactly what to do.
     if !ollama_reachable() {
@@ -307,8 +321,8 @@ fn ollama_generate(transcript: &str, model: &str) -> Result<String, String> {
         .set("Content-Type", "application/json")
         .send_json(json!({
             "model": model,
-            "system": SYSTEM_PROMPT,
-            "prompt": transcript,
+            "system": system.unwrap_or(SYSTEM_PROMPT),
+            "prompt": prompt,
             "stream": false,
         }))
         .map_err(|e| format!("generate failed: {e:?}"))?;
@@ -365,6 +379,51 @@ fn ollama_model_installed(model: &str) -> bool {
 /// True when the cleaned text is the filler-only sentinel (or empty).
 pub fn is_filler_result(cleaned: &str) -> bool {
     cleaned.trim() == EMPTY_SENTINEL || cleaned.trim().is_empty()
+}
+
+/// Format the cleanup input: non-empty context → `<context>…</context>`
+/// block above the `<transcript>` tag; otherwise the plain transcript
+/// (the cleanup prompt treats untagged input as the transcript).
+pub fn format_cleanup_input(context: Option<&str>, transcript: &str) -> String {
+    match context {
+        Some(c) if !c.trim().is_empty() => format!(
+            "<context>{}</context>\n<transcript>{}</transcript>",
+            c.trim(),
+            transcript
+        ),
+        _ => transcript.to_string(),
+    }
+}
+
+/// Two-sentence context via the context model. "" when disabled, no app
+/// name, or any failure — never invent (the cleanup proceeds without it).
+/// Provider order for the small context call: Groq → Ollama (skips
+/// OpenRouter for latency).
+pub fn synthesize_context(app_name: Option<&str>, cfg: &crate::config::Config) -> String {
+    let Some(app) = app_name.filter(|a| !a.trim().is_empty()) else {
+        return String::new();
+    };
+    if !cfg.context_enabled {
+        return String::new();
+    }
+    let prompt = format!("App: {app}");
+    if let Some(key) = groq_key() {
+        if let Ok(text) = chat_completion(
+            "https://api.groq.com/openai/v1/chat/completions",
+            &key,
+            &cfg.context_model,
+            &prompt,
+            Some(CONTEXT_PROMPT),
+        ) {
+            return text;
+        }
+    }
+    if ollama_reachable() && ollama_model_installed(&cfg.cleanup_model) {
+        if let Ok(text) = ollama_chat(&prompt, Some(CONTEXT_PROMPT), &cfg.cleanup_model) {
+            return text;
+        }
+    }
+    String::new()
 }
 
 fn truncate(s: &str) -> String {
@@ -457,6 +516,26 @@ mod tests {
                 let _ = std::fs::remove_file(&keys_path);
             }
         }
+    }
+
+    #[test]
+    fn test_context_formatting() {
+        let out = format_cleanup_input(
+            Some("The user is dictating into Firefox. Likely a chat reply."),
+            "hello world",
+        );
+        assert!(out.contains("<context>"));
+        assert!(out.contains("</context>"));
+        assert!(out.contains("<transcript>hello world</transcript>"));
+        let bare = format_cleanup_input(None, "hello world");
+        assert_eq!(bare, "hello world"); // no context → plain transcript (prompt: no tags = transcript)
+    }
+
+    #[test]
+    fn test_synthesize_context_disabled_or_missing_app() {
+        let cfg = crate::config::Config::default();
+        // No app name → empty context (never invent — prompt rule).
+        assert_eq!(synthesize_context(None, &cfg), "");
     }
 
     #[test]

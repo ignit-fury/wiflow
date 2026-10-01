@@ -147,6 +147,21 @@ pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
     });
 }
 
+/// Frontmost app name via System Events (osascript subprocess, ~200ms).
+/// None when the query fails or returns empty.
+pub fn focused_app_name() -> Option<String> {
+    let out = std::process::Command::new("osascript")
+        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Model-switch-failure semantics (via `stt::transcribe_shared`): a failed
 /// new-model load returns Err and keeps the previously loaded model cached,
 /// so the caller only needs to warn and can retry with a fixed path.
@@ -193,9 +208,19 @@ fn pipeline_on_worker(
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
     // LLM cleanup chain (Groq → OpenRouter → Ollama local, $0). Issues
-    // (rate limits, missing model) surface as tray alerts.
+    // (rate limits, missing model) surface as tray alerts. Context
+    // synthesis runs first (cleanup layer on → focused app → 2-sentence
+    // hint); a context failure yields "" and the chain proceeds without.
     let cfg = crate::config::load_config();
-    let outcome = crate::cleanup::clean_chain(&text, &cfg);
+    let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
+        let app = focused_app_name();
+        crate::cleanup::synthesize_context(app.as_deref(), &cfg)
+    } else {
+        String::new()
+    };
+    let input =
+        crate::cleanup::format_cleanup_input(if ctx.is_empty() { None } else { Some(&ctx) }, &text);
+    let outcome = crate::cleanup::clean_chain(&input, &cfg);
     for issue in &outcome.issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }

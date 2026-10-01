@@ -135,9 +135,20 @@ fn main() {
                         let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
                         let rtf = ms as f64 / kept_ms.max(1.0);
                         info!("transcribed in {ms}ms (RTF {rtf:.2})");
-                        // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama).
+                        // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama),
+                        // with the focused-app context synthesized first.
                         let cfg = config::load_config();
-                        let outcome = cleanup::clean_chain(&text, &cfg);
+                        let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
+                            let app = daemon::focused_app_name();
+                            cleanup::synthesize_context(app.as_deref(), &cfg)
+                        } else {
+                            String::new()
+                        };
+                        let input = cleanup::format_cleanup_input(
+                            if ctx.is_empty() { None } else { Some(&ctx) },
+                            &text,
+                        );
+                        let outcome = cleanup::clean_chain(&input, &cfg);
                         for issue in &outcome.issues {
                             warn!("cleanup issue: {issue}");
                         }

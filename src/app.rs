@@ -83,6 +83,7 @@ pub struct MenuIds {
     perm_a11y: MenuId,
     edit_vocab: MenuId,
     cleanup_toggle: MenuId,
+    ctx_toggle: MenuId,
     prov_auto: MenuId,
     prov_groq: MenuId,
     prov_openrouter: MenuId,
@@ -120,6 +121,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         perm_a11y: MenuId::new("wiflow:perm:a11y"),
         edit_vocab: MenuId::new("wiflow:edit:vocab"),
         cleanup_toggle: MenuId::new("wiflow:cleanup:toggle"),
+        ctx_toggle: MenuId::new("wiflow:ctx:toggle"),
         prov_auto: MenuId::new("wiflow:prov:auto"),
         prov_groq: MenuId::new("wiflow:prov:groq"),
         prov_openrouter: MenuId::new("wiflow:prov:openrouter"),
@@ -239,6 +241,16 @@ pub fn build_menu(
         None,
     );
 
+    // Context inference: focused-app → 2-sentence context hint fed to the
+    // cleanup model (on by default; skipped instantly when cleanup is off).
+    let ctx_toggle = CheckMenuItem::with_id(
+        ids.ctx_toggle.clone(),
+        "Context Inference",
+        true,
+        config.context_enabled,
+        None,
+    );
+
     // Cleanup provider: auto chain or a single provider (Ollama fallback on
     // quota errors only). Empty config value counts as auto.
     let cp = if config.cleanup_provider.is_empty() {
@@ -306,6 +318,7 @@ pub fn build_menu(
     menu.append(&hk_menu).expect("menu append");
     menu.append(&launch_login).expect("menu append");
     menu.append(&cleanup_toggle).expect("menu append");
+    menu.append(&ctx_toggle).expect("menu append");
     menu.append(&prov_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
@@ -544,6 +557,20 @@ impl DaemonApp {
             tracing::info!(
                 "ai cleanup (ollama): {}",
                 if self.config.cleanup_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            return;
+        }
+        if *id == ids.ctx_toggle {
+            self.config.context_enabled = !self.config.context_enabled;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!(
+                "context inference: {}",
+                if self.config.context_enabled {
                     "on"
                 } else {
                     "off"
@@ -954,6 +981,7 @@ mod tests {
             ids.perm_a11y,
             ids.edit_vocab,
             ids.cleanup_toggle,
+            ids.ctx_toggle,
             ids.prov_auto,
             ids.prov_groq,
             ids.prov_openrouter,
