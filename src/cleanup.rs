@@ -10,16 +10,32 @@ pub const EMPTY_SENTINEL: &str = "EMPTY";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Provider chain (user-specified): Groq → OpenRouter → Ollama local →
-/// deterministic output. Keys come from env (never stored on disk):
-/// `GROQ_API_KEY`, `OPENROUTER_API_KEY`.
-pub fn groq_api_key() -> Option<String> {
-    std::env::var("GROQ_API_KEY").ok().filter(|k| !k.is_empty())
+/// deterministic output. Keys come from env first (`GROQ_API_KEY`,
+/// `OPENROUTER_API_KEY`), then `~/Library/Application Support/wiflow/keys.json`
+/// (`groq_api_key` / `openrouter_api_key` fields) — never stored in the repo.
+pub fn groq_key() -> Option<String> {
+    std::env::var("GROQ_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| key_from_file("groq_api_key"))
 }
 
-pub fn openrouter_api_key() -> Option<String> {
+pub fn openrouter_key() -> Option<String> {
     std::env::var("OPENROUTER_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
+        .or_else(|| key_from_file("openrouter_api_key"))
+}
+
+/// keys.json field reader in the app support dir. Empty strings count as
+/// missing (hand-edited placeholders must not be sent as auth headers).
+fn key_from_file(field: &str) -> Option<String> {
+    let path = crate::config::app_support_dir().join("keys.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v[field]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Result of the cleanup chain: cleaned text (input unchanged when every
@@ -28,6 +44,71 @@ pub fn openrouter_api_key() -> Option<String> {
 pub struct CleanupOutcome {
     pub text: String,
     pub issues: Vec<String>,
+}
+
+/// Cleanup providers for the LLM cleanup layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Groq,
+    OpenRouter,
+    Ollama,
+}
+
+impl Provider {
+    fn name(self) -> &'static str {
+        match self {
+            Provider::Groq => "Groq",
+            Provider::OpenRouter => "OpenRouter",
+            Provider::Ollama => "Ollama",
+        }
+    }
+
+    /// Quota-exhausted wording (differs per provider: rate limit vs credits).
+    fn quota_issue(self, fallback: Provider) -> String {
+        let detail = match self {
+            Provider::Groq => "tokens/rate limit exhausted",
+            Provider::OpenRouter => "tokens/credits exhausted",
+            Provider::Ollama => "quota exhausted",
+        };
+        format!(
+            "{} {detail} — falling back to {}",
+            self.name(),
+            fallback.name()
+        )
+    }
+}
+
+/// Try one provider: key (env → keys.json) + HTTP call. Err carries a
+/// user-facing reason (missing key, HTTP status, unparseable response).
+fn try_provider(
+    p: Provider,
+    cfg: &crate::config::Config,
+    transcript: &str,
+) -> Result<String, String> {
+    match p {
+        Provider::Groq => {
+            let key = groq_key()
+                .ok_or("no Groq API key — set GROQ_API_KEY or add groq_api_key to keys.json")?;
+            chat_completion(
+                "https://api.groq.com/openai/v1/chat/completions",
+                &key,
+                &cfg.cleanup_groq_model,
+                transcript,
+            )
+        }
+        Provider::OpenRouter => {
+            let key = openrouter_key().ok_or(
+                "no OpenRouter API key — set OPENROUTER_API_KEY or add openrouter_api_key to keys.json",
+            )?;
+            chat_completion(
+                "https://openrouter.ai/api/v1/chat/completions",
+                &key,
+                &cfg.cleanup_openrouter_model,
+                transcript,
+            )
+        }
+        Provider::Ollama => ollama_generate(transcript, &cfg.cleanup_model),
+    }
 }
 
 /// Run the full provider chain. Never fails: worst case the input is
@@ -40,59 +121,115 @@ pub fn clean_chain(transcript: &str, cfg: &crate::config::Config) -> CleanupOutc
             issues,
         };
     }
-    // 1. Groq (fastest cloud, generous free tier).
-    if let Some(key) = groq_api_key() {
-        match chat_completion(
-            "https://api.groq.com/openai/v1/chat/completions",
-            &key,
-            &cfg.cleanup_groq_model,
-            transcript,
-        ) {
-            Ok(text) => return CleanupOutcome { text, issues },
-            Err(e) => {
-                if is_quota_error(&e) {
-                    issues.push(
-                        "Groq tokens/rate limit exhausted — falling back to OpenRouter".to_string(),
-                    );
-                } else {
-                    issues.push(format!("Groq failed ({e}) — falling back to OpenRouter"));
+    let provider = if cfg.cleanup_provider.is_empty() {
+        "auto"
+    } else {
+        cfg.cleanup_provider.as_str()
+    };
+    let text = match provider {
+        "groq" => single_provider_chain(transcript, cfg, &[Provider::Groq], &mut issues),
+        "openrouter" => {
+            single_provider_chain(transcript, cfg, &[Provider::OpenRouter], &mut issues)
+        }
+        "ollama" => single_provider_chain(transcript, cfg, &[Provider::Ollama], &mut issues),
+        _ => full_chain(transcript, cfg, &mut issues),
+    };
+    CleanupOutcome {
+        text: text.unwrap_or_else(|| transcript.to_string()),
+        issues,
+    }
+}
+
+/// One chain step: try `p`; on failure push the user-facing issue and fall
+/// back to `next` (when present). Returns Some(cleaned) on success.
+fn chain_step(
+    p: Provider,
+    cfg: &crate::config::Config,
+    transcript: &str,
+    next: Option<Provider>,
+    issues: &mut Vec<String>,
+) -> Option<String> {
+    match try_provider(p, cfg, transcript) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            match next {
+                Some(n) => {
+                    if is_quota_error(&e) {
+                        issues.push(p.quota_issue(n));
+                    } else {
+                        issues.push(format!(
+                            "{} failed ({e}) — falling back to {}",
+                            p.name(),
+                            n.name()
+                        ));
+                    }
                 }
-                tracing::warn!("groq cleanup failed: {e}");
+                None => issues.push(format!("{} fallback failed: {e}", p.name())),
             }
+            tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
+            None
+        }
+    }
+}
+
+/// Auto chain (existing behavior): Groq → OpenRouter → Ollama, silently
+/// skipping cloud providers with no key.
+fn full_chain(
+    transcript: &str,
+    cfg: &crate::config::Config,
+    issues: &mut Vec<String>,
+) -> Option<String> {
+    // 1. Groq (fastest cloud, generous free tier). No key → skip silently.
+    if groq_key().is_some() {
+        if let Some(text) = chain_step(
+            Provider::Groq,
+            cfg,
+            transcript,
+            Some(Provider::OpenRouter),
+            issues,
+        ) {
+            return Some(text);
         }
     }
     // 2. OpenRouter (free-tier models available).
-    if let Some(key) = openrouter_api_key() {
-        match chat_completion(
-            "https://openrouter.ai/api/v1/chat/completions",
-            &key,
-            &cfg.cleanup_openrouter_model,
+    if openrouter_key().is_some() {
+        if let Some(text) = chain_step(
+            Provider::OpenRouter,
+            cfg,
             transcript,
+            Some(Provider::Ollama),
+            issues,
         ) {
-            Ok(text) => return CleanupOutcome { text, issues },
-            Err(e) => {
-                if is_quota_error(&e) {
-                    issues.push(
-                        "OpenRouter tokens/credits exhausted — falling back to Ollama".to_string(),
-                    );
-                } else {
-                    issues.push(format!("OpenRouter failed ({e}) — falling back to Ollama"));
-                }
-                tracing::warn!("openrouter cleanup failed: {e}");
-            }
+            return Some(text);
         }
     }
     // 3. Ollama local ($0, offline). Background model check with guidance.
-    match ollama_generate(transcript, &cfg.cleanup_model) {
-        Ok(text) => return CleanupOutcome { text, issues },
+    chain_step(Provider::Ollama, cfg, transcript, None, issues)
+}
+
+/// Explicit provider: only that one, with Ollama fallback on quota errors
+/// (user requirement: alert + switch to Ollama) — not other errors, unless
+/// the provider IS ollama.
+fn single_provider_chain(
+    transcript: &str,
+    cfg: &crate::config::Config,
+    providers: &[Provider],
+    issues: &mut Vec<String>,
+) -> Option<String> {
+    let p = providers[0];
+    match try_provider(p, cfg, transcript) {
+        Ok(text) => Some(text),
         Err(e) => {
-            issues.push(format!("Ollama fallback failed: {e}"));
-            tracing::warn!("ollama cleanup failed: {e}");
+            if p != Provider::Ollama && is_quota_error(&e) {
+                issues.push(p.quota_issue(Provider::Ollama));
+                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
+                chain_step(Provider::Ollama, cfg, transcript, None, issues)
+            } else {
+                issues.push(format!("{} failed: {e}", p.name()));
+                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
+                None
+            }
         }
-    }
-    CleanupOutcome {
-        text: transcript.to_string(),
-        issues,
     }
 }
 
@@ -257,6 +394,35 @@ mod tests {
             eprintln!("ollama cleaned it live");
         } else {
             eprintln!("issues: {:?}", out.issues);
+        }
+    }
+
+    #[test]
+    fn test_keys_env_overrides_file() {
+        // env wins over keys.json; missing both → None. Uses a throwaway key
+        // file written to the REAL app dir (outside repo, gitignored by
+        // location). A real keys.json is backed up and restored afterwards.
+        let dir = crate::config::app_support_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys_path = dir.join("keys.json");
+        let backup = std::fs::read_to_string(&keys_path).ok();
+        std::fs::write(
+            &keys_path,
+            r#"{"groq_api_key":"file-key","openrouter_api_key":"file-or-key"}"#,
+        )
+        .unwrap();
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("OPENROUTER_API_KEY");
+        assert_eq!(groq_key(), Some("file-key".into()));
+        assert_eq!(openrouter_key(), Some("file-or-key".into()));
+        std::env::set_var("GROQ_API_KEY", "env-key");
+        assert_eq!(groq_key(), Some("env-key".into()));
+        std::env::remove_var("GROQ_API_KEY");
+        match backup {
+            Some(orig) => std::fs::write(&keys_path, orig).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&keys_path);
+            }
         }
     }
 

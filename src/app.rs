@@ -83,6 +83,10 @@ pub struct MenuIds {
     perm_a11y: MenuId,
     edit_vocab: MenuId,
     cleanup_toggle: MenuId,
+    prov_auto: MenuId,
+    prov_groq: MenuId,
+    prov_openrouter: MenuId,
+    prov_ollama: MenuId,
     quit: MenuId,
 }
 
@@ -116,6 +120,10 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         perm_a11y: MenuId::new("wiflow:perm:a11y"),
         edit_vocab: MenuId::new("wiflow:edit:vocab"),
         cleanup_toggle: MenuId::new("wiflow:cleanup:toggle"),
+        prov_auto: MenuId::new("wiflow:prov:auto"),
+        prov_groq: MenuId::new("wiflow:prov:groq"),
+        prov_openrouter: MenuId::new("wiflow:prov:openrouter"),
+        prov_ollama: MenuId::new("wiflow:prov:ollama"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -231,6 +239,41 @@ pub fn build_menu(
         None,
     );
 
+    // Cleanup provider: auto chain or a single provider (Ollama fallback on
+    // quota errors only). Empty config value counts as auto.
+    let cp = if config.cleanup_provider.is_empty() {
+        "auto"
+    } else {
+        config.cleanup_provider.as_str()
+    };
+    let prov_menu = Submenu::new("Cleanup Provider", true);
+    let prov_auto = CheckMenuItem::with_id(
+        ids.prov_auto.clone(),
+        "Auto (Groq→OpenRouter→Ollama)",
+        true,
+        cp == "auto",
+        None,
+    );
+    let prov_groq =
+        CheckMenuItem::with_id(ids.prov_groq.clone(), "Groq only", true, cp == "groq", None);
+    let prov_openrouter = CheckMenuItem::with_id(
+        ids.prov_openrouter.clone(),
+        "OpenRouter only",
+        true,
+        cp == "openrouter",
+        None,
+    );
+    let prov_ollama = CheckMenuItem::with_id(
+        ids.prov_ollama.clone(),
+        "Ollama only",
+        true,
+        cp == "ollama",
+        None,
+    );
+    prov_menu
+        .append_items(&[&prov_auto, &prov_groq, &prov_openrouter, &prov_ollama])
+        .expect("menu append");
+
     let hist_menu = Submenu::new("History", true);
     if history.is_empty() {
         let empty = MenuItem::new("(empty)", false, None);
@@ -263,6 +306,7 @@ pub fn build_menu(
     menu.append(&hk_menu).expect("menu append");
     menu.append(&launch_login).expect("menu append");
     menu.append(&cleanup_toggle).expect("menu append");
+    menu.append(&prov_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
@@ -505,6 +549,34 @@ impl DaemonApp {
                     "off"
                 }
             );
+            return;
+        }
+        if *id == ids.prov_auto {
+            self.config.cleanup_provider = "auto".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("cleanup provider: auto (Groq→OpenRouter→Ollama chain)");
+            return;
+        }
+        if *id == ids.prov_groq {
+            self.config.cleanup_provider = "groq".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("cleanup provider: groq (Ollama fallback on quota)");
+            return;
+        }
+        if *id == ids.prov_openrouter {
+            self.config.cleanup_provider = "openrouter".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("cleanup provider: openrouter (Ollama fallback on quota)");
+            return;
+        }
+        if *id == ids.prov_ollama {
+            self.config.cleanup_provider = "ollama".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("cleanup provider: ollama only");
             return;
         }
         if *id == ids.perm_mic {
@@ -882,6 +954,10 @@ mod tests {
             ids.perm_a11y,
             ids.edit_vocab,
             ids.cleanup_toggle,
+            ids.prov_auto,
+            ids.prov_groq,
+            ids.prov_openrouter,
+            ids.prov_ollama,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));

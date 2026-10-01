@@ -37,6 +37,11 @@ pub struct Config {
     pub cleanup_groq_model: String,
     #[serde(default = "default_openrouter_model")]
     pub cleanup_openrouter_model: String,
+    /// "auto" = Groq → OpenRouter → Ollama chain; explicit "groq" /
+    /// "openrouter" / "ollama" = only that provider (with Ollama fallback on
+    /// quota errors).
+    #[serde(default)]
+    pub cleanup_provider: String,
 }
 
 fn default_true() -> bool {
@@ -65,13 +70,19 @@ impl Default for Config {
             cleanup_model: "llama3.2:1b".into(),
             cleanup_groq_model: "llama-3.3-70b-versatile".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
+            cleanup_provider: "auto".into(),
         }
     }
 }
 
-pub fn config_path() -> PathBuf {
+/// App support dir (shared home for config/history/keys).
+pub fn app_support_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Library/Application Support/wiflow/config.json")
+    PathBuf::from(home).join("Library/Application Support/wiflow")
+}
+
+pub fn config_path() -> PathBuf {
+    app_support_dir().join("config.json")
 }
 
 /// Whisper initial-prompt vocabulary file: plain text, one line (artist
@@ -79,8 +90,7 @@ pub fn config_path() -> PathBuf {
 /// field so hand-editing can never corrupt the real config (corrupt config
 /// falls back to defaults and loses hotkey/mic/model settings).
 pub fn prompt_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Library/Application Support/wiflow/prompt.txt")
+    app_support_dir().join("prompt.txt")
 }
 
 pub fn load_config_from(path: &Path) -> Config {
@@ -209,6 +219,7 @@ mod tests {
             cleanup_model: "llama3.2:1b".into(),
             cleanup_groq_model: "llama-3.3-70b-versatile".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
+            cleanup_provider: "auto".into(),
         }
     }
 
@@ -234,6 +245,11 @@ mod tests {
         std::fs::write(&p, "{nope").unwrap();
         assert_eq!(load_config_from(&p), Config::default());
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn test_default_cleanup_provider_is_auto() {
+        assert_eq!(Config::default().cleanup_provider, "auto");
     }
 
     #[test]
