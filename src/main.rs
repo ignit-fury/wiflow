@@ -53,6 +53,15 @@ fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn maybe_dump_wav(args: &Args, kept: &[f32]) {
+    if args.dump_wav {
+        match dump_wav("/tmp/wiflow_hold.wav", kept, vad::VAD_SAMPLE_RATE) {
+            Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
+            Err(e) => warn!("wav dump failed: {e}"),
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -105,6 +114,7 @@ fn main() {
             info!("no speech detected");
             return;
         }
+        maybe_dump_wav(&args, &kept);
         match ptt.on_key_up(out.duration_ms) {
             PttEvent::Transcribe { duration_ms } => {
                 info!(
@@ -219,12 +229,6 @@ fn main() {
                                 inject::leave_on_clipboard(&text);
                             }
                         }
-                    }
-                }
-                if args.dump_wav {
-                    match dump_wav("/tmp/wiflow_hold.wav", &kept, vad::VAD_SAMPLE_RATE) {
-                        Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
-                        Err(e) => warn!("wav dump failed: {e}"),
                     }
                 }
             }
