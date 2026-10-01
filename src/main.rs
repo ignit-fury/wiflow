@@ -6,6 +6,7 @@ mod history;
 mod hotkey;
 mod inject;
 mod stt;
+mod tap;
 mod vad;
 
 use clap::Parser;

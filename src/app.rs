@@ -184,20 +184,20 @@ pub fn build_menu(
         .expect("menu append");
 
     let hk_menu = Submenu::new("Push-to-talk hotkey", true);
-    // Single-key holds cannot register on macOS (global-hotkey 0.7 has no
-    // scancode entries for bare modifiers — "Unknown scancode for AltRight").
-    // Items stay visible but disabled so the menu is honest about it.
+    // Bare-modifier presets (Right Option/Fn) ride a listen-only CGEventTap —
+    // RegisterEventHotKey can't see bare modifiers. Tap failure (no Input
+    // Monitoring permission) falls back to CtrlSpace + warn.
     let hk_right = CheckMenuItem::with_id(
         ids.hk_right.clone(),
-        "Right Option — unavailable on macOS",
-        false,
+        "Right Option",
+        true,
         config.hotkey_preset == HotkeyPreset::RightOption,
         None,
     );
     let hk_fn = CheckMenuItem::with_id(
         ids.hk_fn.clone(),
-        "Fn — unavailable on macOS",
-        false,
+        "Fn",
+        true,
         config.hotkey_preset == HotkeyPreset::Fn,
         None,
     );
@@ -269,7 +269,10 @@ struct DaemonApp {
     tray: TrayIcon,
     // Kept alive: dropping the manager unregisters the global hotkey.
     hotkey_manager: global_hotkey::GlobalHotKeyManager,
-    hotkey: global_hotkey::hotkey::HotKey,
+    // None when the PTT rides the CGEventTap (bare modifier presets).
+    hotkey: Option<global_hotkey::hotkey::HotKey>,
+    // Live tap handle for bare-modifier presets; Drop stops listening.
+    tap: Option<crate::tap::ModifierTap>,
     preset: HotkeyPreset,
     config: Config,
     devices: Vec<String>,
@@ -347,25 +350,66 @@ impl DaemonApp {
         if want == self.preset {
             return;
         }
-        let old = self.hotkey;
-        let _ = self.hotkey_manager.unregister(old);
-        match self.hotkey_manager.register(preset_hotkey(want)) {
-            Ok(()) => {
-                self.hotkey = preset_hotkey(want);
-                self.preset = want;
-                self.config.hotkey_preset = want;
-                self.save();
-                self.menu_dirty = true;
-                tracing::info!("ptt hotkey switched to {want:?}");
+        let want_is_bare = matches!(want, HotkeyPreset::RightOption | HotkeyPreset::Fn);
+        let old_preset = self.preset;
+        if want_is_bare {
+            // Combo → bare: unregister the global hotkey, spawn the tap.
+            if let Some(old) = self.hotkey.take() {
+                let _ = self.hotkey_manager.unregister(old);
             }
-            Err(e) => {
-                // Old id is gone from the manager — re-register it so PTT survives.
-                if let Err(e2) = self.hotkey_manager.register(old) {
-                    tracing::warn!("hotkey restore failed: {e2:?}");
+            match crate::tap::spawn(want, self.proxy.clone()) {
+                Ok(t) => {
+                    self.tap = Some(t);
+                    self.preset = want;
+                    self.config.hotkey_preset = want;
+                    self.save();
+                    self.menu_dirty = true;
+                    tracing::info!("ptt hotkey switched to {want:?} (CGEventTap)");
                 }
-                self.warn_note(format!("hotkey switch failed: {e:?}"));
+                Err(e) => {
+                    // Rollback: re-register the old combo so PTT survives.
+                    let _ = self.hotkey_manager.register(preset_hotkey(old_preset));
+                    self.hotkey = Some(preset_hotkey(old_preset));
+                    self.warn_note(format!("hotkey switch failed: {e}"));
+                }
+            }
+        } else {
+            // Bare → combo (or combo → combo): stop the tap, register hotkey.
+            if let Some(t) = self.tap.as_mut() {
+                t.stop();
+            }
+            self.tap = None;
+            match self.hotkey_manager.register(preset_hotkey(want)) {
+                Ok(()) => {
+                    self.hotkey = Some(preset_hotkey(want));
+                    self.preset = want;
+                    self.config.hotkey_preset = want;
+                    self.save();
+                    self.menu_dirty = true;
+                    tracing::info!("ptt hotkey switched to {want:?}");
+                }
+                Err(e) => {
+                    // Rollback: restore the old mechanism.
+                    if Self::old_is_bare_preset(old_preset) {
+                        match crate::tap::spawn(old_preset, self.proxy.clone()) {
+                            Ok(t) => self.tap = Some(t),
+                            Err(e2) => tracing::warn!("tap restore failed: {e2:?}"),
+                        }
+                    } else if let Some(old) = self.hotkey.take() {
+                        let _ = self.hotkey_manager.unregister(old);
+                        if let Err(e2) = self.hotkey_manager.register(preset_hotkey(old_preset)) {
+                            tracing::warn!("hotkey restore failed: {e2:?}");
+                        }
+                        self.hotkey = Some(preset_hotkey(old_preset));
+                    }
+                    self.warn_note(format!("hotkey switch failed: {e:?}"));
+                }
             }
         }
+    }
+
+    fn old_is_bare_preset(preset: HotkeyPreset) -> bool {
+        matches!(preset, HotkeyPreset::RightOption | HotkeyPreset::Fn)
     }
 
     fn handle_menu_event(&mut self, id: &MenuId) {
@@ -395,12 +439,10 @@ impl DaemonApp {
             return;
         }
         if *id == ids.hk_right {
-            // Disabled menu item — unreachable, kept for cross-platform later.
             self.switch_hotkey(HotkeyPreset::RightOption);
             return;
         }
         if *id == ids.hk_fn {
-            // Disabled menu item — unreachable, kept for cross-platform later.
             self.switch_hotkey(HotkeyPreset::Fn);
             return;
         }
@@ -574,12 +616,47 @@ fn app_main(
         history.len()
     );
 
-    let (manager, hotkey, won) = crate::daemon::register_ptt_hotkey(config.hotkey_preset)
-        .unwrap_or_else(|e| {
-            eprintln!("no push-to-talk hotkey: {e}");
-            std::process::exit(1);
-        });
-    tracing::info!("ptt hotkey registered: {won:?} (id {})", hotkey.id());
+    let is_bare = matches!(
+        config.hotkey_preset,
+        HotkeyPreset::RightOption | HotkeyPreset::Fn
+    );
+    let (manager, ptt_hotkey, won, tap) = if is_bare {
+        // Bare-modifier presets ride a listen-only CGEventTap (raw
+        // flagsChanged) — RegisterEventHotKey cannot see them.
+        match crate::tap::spawn(config.hotkey_preset, proxy.clone()) {
+            Ok(t) => {
+                let manager = global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
+                    eprintln!("hotkey manager: {e:?}");
+                    std::process::exit(1);
+                });
+                (manager, None, config.hotkey_preset, Some(t))
+            }
+            Err(e) => {
+                tracing::warn!("modifier tap unavailable ({e}) — falling back to CtrlSpace");
+                let (manager, hk, w) = crate::daemon::register_ptt_hotkey(HotkeyPreset::CtrlSpace)
+                    .unwrap_or_else(|e| {
+                        eprintln!("no push-to-talk hotkey: {e}");
+                        std::process::exit(1);
+                    });
+                (manager, Some(hk), w, None)
+            }
+        }
+    } else {
+        let (manager, hk, w) = crate::daemon::register_ptt_hotkey(config.hotkey_preset)
+            .unwrap_or_else(|e| {
+                eprintln!("no push-to-talk hotkey: {e}");
+                std::process::exit(1);
+            });
+        (manager, Some(hk), w, None)
+    };
+    tracing::info!(
+        "ptt hotkey registered: {won:?} ({})",
+        if ptt_hotkey.is_some() {
+            "global-hotkey"
+        } else {
+            "CGEventTap"
+        }
+    );
     // Esc cancel: winit device_event never delivers Key events to a
     // zero-window tray app on macOS (proven Task 3), so Esc rides the
     // same global-hotkey bridge as PTT. Registration failure degrades
@@ -608,7 +685,8 @@ fn app_main(
     let mut app = DaemonApp {
         tray,
         hotkey_manager: manager,
-        hotkey,
+        hotkey: ptt_hotkey,
+        tap,
         preset: won,
         config,
         devices,
