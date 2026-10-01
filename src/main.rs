@@ -3,6 +3,7 @@ mod audio;
 mod cleanup;
 mod config;
 mod daemon;
+mod groq_stt;
 mod history;
 mod hotkey;
 mod inject;
@@ -129,64 +130,96 @@ fn main() {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                match stt::transcribe_shared(&model_path, &kept, &stt::read_prompt()) {
-                    Ok(text) => {
-                        let ms = t0.elapsed().as_millis();
-                        let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
-                        let rtf = ms as f64 / kept_ms.max(1.0);
-                        info!("transcribed in {ms}ms (RTF {rtf:.2})");
-                        // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama),
-                        // with the focused-app context synthesized first.
-                        let cfg = config::load_config();
-                        let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
-                            let app = daemon::focused_app_name();
-                            cleanup::synthesize_context(app.as_deref(), &cfg)
-                        } else {
-                            String::new()
-                        };
-                        let input = cleanup::format_cleanup_input(
-                            if ctx.is_empty() { None } else { Some(&ctx) },
-                            &text,
-                        );
-                        let outcome = cleanup::clean_chain(&input, &cfg);
-                        for issue in &outcome.issues {
-                            warn!("cleanup issue: {issue}");
+                // Hoisted ABOVE transcribe: reused for the STT language/
+                // provider branch and the cleanup context below.
+                let cfg = config::load_config();
+                let prompt = stt::read_prompt();
+                // Same STT provider branch as the daemon: "groq" = cloud
+                // whisper-large-v3 (OPT-IN, tray alert + local fallback on
+                // failure), otherwise local on-device whisper.
+                let text = if cfg.stt_provider == "groq" {
+                    match crate::groq_stt::transcribe_cloud(&kept, vad::VAD_SAMPLE_RATE, &cfg) {
+                        Ok(t) => {
+                            info!("cloud stt (whisper-large-v3) done");
+                            t
                         }
-                        let text = outcome.text;
-                        if cleanup::is_filler_result(&text) {
-                            info!("transcript empty or filler-only after cleanup");
-                            return;
-                        }
-                        println!("TRANSCRIPT: {text}");
-                        if text.trim().is_empty() {
-                            info!("empty transcript, nothing to inject");
-                        } else {
-                            let entry = history::HistoryEntry {
-                                text: text.clone(),
-                                at_ms: now_ms(),
-                                duration_ms,
-                                rtf,
-                            };
-                            if let Err(e) = history::push_history(entry) {
-                                warn!("history push failed: {e}");
-                            }
-                            if args.no_inject {
-                                info!("--no-inject: skipping cursor injection");
-                            } else {
-                                match inject::inject_text(&text) {
-                                    Ok(r) => info!(
-                                        "injected via {} (clipboard restored: {})",
-                                        r.pasted_via, r.clipboard_restored
-                                    ),
-                                    Err(e) => {
-                                        warn!("inject failed ({e}) — text left on clipboard, press Cmd+V");
-                                        inject::leave_on_clipboard(&text);
-                                    }
+                        Err(e) => {
+                            warn!("Groq STT failed: {e} — using local whisper");
+                            match stt::transcribe_shared(
+                                &model_path,
+                                &kept,
+                                &prompt,
+                                &cfg.stt_language,
+                            ) {
+                                Ok(t) => t,
+                                Err(e2) => {
+                                    warn!("transcribe failed: {e2}");
+                                    return;
                                 }
                             }
                         }
                     }
-                    Err(e) => warn!("transcribe failed: {e}"),
+                } else {
+                    match stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!("transcribe failed: {e}");
+                            return;
+                        }
+                    }
+                };
+                let ms = t0.elapsed().as_millis();
+                let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
+                let rtf = ms as f64 / kept_ms.max(1.0);
+                info!("transcribed in {ms}ms (RTF {rtf:.2})");
+                // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama),
+                // with the focused-app context synthesized first.
+                let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
+                    let app = daemon::focused_app_name();
+                    cleanup::synthesize_context(app.as_deref(), &cfg)
+                } else {
+                    String::new()
+                };
+                let input = cleanup::format_cleanup_input(
+                    if ctx.is_empty() { None } else { Some(&ctx) },
+                    &text,
+                );
+                let outcome = cleanup::clean_chain(&input, &cfg);
+                for issue in &outcome.issues {
+                    warn!("cleanup issue: {issue}");
+                }
+                let text = outcome.text;
+                if cleanup::is_filler_result(&text) {
+                    info!("transcript empty or filler-only after cleanup");
+                    return;
+                }
+                println!("TRANSCRIPT: {text}");
+                if text.trim().is_empty() {
+                    info!("empty transcript, nothing to inject");
+                } else {
+                    let entry = history::HistoryEntry {
+                        text: text.clone(),
+                        at_ms: now_ms(),
+                        duration_ms,
+                        rtf,
+                    };
+                    if let Err(e) = history::push_history(entry) {
+                        warn!("history push failed: {e}");
+                    }
+                    if args.no_inject {
+                        info!("--no-inject: skipping cursor injection");
+                    } else {
+                        match inject::inject_text(&text) {
+                            Ok(r) => info!(
+                                "injected via {} (clipboard restored: {})",
+                                r.pasted_via, r.clipboard_restored
+                            ),
+                            Err(e) => {
+                                warn!("inject failed ({e}) — text left on clipboard, press Cmd+V");
+                                inject::leave_on_clipboard(&text);
+                            }
+                        }
+                    }
                 }
                 if args.dump_wav {
                     match dump_wav("/tmp/wiflow_hold.wav", &kept, vad::VAD_SAMPLE_RATE) {

@@ -88,6 +88,8 @@ pub struct MenuIds {
     prov_groq: MenuId,
     prov_openrouter: MenuId,
     prov_ollama: MenuId,
+    stt_local: MenuId,
+    stt_groq: MenuId,
     quit: MenuId,
 }
 
@@ -126,6 +128,8 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         prov_groq: MenuId::new("wiflow:prov:groq"),
         prov_openrouter: MenuId::new("wiflow:prov:openrouter"),
         prov_ollama: MenuId::new("wiflow:prov:ollama"),
+        stt_local: MenuId::new("wiflow:stt:local"),
+        stt_groq: MenuId::new("wiflow:stt:groq"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -286,6 +290,28 @@ pub fn build_menu(
         .append_items(&[&prov_auto, &prov_groq, &prov_openrouter, &prov_ollama])
         .expect("menu append");
 
+    // Speech-to-text provider: local (on-device) by default — audio leaves
+    // the device only when Groq cloud is explicitly chosen (privacy rule).
+    // stt_language stays config.json-only (not in the menu).
+    let stt_menu = Submenu::new("Transcription", true);
+    let stt_local = CheckMenuItem::with_id(
+        ids.stt_local.clone(),
+        "Transcription: Local whisper",
+        true,
+        config.stt_provider != "groq",
+        None,
+    );
+    let stt_groq = CheckMenuItem::with_id(
+        ids.stt_groq.clone(),
+        "Transcription: Groq cloud (whisper-large-v3)",
+        true,
+        config.stt_provider == "groq",
+        None,
+    );
+    stt_menu
+        .append_items(&[&stt_local, &stt_groq])
+        .expect("menu append");
+
     let hist_menu = Submenu::new("History", true);
     if history.is_empty() {
         let empty = MenuItem::new("(empty)", false, None);
@@ -320,6 +346,7 @@ pub fn build_menu(
     menu.append(&cleanup_toggle).expect("menu append");
     menu.append(&ctx_toggle).expect("menu append");
     menu.append(&prov_menu).expect("menu append");
+    menu.append(&stt_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
@@ -604,6 +631,20 @@ impl DaemonApp {
             self.save();
             self.menu_dirty = true;
             tracing::info!("cleanup provider: ollama only");
+            return;
+        }
+        if *id == ids.stt_local {
+            self.config.stt_provider = "local".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("stt provider: local (on-device whisper)");
+            return;
+        }
+        if *id == ids.stt_groq {
+            self.config.stt_provider = "groq".into();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("stt provider: groq cloud (whisper-large-v3)");
             return;
         }
         if *id == ids.perm_mic {
@@ -986,6 +1027,8 @@ mod tests {
             ids.prov_groq,
             ids.prov_openrouter,
             ids.prov_ollama,
+            ids.stt_local,
+            ids.stt_groq,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));

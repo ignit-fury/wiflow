@@ -195,12 +195,42 @@ fn pipeline_on_worker(
             return;
         }
     };
+    // Hoisted ABOVE transcribe: one config read per cycle, reused for the
+    // initial prompt, STT language/provider, and the cleanup context below.
+    let cfg = crate::config::load_config();
+    let prompt = crate::stt::read_prompt();
     let t0 = std::time::Instant::now();
-    let text = match crate::stt::transcribe_shared(&model_path, &kept, &crate::stt::read_prompt()) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
-            return;
+    // STT provider branch: "groq" = cloud whisper-large-v3 (OPT-IN), any
+    // other value = local on-device whisper. Cloud failure → tray alert +
+    // local fallback (never lose the transcript to a network error).
+    let text = if cfg.stt_provider == "groq" {
+        match crate::groq_stt::transcribe_cloud(&kept, crate::vad::VAD_SAMPLE_RATE, &cfg) {
+            Ok(t) => {
+                tracing::info!("cloud stt (whisper-large-v3) done");
+                t
+            }
+            Err(e) => {
+                let _ = proxy.send_event(DaemonEvent::CleanupIssue(format!(
+                    "Groq STT failed: {e} — using local whisper"
+                )));
+                match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language)
+                {
+                    Ok(t) => t,
+                    Err(e2) => {
+                        let _ = proxy
+                            .send_event(DaemonEvent::Failed(format!("transcribe failed: {e2}")));
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
+                return;
+            }
         }
     };
     let ms = t0.elapsed().as_millis();
@@ -211,7 +241,6 @@ fn pipeline_on_worker(
     // (rate limits, missing model) surface as tray alerts. Context
     // synthesis runs first (cleanup layer on → focused app → 2-sentence
     // hint); a context failure yields "" and the chain proceeds without.
-    let cfg = crate::config::load_config();
     let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
         let app = focused_app_name();
         crate::cleanup::synthesize_context(app.as_deref(), &cfg)

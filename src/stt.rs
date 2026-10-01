@@ -43,10 +43,13 @@ impl Stt {
     /// Reuses the cached WhisperState: no Metal re-init, no buffer re-allocation.
     /// `initial_prompt` biases recognition with domain terms (names, jargon);
     /// empty string = no prompt (zero cost).
+    /// `language` = "auto" (detect) or an ISO code ("en"); "auto"/empty skips
+    /// set_language (whisper-rs FullParams::set_language takes Option<&str>).
     pub fn transcribe(
         &mut self,
         samples_16k: &[f32],
         initial_prompt: &str,
+        language: &str,
     ) -> Result<String, String> {
         if samples_16k.is_empty() {
             return Ok(String::new());
@@ -59,6 +62,9 @@ impl Stt {
         params.set_no_timestamps(true);
         if !initial_prompt.is_empty() {
             params.set_initial_prompt(initial_prompt);
+        }
+        if language != "auto" && !language.is_empty() {
+            params.set_language(Some(language));
         }
         self.state
             .full(params, samples_16k)
@@ -90,6 +96,7 @@ pub fn transcribe_shared(
     model_path: &Path,
     samples: &[f32],
     initial_prompt: &str,
+    language: &str,
 ) -> Result<String, String> {
     let slot = STT.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -101,7 +108,7 @@ pub fn transcribe_shared(
         .as_mut()
         .expect("slot just filled")
         .1
-        .transcribe(samples, initial_prompt)
+        .transcribe(samples, initial_prompt, language)
 }
 
 /// Read the initial-prompt vocabulary (prompt.txt); missing file → empty.
@@ -375,9 +382,13 @@ mod tests {
 
     #[test]
     fn test_transcribe_shared_bad_path_is_err() {
-        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
+        assert!(
+            transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "", "").is_err()
+        );
         // Retry allowed: second call re-attempts (no poisoned cache).
-        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
+        assert!(
+            transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "", "").is_err()
+        );
     }
 
     #[test]
@@ -521,7 +532,7 @@ mod tests {
         let mut stt = Stt::load(&path).expect("load");
         let tone: Vec<f32> = (0..16_000).map(|i| 0.5 * (i as f32 * 0.02).sin()).collect();
         let text = stt
-            .transcribe(&tone, "")
+            .transcribe(&tone, "", "")
             .expect("transcribe must not error");
         eprintln!("tone transcript: {text:?}");
     }
