@@ -76,7 +76,6 @@ pub struct MenuIds {
     model_small: MenuId,
     hk_right: MenuId,
     hk_fn: MenuId,
-    hk_alt: MenuId,
     hk_ctrl: MenuId,
     launch_login: MenuId,
     history_items: Vec<(String, MenuId)>,
@@ -102,7 +101,6 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         model_small: MenuId::new("wiflow:model:small"),
         hk_right: MenuId::new("wiflow:hk:right"),
         hk_fn: MenuId::new("wiflow:hk:fn"),
-        hk_alt: MenuId::new("wiflow:hk:alt"),
         hk_ctrl: MenuId::new("wiflow:hk:ctrl"),
         launch_login: MenuId::new("wiflow:launch"),
         history_items: history
@@ -201,13 +199,6 @@ pub fn build_menu(
         config.hotkey_preset == HotkeyPreset::Fn,
         None,
     );
-    let hk_alt = CheckMenuItem::with_id(
-        ids.hk_alt.clone(),
-        "Option+Space",
-        true,
-        config.hotkey_preset == HotkeyPreset::AltSpace,
-        None,
-    );
     let hk_ctrl = CheckMenuItem::with_id(
         ids.hk_ctrl.clone(),
         "Ctrl+Space",
@@ -216,7 +207,7 @@ pub fn build_menu(
         None,
     );
     hk_menu
-        .append_items(&[&hk_right, &hk_fn, &hk_alt, &hk_ctrl])
+        .append_items(&[&hk_right, &hk_fn, &hk_ctrl])
         .expect("menu append");
 
     let launch_login = CheckMenuItem::with_id(
@@ -444,10 +435,6 @@ impl DaemonApp {
         }
         if *id == ids.hk_fn {
             self.switch_hotkey(HotkeyPreset::Fn);
-            return;
-        }
-        if *id == ids.hk_alt {
-            self.switch_hotkey(HotkeyPreset::AltSpace);
             return;
         }
         if *id == ids.hk_ctrl {
@@ -812,7 +799,6 @@ mod tests {
             ids.model_small,
             ids.hk_right,
             ids.hk_fn,
-            ids.hk_alt,
             ids.hk_ctrl,
             ids.launch_login,
             ids.perm_mic,

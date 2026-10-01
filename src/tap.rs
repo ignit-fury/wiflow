@@ -212,6 +212,5 @@ mod tests {
         assert_eq!(keycode_for_preset(HotkeyPreset::Fn), Some(63));
         // Combo presets ride global-hotkey, not the tap.
         assert_eq!(keycode_for_preset(HotkeyPreset::CtrlSpace), None);
-        assert_eq!(keycode_for_preset(HotkeyPreset::AltSpace), None);
     }
 }

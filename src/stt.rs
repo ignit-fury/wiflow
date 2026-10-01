@@ -64,7 +64,12 @@ impl Stt {
                 );
             }
         }
-        Ok(post_process(&text))
+        // Cleanup pipeline: hallucination tokens → capitalization/i-fix →
+        // spoken math ("A plus B" → "A+B"). Empty after token strip → Ok("")
+        // (callers treat empty as no-text, nothing injected).
+        let stripped = strip_hallucination_tokens(&text);
+        let processed = post_process(&stripped);
+        Ok(plus_to_symbol(&processed))
     }
 }
 
@@ -242,6 +247,81 @@ pub fn post_process(text: &str) -> String {
     out
 }
 
+/// Remove bracketed ALL-CAPS Whisper tokens ([BLANK_AUDIO], [MUSIC],
+/// [APPLAUSE], [BLANK_AUDIO]) that silent/noisy holds produce — the user's
+/// history shows them getting pasted into documents. Lowercase bracket
+/// content (markdown links, [ok]) is preserved. One trailing space after a
+/// stripped token is consumed.
+fn strip_hallucination_tokens(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(close) = chars[i + 1..].iter().position(|&c| c == ']') {
+                let inner = &chars[i + 1..i + 1 + close];
+                let is_token =
+                    !inner.is_empty() && inner.iter().all(|c| c.is_ascii_uppercase() || *c == '_');
+                if is_token {
+                    i += close + 2;
+                    if i < chars.len() && chars[i] == ' ' {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Alphanumeric core of a word, ignoring SURROUNDING punctuation only:
+/// "(A" → "A", "B," → "B". Inner punctuation is untouched ("1.0" → "1.0",
+/// so decimals never match the single-letter plus check).
+fn core_word(w: &str) -> &str {
+    let s = w.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    s.trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+}
+
+fn is_single_alnum(w: &str) -> bool {
+    let c = core_word(w);
+    c.chars().count() == 1 && c.chars().next().is_some_and(|x| x.is_ascii_alphanumeric())
+}
+
+/// Spoken math → symbol: "A plus B" → "A+B", "A plus B, then" → "A+B, then",
+/// "A plus B plus C" → "A+B+C". Only between single alphanumeric
+/// letters/digits (punctuation attached to the letter is kept); normal prose
+/// ("the cost plus tax") is untouched.
+fn plus_to_symbol(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 3 {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < words.len() {
+        if words[i] == "plus"
+            && i >= 1
+            && i + 1 < words.len()
+            && is_single_alnum(words[i - 1])
+            && is_single_alnum(words[i + 1])
+        {
+            if out.ends_with(' ') {
+                out.pop();
+            }
+            out.push('+');
+            i += 1;
+            continue;
+        }
+        out.push_str(words[i]);
+        out.push(' ');
+        i += 1;
+    }
+    out.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +429,46 @@ mod tests {
             .map(|m| m.len() == size)
             .unwrap_or(false));
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn test_strip_hallucination_tokens() {
+        assert_eq!(strip_hallucination_tokens("[BLANK_AUDIO]"), "");
+        assert_eq!(strip_hallucination_tokens("[MUSIC]"), "");
+        assert_eq!(
+            strip_hallucination_tokens("[BLANK_AUDIO] hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            strip_hallucination_tokens("hello [MUSIC] world"),
+            "hello world"
+        );
+        // Lowercase bracket content preserved (markdown links, [ok]).
+        assert_eq!(
+            strip_hallucination_tokens("see [the docs] here"),
+            "see [the docs] here"
+        );
+        assert_eq!(strip_hallucination_tokens("[ok]"), "[ok]");
+        // Unbalanced bracket untouched.
+        assert_eq!(
+            strip_hallucination_tokens("[BLANK_AUDIO hello"),
+            "[BLANK_AUDIO hello"
+        );
+    }
+
+    #[test]
+    fn test_plus_to_symbol() {
+        assert_eq!(plus_to_symbol("A plus B"), "A+B");
+        assert_eq!(plus_to_symbol("a plus b"), "a+b");
+        assert_eq!(plus_to_symbol("A plus B, then why"), "A+B, then why");
+        assert_eq!(plus_to_symbol("A plus B plus C"), "A+B+C");
+        assert_eq!(plus_to_symbol("(A) plus [B]"), "(A)+[B]");
+        assert_eq!(plus_to_symbol("1 plus 2 equals 3"), "1+2 equals 3");
+        // Prose untouched: multi-letter words, decimals.
+        assert_eq!(plus_to_symbol("the cost plus tax"), "the cost plus tax");
+        assert_eq!(plus_to_symbol("1.0 plus 2.0"), "1.0 plus 2.0");
+        assert_eq!(plus_to_symbol("hello"), "hello");
+        assert_eq!(plus_to_symbol(""), "");
     }
 
     #[test]
