@@ -81,6 +81,7 @@ pub struct MenuIds {
     history_items: Vec<(String, MenuId)>,
     perm_mic: MenuId,
     perm_a11y: MenuId,
+    edit_vocab: MenuId,
     quit: MenuId,
 }
 
@@ -112,6 +113,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
             .collect(),
         perm_mic: MenuId::new("wiflow:perm:mic"),
         perm_a11y: MenuId::new("wiflow:perm:a11y"),
+        edit_vocab: MenuId::new("wiflow:edit:vocab"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -236,6 +238,10 @@ pub fn build_menu(
         .append_items(&[&perm_mic, &perm_a11y])
         .expect("menu append");
 
+    // Vocabulary (Whisper initial prompt): opens prompt.txt in the default
+    // editor — plain text so hand-editing can't corrupt JSON config.
+    let edit_vocab = MenuItem::with_id(ids.edit_vocab.clone(), "Edit Vocabulary…", true, None);
+
     let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
 
     menu.append(&status).expect("menu append");
@@ -248,6 +254,7 @@ pub fn build_menu(
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
+    menu.append(&edit_vocab).expect("menu append");
     menu.append(&perm_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
@@ -453,6 +460,24 @@ impl DaemonApp {
                     tracing::info!("launch at login: {enable}");
                 }
                 Err(e) => self.warn_note(format!("launch-at-login failed: {e}")),
+            }
+            return;
+        }
+        if *id == ids.edit_vocab {
+            // Ensure prompt.txt exists (empty), then open in default editor.
+            let path = crate::config::prompt_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if !path.exists() {
+                let _ = std::fs::write(
+                    &path,
+                    "One line: names/jargon Whisper mishears, e.g. Playboy Carti, Rather Lie\n",
+                );
+            }
+            match open::that(&path) {
+                Ok(()) => tracing::info!("vocabulary editor opened"),
+                Err(e) => self.warn_note(format!("cannot open editor: {e:?}")),
             }
             return;
         }
@@ -803,6 +828,7 @@ mod tests {
             ids.launch_login,
             ids.perm_mic,
             ids.perm_a11y,
+            ids.edit_vocab,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));

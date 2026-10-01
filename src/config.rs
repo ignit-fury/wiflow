@@ -31,6 +31,15 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/wiflow/config.json")
 }
 
+/// Whisper initial-prompt vocabulary file: plain text, one line (artist
+/// names, jargon the model mishears). Plain .txt instead of a JSON config
+/// field so hand-editing can never corrupt the real config (corrupt config
+/// falls back to defaults and loses hotkey/mic/model settings).
+pub fn prompt_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("Library/Application Support/wiflow/prompt.txt")
+}
+
 pub fn load_config_from(path: &Path) -> Config {
     std::fs::read_to_string(path)
         .ok()

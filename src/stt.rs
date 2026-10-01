@@ -41,7 +41,13 @@ impl Stt {
     /// Input MUST be 16kHz mono — callers pass `vad::transcribe_ready` output.
     /// Empty input short-circuits to Ok("") without touching the model.
     /// Reuses the cached WhisperState: no Metal re-init, no buffer re-allocation.
-    pub fn transcribe(&mut self, samples_16k: &[f32]) -> Result<String, String> {
+    /// `initial_prompt` biases recognition with domain terms (names, jargon);
+    /// empty string = no prompt (zero cost).
+    pub fn transcribe(
+        &mut self,
+        samples_16k: &[f32],
+        initial_prompt: &str,
+    ) -> Result<String, String> {
         if samples_16k.is_empty() {
             return Ok(String::new());
         }
@@ -51,6 +57,9 @@ impl Stt {
         params.set_single_segment(true);
         // Skip timestamp token computation — wiflow never uses timestamps.
         params.set_no_timestamps(true);
+        if !initial_prompt.is_empty() {
+            params.set_initial_prompt(initial_prompt);
+        }
         self.state
             .full(params, samples_16k)
             .map_err(|e| format!("transcribe: {e:?}"))?;
@@ -77,7 +86,11 @@ static STT: OnceLock<Mutex<Option<(PathBuf, Stt)>>> = OnceLock::new();
 
 /// Load once, reload on model switch, retry after failure (Err never sticks).
 /// First-implemented fix for the Phase 4 `OnceLock<Result>` Err-sticks finding.
-pub fn transcribe_shared(model_path: &Path, samples: &[f32]) -> Result<String, String> {
+pub fn transcribe_shared(
+    model_path: &Path,
+    samples: &[f32],
+    initial_prompt: &str,
+) -> Result<String, String> {
     let slot = STT.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     let hit = matches!(&*guard, Some((p, _)) if p == model_path);
@@ -88,7 +101,19 @@ pub fn transcribe_shared(model_path: &Path, samples: &[f32]) -> Result<String, S
         .as_mut()
         .expect("slot just filled")
         .1
-        .transcribe(samples)
+        .transcribe(samples, initial_prompt)
+}
+
+/// Read the initial-prompt vocabulary (prompt.txt); missing file → empty.
+/// Null bytes stripped (set_initial_prompt panics on them).
+pub fn read_prompt() -> String {
+    std::fs::read_to_string(crate::config::prompt_path())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '\0')
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Drop the cached WhisperContext before process exit: whisper.cpp's C++
@@ -350,9 +375,23 @@ mod tests {
 
     #[test]
     fn test_transcribe_shared_bad_path_is_err() {
-        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
+        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
         // Retry allowed: second call re-attempts (no poisoned cache).
-        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160]).is_err());
+        assert!(transcribe_shared(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
+    }
+
+    #[test]
+    fn test_read_prompt_missing_is_empty() {
+        // Default machine state: prompt.txt not yet created → empty prompt.
+        let p = crate::config::prompt_path();
+        let existed = p.exists();
+        if existed {
+            let saved = std::fs::read_to_string(&p).unwrap();
+            assert!(!read_prompt().contains('\0'));
+            let _ = saved;
+        } else {
+            assert_eq!(read_prompt(), "");
+        }
     }
 
     #[test]
@@ -481,7 +520,9 @@ mod tests {
         }
         let mut stt = Stt::load(&path).expect("load");
         let tone: Vec<f32> = (0..16_000).map(|i| 0.5 * (i as f32 * 0.02).sin()).collect();
-        let text = stt.transcribe(&tone).expect("transcribe must not error");
+        let text = stt
+            .transcribe(&tone, "")
+            .expect("transcribe must not error");
         eprintln!("tone transcript: {text:?}");
     }
 }
