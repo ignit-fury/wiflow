@@ -42,6 +42,24 @@ pub struct Config {
     /// quota errors).
     #[serde(default)]
     pub cleanup_provider: String,
+    /// Post-Processing Fallback: when the primary model fails on a provider,
+    /// the SAME provider is retried with this model before moving down the
+    /// chain.
+    #[serde(default = "default_fallback_model")]
+    pub cleanup_fallback_model: String,
+    /// Context-synthesis layer (focused app → 2-sentence context hint).
+    #[serde(default = "default_true")]
+    pub context_enabled: bool,
+    /// Small model for context synthesis.
+    #[serde(default = "default_context_model")]
+    pub context_model: String,
+    /// Speech-to-text provider: "local" (on-device whisper) or "groq" (cloud,
+    /// opt-in — audio leaves the device only when explicitly chosen).
+    #[serde(default = "default_stt_provider")]
+    pub stt_provider: String,
+    /// STT language: "auto" (detect) or an ISO code like "en".
+    #[serde(default = "default_stt_language")]
+    pub stt_language: String,
 }
 
 fn default_true() -> bool {
@@ -51,10 +69,22 @@ fn default_ollama_model() -> String {
     "llama3.2:1b".into()
 }
 fn default_groq_model() -> String {
-    "llama-3.3-70b-versatile".into()
+    "openai/gpt-oss-20b".into()
 }
 fn default_openrouter_model() -> String {
     "meta-llama/llama-3.3-70b:free".into()
+}
+fn default_fallback_model() -> String {
+    "qwen/qwen3.8-27b".into()
+}
+fn default_context_model() -> String {
+    "qwen/qwen3.8-27b".into()
+}
+fn default_stt_provider() -> String {
+    "local".into()
+}
+fn default_stt_language() -> String {
+    "auto".into()
 }
 
 // Manual Default (not derive): cleanup_enabled must default ON (user intent),
@@ -68,9 +98,14 @@ impl Default for Config {
             launch_at_login: false,
             cleanup_enabled: true,
             cleanup_model: "llama3.2:1b".into(),
-            cleanup_groq_model: "llama-3.3-70b-versatile".into(),
+            cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
+            context_enabled: true,
+            context_model: "qwen/qwen3.8-27b".into(),
+            stt_provider: "local".into(),
+            stt_language: "auto".into(),
         }
     }
 }
@@ -217,9 +252,14 @@ mod tests {
             launch_at_login: true,
             cleanup_enabled: true,
             cleanup_model: "llama3.2:1b".into(),
-            cleanup_groq_model: "llama-3.3-70b-versatile".into(),
+            cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
+            context_enabled: true,
+            context_model: "qwen/qwen3.8-27b".into(),
+            stt_provider: "local".into(),
+            stt_language: "auto".into(),
         }
     }
 
@@ -250,6 +290,17 @@ mod tests {
     #[test]
     fn test_default_cleanup_provider_is_auto() {
         assert_eq!(Config::default().cleanup_provider, "auto");
+    }
+
+    #[test]
+    fn test_image_model_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.cleanup_groq_model, "openai/gpt-oss-20b");
+        assert_eq!(cfg.cleanup_fallback_model, "qwen/qwen3.8-27b");
+        assert!(cfg.context_enabled);
+        assert_eq!(cfg.context_model, "qwen/qwen3.8-27b");
+        assert_eq!(cfg.stt_provider, "local");
+        assert_eq!(cfg.stt_language, "auto");
     }
 
     #[test]

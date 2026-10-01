@@ -78,13 +78,18 @@ impl Provider {
     }
 }
 
-/// Try one provider: key (env → keys.json) + HTTP call. Err carries a
+/// Model id a provider uses (per-provider config field).
+fn provider_model(p: Provider, cfg: &crate::config::Config) -> &str {
+    match p {
+        Provider::Groq => &cfg.cleanup_groq_model,
+        Provider::OpenRouter => &cfg.cleanup_openrouter_model,
+        Provider::Ollama => &cfg.cleanup_model,
+    }
+}
+
+/// Try one provider + model: key (env → keys.json) + HTTP call. Err carries a
 /// user-facing reason (missing key, HTTP status, unparseable response).
-fn try_provider(
-    p: Provider,
-    cfg: &crate::config::Config,
-    transcript: &str,
-) -> Result<String, String> {
+fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<String, String> {
     match p {
         Provider::Groq => {
             let key = groq_key()
@@ -92,7 +97,7 @@ fn try_provider(
             chat_completion(
                 "https://api.groq.com/openai/v1/chat/completions",
                 &key,
-                &cfg.cleanup_groq_model,
+                model,
                 transcript,
             )
         }
@@ -103,11 +108,34 @@ fn try_provider(
             chat_completion(
                 "https://openrouter.ai/api/v1/chat/completions",
                 &key,
-                &cfg.cleanup_openrouter_model,
+                model,
                 transcript,
             )
         }
-        Provider::Ollama => ollama_generate(transcript, &cfg.cleanup_model),
+        Provider::Ollama => ollama_generate(transcript, model),
+    }
+}
+
+/// Explicit retry: after the primary model fails on a provider, retry the
+/// SAME provider with `cleanup_fallback_model` before moving down the chain.
+/// The fallback error stands when the fallback equals the primary.
+fn try_provider_with_retry(
+    p: Provider,
+    cfg: &crate::config::Config,
+    transcript: &str,
+) -> Result<String, String> {
+    let primary = provider_model(p, cfg);
+    match try_provider_model(p, primary, transcript) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            let fallback = cfg.cleanup_fallback_model.as_str();
+            if fallback != primary {
+                tracing::warn!("retry with fallback model {fallback}: {e}");
+                try_provider_model(p, fallback, transcript)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -149,7 +177,7 @@ fn chain_step(
     next: Option<Provider>,
     issues: &mut Vec<String>,
 ) -> Option<String> {
-    match try_provider(p, cfg, transcript) {
+    match try_provider_with_retry(p, cfg, transcript) {
         Ok(text) => Some(text),
         Err(e) => {
             match next {
@@ -217,7 +245,7 @@ fn single_provider_chain(
     issues: &mut Vec<String>,
 ) -> Option<String> {
     let p = providers[0];
-    match try_provider(p, cfg, transcript) {
+    match try_provider_with_retry(p, cfg, transcript) {
         Ok(text) => Some(text),
         Err(e) => {
             if p != Provider::Ollama && is_quota_error(&e) {
@@ -384,9 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_chain_falls_through_to_ollama() {
-        // No env keys → chain falls through to Ollama (running here).
-        let cfg = crate::config::Config::default();
+    fn test_clean_chain_ollama_provider_live() {
+        // Explicit "ollama" provider: never calls the cloud APIs from tests
+        // (the real Groq key lives in keys.json — live cloud verification is
+        // Task 5's job). Ollama may or may not be running locally.
+        let cfg = crate::config::Config {
+            cleanup_provider: "ollama".into(),
+            ..crate::config::Config::default()
+        };
         let out = clean_chain("hello world", &cfg);
         assert!(!out.text.is_empty(), "cleaned text must not be empty");
         eprintln!("chain output: {:?}", out.text);
