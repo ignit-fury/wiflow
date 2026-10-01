@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod cleanup;
 mod config;
 mod daemon;
 mod history;
@@ -134,6 +135,18 @@ fn main() {
                         let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
                         let rtf = ms as f64 / kept_ms.max(1.0);
                         info!("transcribed in {ms}ms (RTF {rtf:.2})");
+                        // Same LLM cleanup as the daemon (Ollama, graceful skip).
+                        let cfg = config::load_config();
+                        let text = cleanup::clean(
+                            &text,
+                            cfg.cleanup_enabled,
+                            &cfg.cleanup_model,
+                            cleanup::DEFAULT_ENDPOINT,
+                        );
+                        if cleanup::is_filler_result(&text) {
+                            info!("transcript empty or filler-only after cleanup");
+                            return;
+                        }
                         println!("TRANSCRIPT: {text}");
                         if text.trim().is_empty() {
                             info!("empty transcript, nothing to inject");

@@ -15,7 +15,8 @@ pub enum ModelChoice {
 // re-exported here so config serializes the same type the daemon registers.
 pub use crate::daemon::HotkeyPreset;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub hotkey_preset: HotkeyPreset,
     #[serde(default)]
@@ -24,6 +25,31 @@ pub struct Config {
     pub model: ModelChoice,
     #[serde(default)]
     pub launch_at_login: bool,
+    /// LLM cleanup (Ollama local, $0): on by default, skips instantly when
+    /// Ollama is unreachable so the deterministic output stands.
+    #[serde(default = "default_true")]
+    pub cleanup_enabled: bool,
+    #[serde(default)]
+    pub cleanup_model: String,
+}
+
+// Manual Default (not derive): cleanup_enabled must default ON (user intent),
+// matching the serde missing-field default.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hotkey_preset: HotkeyPreset::default(),
+            mic_name: None,
+            model: ModelChoice::default(),
+            launch_at_login: false,
+            cleanup_enabled: true,
+            cleanup_model: crate::cleanup::DEFAULT_MODEL.into(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn config_path() -> PathBuf {
@@ -162,6 +188,8 @@ mod tests {
             mic_name: Some("Test Mic".into()),
             model: ModelChoice::SmallEn,
             launch_at_login: true,
+            cleanup_enabled: true,
+            cleanup_model: "llama3.2:1b".into(),
         }
     }
 

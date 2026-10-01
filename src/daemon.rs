@@ -189,6 +189,26 @@ fn pipeline_on_worker(
     let kept_ms = kept.len() as f64 / crate::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
+    // LLM cleanup (literal dictation cleanup layer, Ollama local $0): skips
+    // instantly when Ollama is unreachable — deterministic output stands.
+    let cfg = crate::config::load_config();
+    let cleaned = crate::cleanup::clean(
+        &text,
+        cfg.cleanup_enabled,
+        &cfg.cleanup_model,
+        crate::cleanup::DEFAULT_ENDPOINT,
+    );
+    if crate::cleanup::is_filler_result(&cleaned) {
+        // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
+        tracing::info!("transcript empty or filler-only after cleanup");
+        let _ = proxy.send_event(DaemonEvent::Done {
+            text: String::new(),
+            duration_ms,
+            rtf,
+        });
+        return;
+    }
+    let text = cleaned;
     if text.trim().is_empty() {
         let _ = proxy.send_event(DaemonEvent::Done {
             text: String::new(),

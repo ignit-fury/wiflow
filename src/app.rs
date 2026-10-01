@@ -82,6 +82,7 @@ pub struct MenuIds {
     perm_mic: MenuId,
     perm_a11y: MenuId,
     edit_vocab: MenuId,
+    cleanup_toggle: MenuId,
     quit: MenuId,
 }
 
@@ -114,6 +115,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         perm_mic: MenuId::new("wiflow:perm:mic"),
         perm_a11y: MenuId::new("wiflow:perm:a11y"),
         edit_vocab: MenuId::new("wiflow:edit:vocab"),
+        cleanup_toggle: MenuId::new("wiflow:cleanup:toggle"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -220,6 +222,15 @@ pub fn build_menu(
         None,
     );
 
+    // LLM cleanup (literal dictation cleanup layer via Ollama, $0 local).
+    let cleanup_toggle = CheckMenuItem::with_id(
+        ids.cleanup_toggle.clone(),
+        "AI Cleanup (Ollama)",
+        true,
+        config.cleanup_enabled,
+        None,
+    );
+
     let hist_menu = Submenu::new("History", true);
     if history.is_empty() {
         let empty = MenuItem::new("(empty)", false, None);
@@ -251,6 +262,7 @@ pub fn build_menu(
     menu.append(&model_menu).expect("menu append");
     menu.append(&hk_menu).expect("menu append");
     menu.append(&launch_login).expect("menu append");
+    menu.append(&cleanup_toggle).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
@@ -479,6 +491,20 @@ impl DaemonApp {
                 Ok(()) => tracing::info!("vocabulary editor opened"),
                 Err(e) => self.warn_note(format!("cannot open editor: {e:?}")),
             }
+            return;
+        }
+        if *id == ids.cleanup_toggle {
+            self.config.cleanup_enabled = !self.config.cleanup_enabled;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!(
+                "ai cleanup (ollama): {}",
+                if self.config.cleanup_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
             return;
         }
         if *id == ids.perm_mic {
@@ -829,6 +855,7 @@ mod tests {
             ids.perm_mic,
             ids.perm_a11y,
             ids.edit_vocab,
+            ids.cleanup_toggle,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));
