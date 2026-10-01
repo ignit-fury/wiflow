@@ -7,6 +7,8 @@
 - Lesson: crash reports in `~/Library/Logs/DiagnosticReports/` carry the exact faulting stack — check them FIRST before log archaeology.
 - Zombie incident: a cancelled subagent later wrote unvetted changes (WhisperState reuse, post_process capitalization, Tiny model variant) interleaved with the fixes and got swept into a fix commit; reset + recommit cleaned it. Candidates later IMPLEMENTED properly on user request (commit a170b78, 2026-10-01): state reuse (84ms/cycle, no Metal re-init), set_no_timestamps, tiny.en (77,704,715B verified), post_process (capitalization + i→I, decimal-safe).
 - macOS constraint remembered: single-key global hotkeys (AltRight/Fn) fail "Unknown scancode"; CtrlSpace works. PTT mode unchanged.
+- 2026-10-01 — Hotkey options reality (user-reported error + investigation, commit 4d486ac): global-hotkey 0.7's macOS scancode table has NO entries for bare modifiers — RightOption/Fn CANNOT register, period. Menu now marks them disabled+unavailable (kept for cross-platform later); fallback order uses working combos so stale configs still get a hotkey. AltSpace (Option+Space) preset added: REGISTERS (unit test + app logs), but posted-event firing NOT verified (3 posting variants failed; probe can't pump NSApplication Carbon dispatch — winit does). Physical keypress test is USER-owned: hold Option+Space manually — if it fires, it's the right-option alternative; if not, stay on Ctrl+Space.
+- 2026-10-01 — Crash-fix lessons: check `~/Library/Logs/DiagnosticReports/*.ips` FIRST (exact faulting stack); Carbon hotkey events need NSApplication pumping (bare CFRunLoop probes give false negatives).
 
 ## Phase 4 Inject + History — Wired (2026-09-30)
 - Deps: arboard 3.6, enigo 0.6, serde 1, serde_json 1 (all $0, offline, no network).
