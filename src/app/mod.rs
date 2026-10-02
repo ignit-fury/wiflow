@@ -107,6 +107,7 @@ pub struct MenuIds {
     edit_vocab: MenuId,
     cleanup_toggle: MenuId,
     ctx_toggle: MenuId,
+    duck_toggle: MenuId,
     prov_auto: MenuId,
     prov_groq: MenuId,
     prov_openrouter: MenuId,
@@ -154,6 +155,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
         edit_vocab: MenuId::new("wiflow:edit:vocab"),
         cleanup_toggle: MenuId::new("wiflow:cleanup:toggle"),
         ctx_toggle: MenuId::new("wiflow:ctx:toggle"),
+        duck_toggle: MenuId::new("wiflow:duck:toggle"),
         prov_auto: MenuId::new("wiflow:prov:auto"),
         prov_groq: MenuId::new("wiflow:prov:groq"),
         prov_openrouter: MenuId::new("wiflow:prov:openrouter"),
@@ -294,6 +296,16 @@ pub fn build_menu(
         "Context Inference",
         true,
         config.context_enabled,
+        None,
+    );
+
+    // Audio prioritization: duck competing output + pause scriptable players
+    // while the mic is hot, restored exactly afterwards.
+    let duck_toggle = CheckMenuItem::with_id(
+        ids.duck_toggle.clone(),
+        "Duck Audio While Dictating",
+        true,
+        config.duck_audio,
         None,
     );
 
@@ -450,6 +462,7 @@ pub fn build_menu(
     menu.append(&launch_login).expect("menu append");
     menu.append(&cleanup_toggle).expect("menu append");
     menu.append(&ctx_toggle).expect("menu append");
+    menu.append(&duck_toggle).expect("menu append");
     menu.append(&prov_menu).expect("menu append");
     menu.append(&stt_menu).expect("menu append");
     menu.append(&ai_menu).expect("menu append");
@@ -729,6 +742,16 @@ impl DaemonApp {
                 } else {
                     "off"
                 }
+            );
+            return;
+        }
+        if *id == ids.duck_toggle {
+            self.config.duck_audio = !self.config.duck_audio;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!(
+                "audio ducking: {}",
+                if self.config.duck_audio { "on" } else { "off" }
             );
             return;
         }
@@ -1247,6 +1270,7 @@ mod tests {
             ids.edit_vocab,
             ids.cleanup_toggle,
             ids.ctx_toggle,
+            ids.duck_toggle,
             ids.prov_auto,
             ids.prov_groq,
             ids.prov_openrouter,

@@ -331,17 +331,21 @@ fn worker_on_control_down<S: DaemonEventSender>(
     ptt: &mut PushToTalk,
     capture: &mut Option<crate::core::audio::AudioCapture>,
     capture_start: &mut Option<Instant>,
+    duck: &crate::duck::AudioDuck<crate::duck::OsBackend>,
 ) {
     let now = now_ms();
     match ptt.on_key_down(now) {
         PttEvent::Started => {
-            // Menu-selected mic, re-read per hold (never cached).
-            let mic = crate::core::config::load_config().mic_name;
+            // Menu-selected mic + duck toggle, re-read per hold.
+            let live = crate::core::config::load_config();
+            duck.set_enabled(live.duck_audio);
+            let mic = live.mic_name;
             match crate::core::audio::AudioCapture::start(mic) {
                 Ok(cap) => {
                     *capture = Some(cap);
                     *capture_start = Some(Instant::now());
                     tracing::info!("[session={}] capture started — mic open", current_session());
+                    duck.duck();
 
                     // Emit before any transcription begins.
                     if sender.send_event(DaemonEvent::CaptureStarted).is_err() {
@@ -394,6 +398,7 @@ fn watchdog(
     capture_start: &mut Option<Instant>,
     proxy: &EventLoopProxy<DaemonEvent>,
     max_ms: u64,
+    duck: &crate::duck::AudioDuck<crate::duck::OsBackend>,
 ) {
     let duration_ms = capture_start
         .map(|s| s.elapsed().as_millis() as u64)
@@ -403,6 +408,8 @@ fn watchdog(
     // Clear the hold bookkeeping: the key-up will never be processed for
     // this cycle (and a late one is dropped by app-side admission anyway).
     let _ = ptt.on_cancel();
+    // Restore audio before force-transcribing (same guarantee as normal exits).
+    duck.restore();
     tracing::warn!(
         "[session={}] WATCHDOG: PttUp LOST — force-stopping recording after {duration_ms}ms (mic would have stayed open forever)",
         current_session()
@@ -444,6 +451,13 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000);
+    // Audio prioritization: ducked on successful capture start, restored on
+    // EVERY hold-exit path below (never stuck ducked, even on failure).
+    let duck = crate::duck::AudioDuck::new(
+        crate::duck::OsBackend,
+        crate::core::config::load_config().duck_audio,
+        crate::duck::PAUSE_DELAY,
+    );
     tracing::info!(
         "[session={}] worker started (recording watchdog max {max_ms}ms)",
         current_session()
@@ -456,13 +470,13 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                 let deadline = start + Duration::from_millis(max_ms);
                 let now = Instant::now();
                 if now >= deadline {
-                    watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms);
+                    watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms, &duck);
                     continue;
                 }
                 match rx.recv_timeout(deadline - now) {
                     Ok(c) => c,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms);
+                        watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms, &duck);
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -476,7 +490,7 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         match ctl {
             Control::Down => {
                 tracing::info!("[session={}] worker Control::Down", current_session());
-                worker_on_control_down(&proxy, &mut ptt, &mut capture, &mut capture_start);
+                worker_on_control_down(&proxy, &mut ptt, &mut capture, &mut capture_start, &duck);
             }
             Control::Up => {
                 tracing::info!("[session={}] worker Control::Up", current_session());
@@ -489,6 +503,9 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                                     "[session={}] capture stop requested ({duration_ms}ms hold)",
                                     current_session()
                                 );
+                                // Listening ended at key-up: restore audio first so
+                                // music is back while transcription runs.
+                                duck.restore();
                                 pipeline_on_worker(cap, duration_ms, &proxy);
                             }
                             None => {
@@ -514,6 +531,7 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                     PttEvent::DiscardedShort { duration_ms } => {
                         capture = None;
                         capture_start = None;
+                        duck.restore();
                         tracing::info!(
                             "[session={}] discarded short hold ({duration_ms}ms)",
                             current_session()
@@ -547,6 +565,7 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                     PttEvent::Cancelled => {
                         capture = None;
                         capture_start = None;
+                        duck.restore();
                         tracing::info!(
                             "[session={}] dictation cancelled (Esc) — mic released",
                             current_session()
@@ -626,7 +645,12 @@ mod tests {
         let mut ptt = PushToTalk::new(300, 60_000);
         let mut capture: Option<crate::core::audio::AudioCapture> = None;
         let mut capture_start: Option<Instant> = None;
-        worker_on_control_down(&sender, &mut ptt, &mut capture, &mut capture_start);
+        let duck = crate::duck::AudioDuck::new(
+            crate::duck::OsBackend,
+            false, // duck_audio is false in the test config; irrelevant for this test
+            crate::duck::PAUSE_DELAY,
+        );
+        worker_on_control_down(&sender, &mut ptt, &mut capture, &mut capture_start, &duck);
 
         let failed = sender.failed_msg.lock().unwrap().clone();
         let started = *sender.capture_started_seen.lock().unwrap();
