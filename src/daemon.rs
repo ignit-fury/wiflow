@@ -241,7 +241,12 @@ fn pipeline_on_worker(
     // (rate limits, missing model) surface as tray alerts. Context
     // synthesis runs first (cleanup layer on → focused app → 2-sentence
     // hint); a context failure yields "" and the chain proceeds without.
-    let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
+    // Context needs a cloud key (synthesize is cloud-only): skip the ~200ms
+    // osascript app query too when it could never be used.
+    let ctx = if cfg.cleanup_enabled
+        && cfg.context_enabled
+        && crate::cleanup::groq_key().is_some()
+    {
         let app = focused_app_name();
         crate::cleanup::synthesize_context(app.as_deref(), &cfg)
     } else {

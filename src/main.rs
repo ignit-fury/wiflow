@@ -184,7 +184,10 @@ fn main() {
                 info!("transcribed in {ms}ms (RTF {rtf:.2})");
                 // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama),
                 // with the focused-app context synthesized first.
-                let ctx = if cfg.cleanup_enabled && cfg.context_enabled {
+                let ctx = if cfg.cleanup_enabled
+                    && cfg.context_enabled
+                    && cleanup::groq_key().is_some()
+                {
                     let app = daemon::focused_app_name();
                     cleanup::synthesize_context(app.as_deref(), &cfg)
                 } else {

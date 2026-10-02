@@ -90,6 +90,12 @@ pub struct MenuIds {
     prov_ollama: MenuId,
     stt_local: MenuId,
     stt_groq: MenuId,
+    key_groq: MenuId,
+    key_openrouter: MenuId,
+    key_groq_clear: MenuId,
+    key_or_clear: MenuId,
+    ollama_models: Vec<(String, MenuId)>,
+    ollama_refresh: MenuId,
     quit: MenuId,
 }
 
@@ -97,7 +103,11 @@ pub struct MenuIds {
 /// platform objects — testable off the main thread (muda forbids
 /// `Menu::new` elsewhere on macOS). `build_menu` stamps these ids via
 /// `with_id`, so the handler and the test see the same values.
-fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
+fn ids_for(
+    devices: &[String],
+    history: &[HistoryEntry],
+    ollama_models: &[String],
+) -> MenuIds {
     MenuIds {
         status: MenuId::new("wiflow:status"),
         mic_items: devices
@@ -130,6 +140,16 @@ fn ids_for(devices: &[String], history: &[HistoryEntry]) -> MenuIds {
         prov_ollama: MenuId::new("wiflow:prov:ollama"),
         stt_local: MenuId::new("wiflow:stt:local"),
         stt_groq: MenuId::new("wiflow:stt:groq"),
+        key_groq: MenuId::new("wiflow:key:groq"),
+        key_openrouter: MenuId::new("wiflow:key:openrouter"),
+        key_groq_clear: MenuId::new("wiflow:key:groq:clear"),
+        key_or_clear: MenuId::new("wiflow:key:or:clear"),
+        ollama_models: ollama_models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.clone(), MenuId::new(format!("wiflow:ollama:{i}"))))
+            .collect(),
+        ollama_refresh: MenuId::new("wiflow:ollama:refresh"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -152,9 +172,10 @@ pub fn build_menu(
     devices: &[String],
     history: &[HistoryEntry],
     state_label: &str,
+    ollama_models: &[String],
 ) -> (Menu, MenuIds) {
     let menu = Menu::new();
-    let ids = ids_for(devices, history);
+    let ids = ids_for(devices, history, ollama_models);
 
     let status = MenuItem::with_id(
         ids.status.clone(),
@@ -312,6 +333,61 @@ pub fn build_menu(
         .append_items(&[&stt_local, &stt_groq])
         .expect("menu append");
 
+    // AI keys + local model picker. Key state shown inline (✓/not set);
+    // entry via native secure dialog (tray app has no windows). Model list
+    // is the live Ollama inventory passed in by the caller.
+    let ai_menu = Submenu::new("AI Keys && Models", true);
+    let groq_set = crate::cleanup::groq_key().is_some();
+    let or_set = crate::cleanup::openrouter_key().is_some();
+    let key_groq = MenuItem::with_id(
+        ids.key_groq.clone(),
+        format!(
+            "Groq API Key{}…",
+            if groq_set { " ✓" } else { " (not set)" }
+        ),
+        true,
+        None,
+    );
+    let key_openrouter = MenuItem::with_id(
+        ids.key_openrouter.clone(),
+        format!(
+            "OpenRouter API Key{}…",
+            if or_set { " ✓" } else { " (not set)" }
+        ),
+        true,
+        None,
+    );
+    let key_groq_clear =
+        MenuItem::with_id(ids.key_groq_clear.clone(), "Clear Groq Key", groq_set, None);
+    let key_or_clear =
+        MenuItem::with_id(ids.key_or_clear.clone(), "Clear OpenRouter Key", or_set, None);
+    ai_menu
+        .append_items(&[&key_groq, &key_openrouter, &key_groq_clear, &key_or_clear])
+        .expect("menu append");
+    ai_menu
+        .append(&PredefinedMenuItem::separator())
+        .expect("menu append");
+    let ollama_menu = Submenu::new("Ollama Model", true);
+    if ollama_models.is_empty() {
+        let off = MenuItem::new("(Ollama not running)", false, None);
+        ollama_menu.append(&off).expect("menu append");
+    } else {
+        for (name, mid) in &ids.ollama_models {
+            let item = CheckMenuItem::with_id(
+                mid.clone(),
+                name,
+                true,
+                *name == config.cleanup_model,
+                None,
+            );
+            ollama_menu.append(&item).expect("menu append");
+        }
+    }
+    let ollama_refresh =
+        MenuItem::with_id(ids.ollama_refresh.clone(), "Refresh Models…", true, None);
+    ollama_menu.append(&ollama_refresh).expect("menu append");
+    ai_menu.append(&ollama_menu).expect("menu append");
+
     let hist_menu = Submenu::new("History", true);
     if history.is_empty() {
         let empty = MenuItem::new("(empty)", false, None);
@@ -347,6 +423,7 @@ pub fn build_menu(
     menu.append(&ctx_toggle).expect("menu append");
     menu.append(&prov_menu).expect("menu append");
     menu.append(&stt_menu).expect("menu append");
+    menu.append(&ai_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
@@ -415,11 +492,15 @@ impl DaemonApp {
 
     fn rebuild_menu(&mut self) {
         let history = crate::history::load_history();
+        // Live Ollama inventory (≤500ms, empty when down). Only fetched on
+        // rebuilds, never per event-loop tick.
+        let models = crate::cleanup::list_ollama_models();
         let (menu, ids) = build_menu(
             &self.config,
             &self.devices,
             &history,
             self.state.status_label(),
+            &models,
         );
         self.tray.set_menu(Some(Box::new(menu)));
         self.menu_ids = ids;
@@ -647,6 +728,64 @@ impl DaemonApp {
             tracing::info!("stt provider: groq cloud (whisper-large-v3)");
             return;
         }
+        if *id == ids.key_groq {
+            match crate::cleanup::prompt_for_key("Wiflow", "Paste your Groq API key:") {
+                Some(v) => match crate::cleanup::save_key("groq_api_key", &v) {
+                    Ok(()) => {
+                        self.menu_dirty = true;
+                        tracing::info!("groq api key saved");
+                    }
+                    Err(e) => self.warn_note(format!("save groq key failed: {e}")),
+                },
+                None => tracing::debug!("groq key dialog cancelled"),
+            }
+            return;
+        }
+        if *id == ids.key_openrouter {
+            match crate::cleanup::prompt_for_key("Wiflow", "Paste your OpenRouter API key:") {
+                Some(v) => match crate::cleanup::save_key("openrouter_api_key", &v) {
+                    Ok(()) => {
+                        self.menu_dirty = true;
+                        tracing::info!("openrouter api key saved");
+                    }
+                    Err(e) => self.warn_note(format!("save openrouter key failed: {e}")),
+                },
+                None => tracing::debug!("openrouter key dialog cancelled"),
+            }
+            return;
+        }
+        if *id == ids.key_groq_clear {
+            match crate::cleanup::clear_key("groq_api_key") {
+                Ok(()) => {
+                    self.menu_dirty = true;
+                    tracing::info!("groq api key cleared");
+                }
+                Err(e) => self.warn_note(format!("clear groq key failed: {e}")),
+            }
+            return;
+        }
+        if *id == ids.key_or_clear {
+            match crate::cleanup::clear_key("openrouter_api_key") {
+                Ok(()) => {
+                    self.menu_dirty = true;
+                    tracing::info!("openrouter api key cleared");
+                }
+                Err(e) => self.warn_note(format!("clear openrouter key failed: {e}")),
+            }
+            return;
+        }
+        if *id == ids.ollama_refresh {
+            // Rebuild refetches the live inventory (≤500ms localhost call).
+            self.menu_dirty = true;
+            return;
+        }
+        if let Some((name, _)) = ids.ollama_models.iter().find(|(_, mid)| mid == id) {
+            self.config.cleanup_model = name.clone();
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!("ollama cleanup model: {name} (takes effect next hold)");
+            return;
+        }
         if *id == ids.perm_mic {
             crate::config::permissions::open_mic_settings();
             return;
@@ -786,7 +925,14 @@ fn app_main(
 ) -> ! {
     let devices = crate::audio::list_devices();
     let history = crate::history::load_history();
-    let (menu, ids) = build_menu(&config, &devices, &history, AppState::Idle.status_label());
+    let models = crate::cleanup::list_ollama_models();
+    let (menu, ids) = build_menu(
+        &config,
+        &devices,
+        &history,
+        AppState::Idle.status_label(),
+        &models,
+    );
     let tray = TrayIconBuilder::new()
         .with_tooltip(AppState::Idle.tooltip(config.hotkey_preset))
         .with_icon(make_icon(AppState::Idle))
@@ -1008,7 +1154,8 @@ mod tests {
         // the main thread on macOS). build_menu stamps these same ids via
         // with_id, so distinctness here covers the handler dispatch.
         let devices = vec!["Mic A".to_string(), "Mic B".to_string()];
-        let ids = ids_for(&devices, &sample_history());
+        let models = vec!["llama3.2:1b".to_string(), "qwen3:8b".to_string()];
+        let ids = ids_for(&devices, &sample_history(), &models);
         let mut all = vec![
             ids.status,
             ids.model_tiny,
@@ -1029,10 +1176,16 @@ mod tests {
             ids.prov_ollama,
             ids.stt_local,
             ids.stt_groq,
+            ids.key_groq,
+            ids.key_openrouter,
+            ids.key_groq_clear,
+            ids.key_or_clear,
+            ids.ollama_refresh,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));
         all.extend(ids.history_items.into_iter().map(|(_, id)| id));
+        all.extend(ids.ollama_models.into_iter().map(|(_, id)| id));
         let mut seen = std::collections::HashSet::new();
         for id in &all {
             assert!(seen.insert(id.clone()), "duplicate menu id: {id:?}");
@@ -1044,10 +1197,30 @@ mod tests {
         // Rebuilds (state change, history push) must keep ids so in-flight
         // clicks still dispatch instead of falling to "unknown id".
         let devices = vec!["Mic A".to_string()];
-        let a = ids_for(&devices, &sample_history());
-        let b = ids_for(&devices, &sample_history());
+        let models = vec!["llama3.2:1b".to_string()];
+        let a = ids_for(&devices, &sample_history(), &models);
+        let b = ids_for(&devices, &sample_history(), &models);
         assert_eq!(a.status, b.status);
         assert_eq!(a.quit, b.quit);
         assert_eq!(a.hk_ctrl, b.hk_ctrl);
+        assert_eq!(a.key_groq, b.key_groq);
+        assert_eq!(a.ollama_refresh, b.ollama_refresh);
+    }
+
+    #[test]
+    fn test_ollama_model_ids_map_back_to_names() {
+        // Click dispatch finds the model name by id (handler contract).
+        let models = vec!["llama3.2:1b".to_string(), "qwen3:8b".to_string()];
+        let ids = ids_for(&[], &[], &models);
+        assert_eq!(ids.ollama_models.len(), 2);
+        let hit = ids
+            .ollama_models
+            .iter()
+            .find(|(_, mid)| mid == &ids.ollama_models[1].1)
+            .map(|(name, _)| name.clone());
+        assert_eq!(hit.as_deref(), Some("qwen3:8b"));
+        // No models → no dynamic ids (menu shows the offline item instead).
+        let empty = ids_for(&[], &[], &[]);
+        assert!(empty.ollama_models.is_empty());
     }
 }
