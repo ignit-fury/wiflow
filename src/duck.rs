@@ -49,6 +49,8 @@ const PLAYERS: &[PlayerApp] = &[PlayerApp::Music, PlayerApp::Spotify];
 /// Hardware/OS media access. Trait (not inline syscalls) so the state
 /// machine is fully testable with a fake.
 pub trait MediaBackend: Send + Sync + 'static {
+    /// Default output device id (diagnostics: detects mid-hold switches).
+    fn output_device_id(&self) -> Option<u32>;
     /// Per-channel output scalars (master first when present). Empty when
     /// the device exposes no volume control. Saved and restored as a vector
     /// so stereo balance can never drift.
@@ -66,6 +68,7 @@ pub trait MediaBackend: Send + Sync + 'static {
 struct Inner {
     enabled: bool,
     active: bool,
+    saved_device: Option<u32>,
     saved_volumes: Vec<f32>,
     paused: Vec<PlayerApp>,
     hold_id: u64,
@@ -100,6 +103,7 @@ impl<B: MediaBackend> AudioDuck<B> {
             inner: Arc::new(Mutex::new(Inner {
                 enabled,
                 active: false,
+                saved_device: None,
                 saved_volumes: Vec::new(),
                 paused: Vec::new(),
                 hold_id: 0,
@@ -116,6 +120,7 @@ impl<B: MediaBackend> AudioDuck<B> {
             inner.active = false;
             let paused = std::mem::take(&mut inner.paused);
             let saved = std::mem::take(&mut inner.saved_volumes);
+            inner.saved_device = None;
             drop(inner);
             for app in paused {
                 self.backend.resume(app);
@@ -136,6 +141,7 @@ impl<B: MediaBackend> AudioDuck<B> {
         if self.backend.output_muted() {
             return; // Nothing audible: leave everything alone.
         }
+        let dev = self.backend.output_device_id();
         let saved = self.backend.output_volumes();
         if saved.is_empty() {
             // No volume control: pause path still valuable.
@@ -144,6 +150,8 @@ impl<B: MediaBackend> AudioDuck<B> {
         } else {
             let ducked: Vec<f32> = saved.iter().map(|v| v * DUCK_FACTOR).collect();
             self.backend.set_output_volumes(&ducked);
+            tracing::info!("duck engaged dev={dev:?} vol {saved:?} -> {ducked:?}");
+            inner.saved_device = dev;
             inner.saved_volumes = saved;
         }
         inner.active = true;
@@ -194,6 +202,7 @@ impl<B: MediaBackend> AudioDuck<B> {
                     inner.paused.push(*app);
                 }
             }
+            tracing::info!("duck pause {app:?}");
             backend.pause(*app);
             {
                 let mut inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -219,11 +228,21 @@ impl<B: MediaBackend> AudioDuck<B> {
         inner.active = false;
         let paused = std::mem::take(&mut inner.paused);
         let saved = std::mem::take(&mut inner.saved_volumes);
+        let saved_dev = inner.saved_device.take();
         drop(inner);
+        // Device-switch diagnosis: if the default output changed mid-hold
+        // (Bluetooth profile switches do this), the restore may land on the
+        // wrong device — warn loudly instead of failing silently.
+        let now_dev = self.backend.output_device_id();
+        if saved_dev.is_some() && saved_dev != now_dev {
+            tracing::warn!("duck device switched mid-hold: {saved_dev:?} -> {now_dev:?}");
+        }
         for app in paused {
+            tracing::info!("duck resume {app:?}");
             self.backend.resume(app);
         }
         if !saved.is_empty() {
+            tracing::info!("duck restore vol {saved:?} (dev {saved_dev:?} -> now {now_dev:?})");
             self.backend.set_output_volumes(&saved);
         }
     }
@@ -276,6 +295,10 @@ mod tests {
     }
 
     impl MediaBackend for Fake {
+        fn output_device_id(&self) -> Option<u32> {
+            Some(7)
+        }
+
         fn output_volumes(&self) -> Vec<f32> {
             self.state.lock().unwrap().volumes.clone()
         }
@@ -632,6 +655,10 @@ fn write_channel(dev: u32, element: u32, v: f32) {
 }
 
 impl MediaBackend for OsBackend {
+    fn output_device_id(&self) -> Option<u32> {
+        default_output_device()
+    }
+
     fn output_volumes(&self) -> Vec<f32> {
         let Some(dev) = default_output_device() else {
             return Vec::new();
