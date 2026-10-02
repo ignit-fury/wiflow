@@ -237,28 +237,60 @@ fn pipeline_on_worker(
     let kept_ms = kept.len() as f64 / crate::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
-    // LLM cleanup chain (Groq → OpenRouter → Ollama local, $0). Issues
-    // (rate limits, missing model) surface as tray alerts. Context
-    // synthesis runs first (cleanup layer on → focused app → 2-sentence
-    // hint); a context failure yields "" and the chain proceeds without.
-    // Context needs a cloud key (synthesize is cloud-only): skip the ~200ms
-    // osascript app query too when it could never be used.
-    let ctx = if cfg.cleanup_enabled
-        && cfg.context_enabled
-        && crate::cleanup::groq_key().is_some()
-    {
-        let app = focused_app_name();
-        crate::cleanup::synthesize_context(app.as_deref(), &cfg)
-    } else {
-        String::new()
+    // Fast routing: deterministic-clean transcripts inject immediately (no
+    // context call, no provider calls, no issues). Complex ones take the
+    // existing LLM chain below (Groq → OpenRouter → Ollama local, $0).
+    // Issues (rate limits, missing model) surface as tray alerts.
+    let route = crate::analyze::decide_route(&text, &cfg);
+    let route_name = match &route {
+        crate::analyze::CleanupRoute::Direct(_) => "deterministic",
+        crate::analyze::CleanupRoute::Llm(_) => "llm",
     };
-    let input =
-        crate::cleanup::format_cleanup_input(if ctx.is_empty() { None } else { Some(&ctx) }, &text);
-    let outcome = crate::cleanup::clean_chain(&input, &cfg);
-    for issue in &outcome.issues {
+    tracing::info!(
+        "cleanup route={route_name} reason={} score={}",
+        crate::analyze::route_reason(&cfg, &route),
+        crate::analyze::route_score(&route),
+    );
+    let (cleaned, issues) = match route {
+        crate::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
+        crate::analyze::CleanupRoute::Llm(a) => {
+            // Context synthesis runs first (focused app → 2-sentence hint);
+            // a context failure yields "" and the chain proceeds without.
+            // Gated deterministically: transcript must carry context-valuable
+            // content AND the app must be context-sensitive — otherwise both
+            // the ~200ms osascript query and the model call are skipped.
+            // Cheap transcript check first (skips the ~200ms osascript query
+            // when context could never pay off), then the full gate.
+            let key_present = crate::cleanup::groq_key().is_some();
+            let ctx =
+                if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
+                    let app = focused_app_name();
+                    if crate::analyze::context_allowed(
+                        app.as_deref(),
+                        &a,
+                        cfg.cleanup_enabled,
+                        cfg.context_enabled,
+                        key_present,
+                    ) {
+                        crate::cleanup::synthesize_context(app.as_deref(), &cfg)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+            let input = crate::cleanup::format_cleanup_input(
+                if ctx.is_empty() { None } else { Some(&ctx) },
+                &text,
+            );
+            let outcome = crate::cleanup::clean_chain(&input, &cfg);
+            (outcome.text, outcome.issues)
+        }
+    };
+    for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
-    if crate::cleanup::is_filler_result(&outcome.text) {
+    if crate::cleanup::is_filler_result(&cleaned) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
         let _ = proxy.send_event(DaemonEvent::Done {
@@ -268,7 +300,7 @@ fn pipeline_on_worker(
         });
         return;
     }
-    let text = outcome.text;
+    let text = cleaned;
     if text.trim().is_empty() {
         let _ = proxy.send_event(DaemonEvent::Done {
             text: String::new(),

@@ -103,11 +103,7 @@ pub struct MenuIds {
 /// platform objects — testable off the main thread (muda forbids
 /// `Menu::new` elsewhere on macOS). `build_menu` stamps these ids via
 /// `with_id`, so the handler and the test see the same values.
-fn ids_for(
-    devices: &[String],
-    history: &[HistoryEntry],
-    ollama_models: &[String],
-) -> MenuIds {
+fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String]) -> MenuIds {
     MenuIds {
         status: MenuId::new("wiflow:status"),
         mic_items: devices
@@ -359,8 +355,12 @@ pub fn build_menu(
     );
     let key_groq_clear =
         MenuItem::with_id(ids.key_groq_clear.clone(), "Clear Groq Key", groq_set, None);
-    let key_or_clear =
-        MenuItem::with_id(ids.key_or_clear.clone(), "Clear OpenRouter Key", or_set, None);
+    let key_or_clear = MenuItem::with_id(
+        ids.key_or_clear.clone(),
+        "Clear OpenRouter Key",
+        or_set,
+        None,
+    );
     ai_menu
         .append_items(&[&key_groq, &key_openrouter, &key_groq_clear, &key_or_clear])
         .expect("menu append");

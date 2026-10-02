@@ -228,22 +228,53 @@ pub fn ensure_model_variant(variant: &str) -> Result<PathBuf, String> {
 /// - Capitalizes the first letter of sentences (text start and after '.', '?', '!')
 /// - Capitalizes lowercase 'i' when standalone ("I") or in common contractions ("I'm", "I've", "I'll", "I'd")
 /// - Preserves punctuation, whitespace, and numbers (e.g. "1.0")
-pub fn post_process(text: &str) -> String {
+pub fn post_process(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Cow::Borrowed(trimmed);
     }
-    let chars: Vec<char> = trimmed.chars().collect();
-    let len = chars.len();
-    let mut out = String::with_capacity(trimmed.len());
+    // Copy-on-first-change: the output buffer is allocated only when a
+    // rewrite actually happens, so already-clean text costs zero allocation.
+    // `prev` always holds the RAW consumed char (rewrites must not leak into
+    // boundary checks); `pos` is the byte offset of the current char for the
+    // prefix copy.
+    let mut out: Option<String> = None;
+    macro_rules! ensure {
+        ($pos:expr) => {
+            out.get_or_insert_with(|| {
+                let mut s = String::with_capacity(trimmed.len());
+                s.push_str(&trimmed[..$pos]);
+                s
+            })
+        };
+    }
     let mut capitalize_next = true;
-    for i in 0..len {
-        let c = chars[i];
+    let mut prev: Option<char> = None;
+    // Square-bracket spans are opaque to rewrites (markdown "[ok]", "[i]")
+    // but transparent to the flag: "[ok] fine" keeps "[ok]" and still caps
+    // the sentence. Depth-counted so nesting/unbalanced stays safe.
+    let mut bracket_depth: u32 = 0;
+    let mut iter = trimmed.char_indices().peekable();
+    while let Some((pos, c)) = iter.next() {
+        if c == '[' {
+            bracket_depth = bracket_depth.saturating_add(1);
+        } else if c == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        }
+        if bracket_depth > 0 && c != ']' && c != '[' {
+            if let Some(o) = out.as_mut() {
+                o.push(c);
+            }
+            prev = Some(c);
+            continue;
+        }
         if c == 'i' {
-            let prev_boundary = i == 0
-                || chars[i - 1].is_whitespace()
-                || matches!(chars[i - 1], '(' | '[' | '{' | '"' | '“' | '‘');
-            let next = chars.get(i + 1).copied();
+            let prev_boundary = match prev {
+                None => true,
+                Some(p) => p.is_whitespace() || matches!(p, '(' | '[' | '{' | '"' | '“' | '‘'),
+            };
+            let next = iter.peek().map(|(_, n)| *n);
             let is_standalone = match next {
                 None => true,
                 Some(n) => {
@@ -256,27 +287,42 @@ pub fn post_process(text: &str) -> String {
             };
             let is_contraction = matches!(next, Some('\''));
             if prev_boundary && (is_standalone || is_contraction) {
-                out.push('I');
+                ensure!(pos).push('I');
                 capitalize_next = false;
+                prev = Some('i');
                 continue;
             }
         }
-        if capitalize_next && c.is_alphabetic() {
-            out.extend(c.to_uppercase());
+        // Any alphanumeric opens the sentence (digits included: "1.0 plus"
+        // must not capitalize "plus"); only lowercase alpha rewrites.
+        if capitalize_next && c.is_alphanumeric() {
+            if c.is_alphabetic() {
+                let mut up = c.to_uppercase();
+                if up.next() != Some(c) || up.next().is_some() {
+                    ensure!(pos).extend(c.to_uppercase());
+                }
+            }
             capitalize_next = false;
+            prev = Some(c);
             continue;
         }
         if matches!(c, '.' | '?' | '!') {
             // Sentence-ending punctuation only when followed by whitespace or
             // end-of-text — a '.' before a digit is a decimal point ("1.0").
-            let next_is_space = chars.get(i + 1).map(|n| n.is_whitespace()).unwrap_or(true);
+            let next_is_space = iter.peek().map(|(_, n)| n.is_whitespace()).unwrap_or(true);
             if next_is_space {
                 capitalize_next = true;
             }
         }
-        out.push(c);
+        if let Some(o) = out.as_mut() {
+            o.push(c);
+        }
+        prev = Some(c);
     }
-    out
+    match out {
+        Some(o) => Cow::Owned(o),
+        None => Cow::Borrowed(trimmed),
+    }
 }
 
 /// Remove bracketed ALL-CAPS Whisper tokens ([BLANK_AUDIO], [MUSIC],
@@ -284,29 +330,49 @@ pub fn post_process(text: &str) -> String {
 /// history shows them getting pasted into documents. Lowercase bracket
 /// content (markdown links, [ok]) is preserved. One trailing space after a
 /// stripped token is consumed.
-fn strip_hallucination_tokens(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
+pub(crate) fn strip_hallucination_tokens(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    // Borrowed fast path: no '[' means no token possible — zero allocation.
+    // Byte walk below (no Vec<char>): '[' / ']' / ' ' are ASCII so they can
+    // never match inside a multibyte sequence; non-ASCII bytes fail the
+    // token check exactly like the old char comparison did.
+    if !text.contains('[') {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
+    let mut removed = false;
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '[' {
-            if let Some(close) = chars[i + 1..].iter().position(|&c| c == ']') {
-                let inner = &chars[i + 1..i + 1 + close];
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(rel) = text[i + 1..].find(']') {
+                let inner = &text[i + 1..i + 1 + rel];
                 let is_token =
-                    !inner.is_empty() && inner.iter().all(|c| c.is_ascii_uppercase() || *c == '_');
+                    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_uppercase() || b == b'_');
                 if is_token {
-                    i += close + 2;
-                    if i < chars.len() && chars[i] == ' ' {
+                    removed = true;
+                    i += rel + 2;
+                    if i < bytes.len() && bytes[i] == b' ' {
                         i += 1;
                     }
                     continue;
                 }
             }
         }
-        out.push(chars[i]);
-        i += 1;
+        if bytes[i] < 0x80 {
+            out.push(bytes[i] as char);
+            i += 1;
+        } else {
+            let ch = text[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
-    out
+    if removed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 /// Alphanumeric core of a word, ignoring SURROUNDING punctuation only:
@@ -326,32 +392,53 @@ fn is_single_alnum(w: &str) -> bool {
 /// "A plus B plus C" → "A+B+C". Only between single alphanumeric
 /// letters/digits (punctuation attached to the letter is kept); normal prose
 /// ("the cost plus tax") is untouched.
-fn plus_to_symbol(text: &str) -> String {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < 3 {
+pub(crate) fn plus_to_symbol(text: &str) -> String {
+    // Fast path: no "plus" word and spacing already regular (ASCII, single
+    // spaces, none at the ends) → output equals input, single copy.
+    // Anything else (tabs, newlines, non-ASCII whitespace, runs) falls
+    // through to the general path below.
+    if text.is_ascii()
+        && !text.split_whitespace().any(|w| w == "plus")
+        && !text.starts_with(char::is_whitespace)
+        && !text.ends_with(char::is_whitespace)
+        && !text.contains("  ")
+        && !text.contains(['\t', '\n', '\x0B', '\x0C', '\r'])
+    {
         return text.to_string();
     }
-    let mut out = String::new();
-    let mut i = 0;
-    while i < words.len() {
-        if words[i] == "plus"
-            && i >= 1
-            && i + 1 < words.len()
-            && is_single_alnum(words[i - 1])
-            && is_single_alnum(words[i + 1])
+    // Lazy word stream (no Vec<&str>): first three words buffered in a fixed
+    // array to preserve the <3-words fast path, then chained back.
+    let mut words = text.split_whitespace();
+    let (Some(w0), Some(w1), third) = (words.next(), words.next(), words.next()) else {
+        return text.to_string();
+    };
+    let rest = third.into_iter().chain(words);
+    let mut words = [w0, w1].into_iter().chain(rest).peekable();
+    // Output never exceeds input: '+' replaces " plus " and runs collapse.
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<&str> = None;
+    while let Some(w) = words.next() {
+        if w == "plus"
+            && prev.is_some_and(is_single_alnum)
+            && words.peek().is_some_and(|n| is_single_alnum(n))
         {
             if out.ends_with(' ') {
                 out.pop();
             }
             out.push('+');
-            i += 1;
-            continue;
+        } else {
+            out.push_str(w);
+            out.push(' ');
         }
-        out.push_str(words[i]);
-        out.push(' ');
-        i += 1;
+        prev = Some(w);
     }
-    out.trim_end().to_string()
+    // Trailing space exists only when the last word was pushed normally —
+    // skip the copy otherwise.
+    if out.ends_with(char::is_whitespace) {
+        out.trim_end().to_string()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +591,94 @@ mod tests {
             strip_hallucination_tokens("[BLANK_AUDIO hello"),
             "[BLANK_AUDIO hello"
         );
+    }
+
+    #[test]
+    fn test_unified_pass_whitespace_and_unicode() {
+        // Whitespace runs still collapse (math stage splits on them).
+        assert_eq!(post_process("hello   world"), "Hello   world");
+        assert_eq!(
+            crate::baseline::deterministic_clean("hello   world"),
+            "Hello world"
+        );
+        // Multibyte text through the byte-walk strip + stream post-process.
+        assert_eq!(
+            crate::baseline::deterministic_clean("café [MUSIC] naïve"),
+            "Café naïve"
+        );
+        assert_eq!(post_process("über alles"), "Über alles");
+        // Token directly adjacent to multibyte chars.
+        assert_eq!(strip_hallucination_tokens("[BLANK_AUDIO]café"), "café");
+    }
+
+    #[test]
+    fn test_borrowed_fast_path() {
+        use std::borrow::Cow;
+        // Already-clean text borrows (zero allocation); dirty text owns.
+        assert!(matches!(post_process("Hello world"), Cow::Borrowed(_)));
+        assert!(matches!(post_process("  Hello world  "), Cow::Borrowed(_)));
+        assert!(matches!(post_process("hello world"), Cow::Owned(_)));
+        assert!(matches!(post_process("i think"), Cow::Owned(_)));
+        assert!(matches!(
+            strip_hallucination_tokens("hello"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            strip_hallucination_tokens("[ok] stays"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            strip_hallucination_tokens("[MUSIC] hi"),
+            Cow::Owned(_)
+        ));
+        // Borrowed content still equals the old owned bytes.
+        let b: Cow<'_, str> = post_process("Hello world");
+        assert_eq!(b, "Hello world");
+        assert_eq!(strip_hallucination_tokens("[BLANK_AUDIO]"), "");
+    }
+
+    #[test]
+    fn test_plus_fast_path() {
+        // No "plus" + regular spacing → single copy, identical bytes.
+        assert_eq!(plus_to_symbol("Hello world today"), "Hello world today");
+        // Irregular spacing still normalizes via the general path.
+        assert_eq!(plus_to_symbol("Hello   world"), "Hello world");
+        assert_eq!(plus_to_symbol("Hello\tworld"), "Hello world");
+        assert_eq!(plus_to_symbol("Hello\nworld"), "Hello world");
+        assert_eq!(plus_to_symbol("Hello\r\nworld"), "Hello world");
+        // Non-breaking space is whitespace too (never fast-pathed).
+        assert_eq!(plus_to_symbol("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_leading_digits_open_sentence() {
+        // Phase 7: a leading number must not capitalize the next word.
+        assert_eq!(post_process("1.0 plus 2.0"), "1.0 plus 2.0");
+        assert_eq!(post_process("20% off today"), "20% off today");
+        assert_eq!(post_process("3 blind mice"), "3 blind mice");
+        // Quoted/parenthesized starts still capitalize inside.
+        assert_eq!(post_process("\"hello\" she said"), "\"Hello\" she said");
+    }
+
+    #[test]
+    fn test_bracket_spans_opaque_to_rewrites() {
+        // Phase 7: markdown bracket content preserved byte-identical, while
+        // sentence capitalization still applies outside the brackets.
+        assert_eq!(post_process("[ok] fine"), "[ok] Fine");
+        assert_eq!(post_process("see [the docs] here"), "See [the docs] here");
+        assert_eq!(post_process("[i] think so"), "[i] Think so");
+        assert_eq!(post_process("a [b [c] d"), "A [b [c] d");
+        assert_eq!(post_process("see [the docs here"), "See [the docs here");
+    }
+
+    #[test]
+    fn test_plus_streaming_edges() {
+        // Leading "plus" never converts (needs a left neighbor).
+        assert_eq!(plus_to_symbol("plus A plus B"), "plus A+B");
+        assert_eq!(plus_to_symbol("A plus"), "A plus");
+        assert_eq!(plus_to_symbol("plus plus plus"), "plus plus plus");
+        assert_eq!(plus_to_symbol("A  plus   B"), "A+B");
+        assert_eq!(plus_to_symbol("a plus b plus c plus d"), "a+b+c+d");
     }
 
     #[test]

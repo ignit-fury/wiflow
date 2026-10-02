@@ -1,5 +1,9 @@
+mod analyze;
 mod app;
 mod audio;
+// Fixture harness: test-only until a later phase needs it in production.
+#[cfg(test)]
+mod baseline;
 mod cleanup;
 mod config;
 mod daemon;
@@ -182,26 +186,55 @@ fn main() {
                 let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
                 let rtf = ms as f64 / kept_ms.max(1.0);
                 info!("transcribed in {ms}ms (RTF {rtf:.2})");
-                // Same cleanup chain as the daemon (Groq→OpenRouter→Ollama),
-                // with the focused-app context synthesized first.
-                let ctx = if cfg.cleanup_enabled
-                    && cfg.context_enabled
-                    && cleanup::groq_key().is_some()
-                {
-                    let app = daemon::focused_app_name();
-                    cleanup::synthesize_context(app.as_deref(), &cfg)
-                } else {
-                    String::new()
+                // Same routing as the daemon: deterministic-clean transcripts
+                // skip the LLM chain; complex ones run it (Groq→OpenRouter→
+                // Ollama) with the focused-app context synthesized first.
+                let route = analyze::decide_route(&text, &cfg);
+                let route_name = match &route {
+                    analyze::CleanupRoute::Direct(_) => "deterministic",
+                    analyze::CleanupRoute::Llm(_) => "llm",
                 };
-                let input = cleanup::format_cleanup_input(
-                    if ctx.is_empty() { None } else { Some(&ctx) },
-                    &text,
+                info!(
+                    "cleanup route={route_name} reason={} score={}",
+                    analyze::route_reason(&cfg, &route),
+                    analyze::route_score(&route),
                 );
-                let outcome = cleanup::clean_chain(&input, &cfg);
-                for issue in &outcome.issues {
+                let (cleaned, issues) = match route {
+                    analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
+                    analyze::CleanupRoute::Llm(a) => {
+                        let key_present = cleanup::groq_key().is_some();
+                        let ctx = if a.wants_context()
+                            && cfg.cleanup_enabled
+                            && cfg.context_enabled
+                            && key_present
+                        {
+                            let app = daemon::focused_app_name();
+                            if analyze::context_allowed(
+                                app.as_deref(),
+                                &a,
+                                cfg.cleanup_enabled,
+                                cfg.context_enabled,
+                                key_present,
+                            ) {
+                                cleanup::synthesize_context(app.as_deref(), &cfg)
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let input = cleanup::format_cleanup_input(
+                            if ctx.is_empty() { None } else { Some(&ctx) },
+                            &text,
+                        );
+                        let outcome = cleanup::clean_chain(&input, &cfg);
+                        (outcome.text, outcome.issues)
+                    }
+                };
+                for issue in &issues {
                     warn!("cleanup issue: {issue}");
                 }
-                let text = outcome.text;
+                let text = cleaned;
                 if cleanup::is_filler_result(&text) {
                     info!("transcript empty or filler-only after cleanup");
                     return;

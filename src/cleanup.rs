@@ -223,7 +223,8 @@ fn try_provider_with_retry(
     transcript: &str,
 ) -> Result<String, String> {
     let primary = provider_model(p, cfg);
-    match try_provider_model(p, primary, transcript).map(|t| sanitize_llm_response(&t, transcript)) {
+    match try_provider_model(p, primary, transcript).map(|t| sanitize_llm_response(&t, transcript))
+    {
         Ok(t) => Ok(t),
         Err(e) => {
             let fallback = cfg.cleanup_fallback_model.as_str();
@@ -509,10 +510,7 @@ fn is_vague_context(c: &str) -> bool {
         return true;
     }
     let l = t.to_ascii_lowercase();
-    if matches!(
-        l.as_str(),
-        "unknown" | "generic" | "n/a" | "none" | "empty"
-    ) {
+    if matches!(l.as_str(), "unknown" | "generic" | "n/a" | "none" | "empty") {
         return true;
     }
     const HEDGES: &[&str] = &[
@@ -532,7 +530,7 @@ fn is_vague_context(c: &str) -> bool {
 
 /// Vague frontmost-app names: synthesizing context for these burns a second
 /// sequential LLM call for zero signal, so skip it (cleanup proceeds alone).
-fn is_vague_app(app: &str) -> bool {
+pub(crate) fn is_vague_app(app: &str) -> bool {
     let t = app.trim();
     if t.is_empty() {
         return true;
@@ -558,8 +556,8 @@ pub fn sanitize_llm_response(raw: &str, fallback_transcript: &str) -> String {
         return fallback;
     }
     // 1. Most relevant tagged payload wins (1B models wrap + continue tags).
-    if let Some(inner) = extract_tag_inner(&text, "transcript")
-        .or_else(|| extract_tag_inner(&text, "translated"))
+    if let Some(inner) =
+        extract_tag_inner(&text, "transcript").or_else(|| extract_tag_inner(&text, "translated"))
     {
         text = inner;
     }
@@ -783,13 +781,22 @@ fn plain_transcript_of(input: &str) -> String {
 /// field… unclear") that confuses the cleanup SLM, so it is skipped and the
 /// plain transcript goes to cleanup.
 pub fn synthesize_context(app_name: Option<&str>, cfg: &crate::config::Config) -> String {
+    synthesize_context_with_key(app_name, cfg, groq_key())
+}
+
+/// Key-injected core (testable without touching env/keys.json or network).
+fn synthesize_context_with_key(
+    app_name: Option<&str>,
+    cfg: &crate::config::Config,
+    key: Option<String>,
+) -> String {
     let Some(app) = app_name.filter(|a| !is_vague_app(a)) else {
         return String::new();
     };
     if !cfg.context_enabled {
         return String::new();
     }
-    let Some(key) = groq_key() else {
+    let Some(key) = key else {
         return String::new();
     };
     let prompt = format!("App: {app}");
@@ -909,7 +916,7 @@ mod tests {
         assert!(!out.contains('<'));
         let bare = format_cleanup_input(None, "hello world");
         assert_eq!(bare, "hello world"); // no context → plain transcript
-        // Vague context → plain transcript (no header injected).
+                                         // Vague context → plain transcript (no header injected).
         assert_eq!(format_cleanup_input(Some(""), "hi"), "hi");
         assert_eq!(format_cleanup_input(Some("unknown"), "hi"), "hi");
         assert_eq!(format_cleanup_input(Some("  Generic "), "hi"), "hi");
@@ -998,21 +1005,15 @@ mod tests {
     #[test]
     fn test_synthesize_context_skips_local_without_cloud_key() {
         // All-local setups must not burn a second sequential 1B call for
-        // context (latency + vague text). Gated: only asserts when no cloud
-        // key exists here (live-key machines skip like other live tests).
-        if groq_key().is_some() {
-            eprintln!("skipped (groq key present here)");
-            return;
-        }
-        if !ollama_reachable() {
-            eprintln!("skipped (ollama not running here)");
-            return;
-        }
+        // context. Key-injected: no env/file/network involved, race-free.
         let cfg = crate::config::Config {
             context_enabled: true,
             ..crate::config::Config::default()
         };
-        assert_eq!(synthesize_context(Some("Electron"), &cfg), "");
+        assert_eq!(
+            synthesize_context_with_key(Some("Electron"), &cfg, None),
+            ""
+        );
     }
 
     #[test]
@@ -1052,7 +1053,10 @@ mod tests {
             Some("sk-abc123".into())
         );
         assert_eq!(parse_dialog_text(""), None); // cancel / empty
-        assert_eq!(parse_dialog_text("text returned:  , button returned:OK"), None);
+        assert_eq!(
+            parse_dialog_text("text returned:  , button returned:OK"),
+            None
+        );
         assert_eq!(parse_dialog_text("button returned:Cancel"), None);
     }
 
@@ -1084,18 +1088,20 @@ mod tests {
         // Empty/corrupted → deterministic fallback (never inject tags).
         assert_eq!(sanitize_llm_response("", "hello world"), "hello world");
         assert_eq!(sanitize_llm_response("   ", "hello world"), "hello world");
-        assert_eq!(sanitize_llm_response("<Input></Input>", "hello world"), "hello world");
-        assert_eq!(sanitize_llm_response("!!! ???", "hello world"), "hello world");
+        assert_eq!(
+            sanitize_llm_response("<Input></Input>", "hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            sanitize_llm_response("!!! ???", "hello world"),
+            "hello world"
+        );
         // Sentinel passes through so the caller drops filler instead of injecting it.
         assert_eq!(sanitize_llm_response("EMPTY", "um uh"), "EMPTY");
         assert_eq!(sanitize_llm_response("  EMPTY  ", "um uh"), "EMPTY");
         // Fallback never carries our own formatting header.
-        let formatted =
-            format_cleanup_input(Some("mail context here"), "hello world");
-        assert_eq!(
-            sanitize_llm_response("", &formatted),
-            "hello world"
-        );
+        let formatted = format_cleanup_input(Some("mail context here"), "hello world");
+        assert_eq!(sanitize_llm_response("", &formatted), "hello world");
         assert_eq!(
             sanitize_llm_response("<Input></Input>", &formatted),
             "hello world"
