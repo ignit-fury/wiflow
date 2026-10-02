@@ -345,6 +345,9 @@ fn worker_on_control_down<S: DaemonEventSender>(
                     *capture = Some(cap);
                     *capture_start = Some(Instant::now());
                     tracing::info!("[session={}] capture started — mic open", current_session());
+                    // Close any previous hold first (a retap while its
+                    // Done is still queued), then duck fresh.
+                    duck.restore();
                     duck.duck();
 
                     // Emit before any transcription begins.
@@ -443,7 +446,11 @@ fn watchdog(
 /// While the mic is open the receive is armed with the watchdog deadline
 /// (`WIFLOW_MAX_RECORDING_MS`, default 60s per PRD §6), so a lost PttUp
 /// can never leave the microphone running indefinitely.
-pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Control>) {
+pub fn worker_main(
+    proxy: EventLoopProxy<DaemonEvent>,
+    rx: mpsc::Receiver<Control>,
+    duck: crate::duck::AudioDuck<crate::duck::OsBackend>,
+) {
     let mut ptt = PushToTalk::new(300, 60_000);
     let mut capture: Option<crate::core::audio::AudioCapture> = None;
     let mut capture_start: Option<Instant> = None;
@@ -451,13 +458,6 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000);
-    // Audio prioritization: ducked on successful capture start, restored on
-    // EVERY hold-exit path below (never stuck ducked, even on failure).
-    let duck = crate::duck::AudioDuck::new(
-        crate::duck::OsBackend,
-        crate::core::config::load_config().duck_audio,
-        crate::duck::PAUSE_DELAY,
-    );
     tracing::info!(
         "[session={}] worker started (recording watchdog max {max_ms}ms)",
         current_session()
@@ -503,9 +503,9 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                                     "[session={}] capture stop requested ({duration_ms}ms hold)",
                                     current_session()
                                 );
-                                // Listening ended at key-up: restore audio first so
-                                // music is back while transcription runs.
-                                duck.restore();
+                                // Restore happens on the MAIN thread after injection
+                                // completes — duck stays through transcription so
+                                // speech + processing stay clean.
                                 pipeline_on_worker(cap, duration_ms, &proxy);
                             }
                             None => {
@@ -587,7 +587,6 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         current_session()
     );
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

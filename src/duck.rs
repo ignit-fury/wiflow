@@ -80,6 +80,18 @@ pub struct AudioDuck<B: MediaBackend> {
     inner: Arc<Mutex<Inner>>,
 }
 
+// Shared between the worker (duck at key-down) and the main thread
+// (restore after injection completes). No `B: Clone` bound needed.
+impl<B: MediaBackend> Clone for AudioDuck<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            pause_delay: self.pause_delay,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<B: MediaBackend> AudioDuck<B> {
     pub fn new(backend: B, enabled: bool, pause_delay: Duration) -> Self {
         Self {
@@ -145,17 +157,55 @@ impl<B: MediaBackend> AudioDuck<B> {
         let delay = self.pause_delay;
         std::thread::spawn(move || {
             std::thread::sleep(delay);
-            let mut inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
+            Self::maybe_pause_for_hold(&backend, &inner_ref, hold_id);
+        });
+    }
+
+    /// Delayed-pause body, extracted for tests. Revalidates the hold after
+    /// EVERY slow backend call: osascript round-trips take 100-500ms cold,
+    /// so the hold can end mid-sequence. Interleavings that slip through
+    /// still converge on the correct end state:
+    /// - restore() between check and pause → we skip (fresh check fails).
+    /// - restore() between record and pause completing → post-pause check
+    ///   fails → immediate resume + unrecord (never stuck paused).
+    /// - restore() after pause completing → it resumes from the list.
+    fn maybe_pause_for_hold(backend: &Arc<B>, inner_ref: &Arc<Mutex<Inner>>, hold_id: u64) {
+        {
+            let inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
             if !inner.active || inner.hold_id != hold_id {
                 return; // Hold ended (or superseded) before the delay.
             }
-            for app in PLAYERS {
-                if backend.is_playing(*app) {
-                    backend.pause(*app);
+        }
+        for app in PLAYERS {
+            if !backend.is_playing(*app) {
+                continue;
+            }
+            {
+                let inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.active || inner.hold_id != hold_id {
+                    return; // Ended during the state query.
+                }
+            }
+            // Optimistic record BEFORE the slow pause call so a concurrent
+            // restore() sees (and resumes) this app no matter when it lands.
+            {
+                let mut inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.paused.contains(app) {
                     inner.paused.push(*app);
                 }
             }
-        });
+            backend.pause(*app);
+            {
+                let mut inner = inner_ref.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.active || inner.hold_id != hold_id {
+                    // Hold ended mid-pause: undo immediately, unrecord.
+                    inner.paused.retain(|a| a != app);
+                    drop(inner);
+                    backend.resume(*app);
+                    return;
+                }
+            }
+        }
     }
 
     /// End prioritization: resume what WE paused, restore the exact saved
@@ -201,6 +251,7 @@ mod tests {
         writes: Vec<Vec<f32>>,
         pauses: Vec<PlayerApp>,
         resumes: Vec<PlayerApp>,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     struct Fake {
@@ -218,6 +269,7 @@ mod tests {
                     writes: Vec::new(),
                     pauses: Vec::new(),
                     resumes: Vec::new(),
+                    hook: None,
                 }),
             }
         }
@@ -240,6 +292,10 @@ mod tests {
             s.running.contains(&app) && s.playing.contains(&app)
         }
         fn pause(&self, app: PlayerApp) {
+            let hook = self.state.lock().unwrap().hook.clone();
+            if let Some(h) = hook {
+                h(); // Test-only: simulate key-up landing mid-pause.
+            }
             let mut s = self.state.lock().unwrap();
             s.playing.retain(|a| a != &app);
             s.pauses.push(app);
@@ -394,6 +450,49 @@ mod tests {
         d.duck();
         assert!(d.is_active());
         d.restore();
+    }
+
+    #[test]
+    fn test_stale_body_never_pauses() {
+        // The exact reported bug: hold ends (restore) while the delayed
+        // thread is still sleeping — the body must no-op entirely.
+        let d = AudioDuck::new(Fake::new(vec![0.8]), true, Duration::from_secs(3600));
+        d.backend
+            .state
+            .lock()
+            .unwrap()
+            .playing
+            .push(PlayerApp::Music);
+        d.duck();
+        let stale_id = d.inner.lock().unwrap().hold_id;
+        d.restore(); // key-up before the delay elapses
+        AudioDuck::maybe_pause_for_hold(&d.backend, &d.inner, stale_id);
+        let s = d.backend.state.lock().unwrap();
+        assert!(s.pauses.is_empty());
+        assert!(s.resumes.is_empty());
+        assert!((s.volumes[0] - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_restore_mid_pause_self_heals() {
+        // Worse interleaving: restore lands between our pause call and its
+        // completion. End state must still be: volume exact, app playing.
+        let d = AudioDuck::new(Fake::new(vec![0.8]), true, Duration::from_secs(3600));
+        d.backend
+            .state
+            .lock()
+            .unwrap()
+            .playing
+            .push(PlayerApp::Music);
+        let restore_duck = d.clone();
+        d.backend.state.lock().unwrap().hook = Some(Arc::new(move || restore_duck.restore()));
+        d.duck();
+        let id = d.inner.lock().unwrap().hold_id;
+        AudioDuck::maybe_pause_for_hold(&d.backend, &d.inner, id);
+        let s = d.backend.state.lock().unwrap();
+        assert!(!d.is_active());
+        assert!((s.volumes[0] - 0.8).abs() < 1e-9, "volume exact");
+        assert!(s.playing.contains(&PlayerApp::Music), "app left playing");
     }
 
     #[test]

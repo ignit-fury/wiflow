@@ -501,6 +501,9 @@ struct DaemonApp {
     applied_tooltip: String,
     menu_ids: MenuIds,
     menu_dirty: bool,
+    /// Shared with the worker (duck at key-down there, restore here after
+    /// injection). Same instance — paused-list ownership never splits.
+    duck: crate::duck::AudioDuck<crate::duck::OsBackend>,
 }
 
 impl DaemonApp {
@@ -933,6 +936,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
+        // Restore ducked audio — but never under a newer hold: if the
+        // user already re-pressed (Recording), that hold owns the duck
+        // and its own Done will restore it.
+        let may_restore = self.state != AppState::Recording;
         let actions = self.orchestrator.handle(&event);
         if actions.is_empty() {
             tracing::info!(
@@ -966,7 +973,15 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
                             injector.leave_on_clipboard(&text);
-                            Err(e)
+                            if may_restore {
+                                self.duck.restore();
+                            }
+                            self.set_state(
+                                AppState::Error,
+                                Some(format!("injected to clipboard: {e}")),
+                            );
+                            self.sync_tray();
+                            return;
                         }
                     };
                     // Feed inject result back to the orchestrator, which drives
@@ -983,6 +998,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 unreachable!("finish_inject only emits SetTray/Notify")
                             }
                         }
+                    }
+                    // Injection completed: volume back to where it was.
+                    if may_restore {
+                        self.duck.restore();
                     }
                 }
             }
@@ -1122,9 +1141,17 @@ fn app_main(
         });
     }
 
+    // One shared duck instance: worker ducks at key-down, main thread
+    // restores after injection completes.
+    let duck = crate::duck::AudioDuck::new(
+        crate::duck::OsBackend,
+        config.duck_audio,
+        crate::duck::PAUSE_DELAY,
+    );
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();
-    std::thread::spawn(move || crate::daemon::worker_main(worker_proxy, rx));
+    let worker_duck = duck.clone();
+    std::thread::spawn(move || crate::daemon::worker_main(worker_proxy, rx, worker_duck));
 
     let mut app = DaemonApp {
         tray,
@@ -1148,6 +1175,7 @@ fn app_main(
         applied_tooltip: AppState::Idle.tooltip(won),
         menu_ids: ids,
         menu_dirty: false,
+        duck,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
