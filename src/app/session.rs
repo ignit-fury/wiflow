@@ -122,6 +122,9 @@ fn bounded_context_fetch(
 mod tests {
     use super::*;
 
+    /// Serializes access to `WIFLOW_MAX_RECORDING_MS` across parallel tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ── Fake context providers ────────────────────────────────────────────
 
     struct FakeContextApp(String);
@@ -160,6 +163,7 @@ mod tests {
 
     #[test]
     fn snapshot_freezes_settings() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let cfg = Config {
             stt_provider: "groq".to_string(),
             ..Default::default()
@@ -184,6 +188,7 @@ mod tests {
 
     #[test]
     fn context_timeout_yields_none_and_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Provider that always returns None — simulates timeout.
         let session = begin_session(&Config::default(), FakeContextNone);
 
@@ -215,6 +220,7 @@ mod tests {
 
     #[test]
     fn context_panicking_provider_yields_none_and_completes() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Provider that panics — must return None without propagating.
         let session = begin_session(&Config::default(), FakeContextPanics);
 
@@ -242,6 +248,7 @@ mod tests {
 
     #[test]
     fn session_uses_next_session_for_id() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let before = crate::daemon::current_session();
         let session = begin_session(&Config::default(), FakeContextNone);
         let after = crate::daemon::current_session();
@@ -266,6 +273,7 @@ mod tests {
 
     #[test]
     fn audio_ref_is_correlation_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let session = begin_session(&Config::default(), FakeContextApp("Xcode".to_string()));
 
         // AudioRef has only session_id — no Vec<f32>, no audio data.
@@ -277,6 +285,7 @@ mod tests {
 
     #[test]
     fn media_snapshot_defaults_s2() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let session = begin_session(&Config::default(), FakeContextNone);
 
         assert_eq!(session.media.output_device, None);
@@ -290,6 +299,7 @@ mod tests {
 
     #[test]
     fn watchdog_ms_reads_env_with_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let session = begin_session(&Config::default(), FakeContextNone);
         // Default is 60_000ms when env var not set.
         assert_eq!(session.watchdog_ms, 60_000);
@@ -297,6 +307,7 @@ mod tests {
 
     #[test]
     fn watchdog_ms_respects_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Save old value.
         let old = std::env::var("WIFLOW_MAX_RECORDING_MS").ok();
 
