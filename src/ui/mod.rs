@@ -4,5 +4,6 @@
 //! daemon or the PTT machine directly (H20).
 
 pub mod gl;
+pub mod notify;
 pub mod pill;
 pub mod settings;

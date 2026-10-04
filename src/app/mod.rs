@@ -90,6 +90,38 @@ pub fn make_icon(state: AppState) -> Icon {
     Icon::from_rgba(icon_rgba(state), 32, 32).expect("generated icon is valid RGBA")
 }
 
+/// Transcribing spinner frames: the state dot stays Transcribing-blue while
+/// a satellite dot orbits (4 positions, one per 250 ms tick). `tick` usually
+/// comes from `about_to_wait`'s animation driver; any wraparound works
+/// (`wrapping` arithmetic — frame N matches frame N mod 4).
+pub fn spinner_rgba(tick: u64) -> Vec<u8> {
+    // Satellite centers for the 4 frames: E, S, W, N at radius 11.
+    const SAT: [(i32, i32); 4] = [(27, 16), (16, 27), (5, 16), (16, 5)];
+    let (sx, sy) = SAT[(tick % 4) as usize];
+    let mut px = Vec::with_capacity(32 * 32 * 4);
+    for y in 0..32i32 {
+        for x in 0..32i32 {
+            let dx = x - 16;
+            let dy = y - 16;
+            let sdx = x - sx;
+            let sdy = y - sy;
+            let (r, g, b) = if dx * dx + dy * dy <= 49 {
+                (60, 180, 255)
+            } else if sdx * sdx + sdy * sdy <= 4 {
+                (240, 240, 240)
+            } else {
+                (24, 24, 24)
+            };
+            px.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    px
+}
+
+pub fn spinner_frame(tick: u64) -> Icon {
+    Icon::from_rgba(spinner_rgba(tick), 32, 32).expect("generated spinner is valid RGBA")
+}
+
 #[derive(Debug, Clone)]
 pub struct MenuIds {
     status: MenuId,
@@ -520,6 +552,8 @@ struct DaemonApp {
     /// Recording pill (S4, pure Rust): observational indicator owned by the
     /// App shell, driven by ShowPill/HidePill actions (H21/H22).
     pill: crate::ui::pill::Pill,
+    /// Transcribing spinner position (about_to_wait animation driver).
+    spinner_tick: u64,
 }
 
 impl DaemonApp {
@@ -1165,6 +1199,29 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 }
             }
         }
+        // Native notifications, best-effort (H23): failures fall back to the
+        // tray note the handlers above already set — the `let _` is load
+        // bearing, never "fix" it into a `?`. CleanupIssue stays tray-only
+        // (a broken provider would banner-spam every cycle).
+        match &event {
+            DaemonEvent::Done { text, .. } if !text.trim().is_empty() => {
+                match crate::ui::notify::notify("wiflow", text) {
+                    Ok(()) => tracing::info!("notification posted (transcript preview)"),
+                    Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+                }
+            }
+            DaemonEvent::Failed(msg) => {
+                match crate::ui::notify::notify("wiflow", &format!("Dictation failed: {msg}")) {
+                    Ok(()) => tracing::info!("notification posted (failure)"),
+                    Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+                }
+            }
+            DaemonEvent::TapIssue(msg) => match crate::ui::notify::notify("wiflow", msg) {
+                Ok(()) => tracing::info!("notification posted (tap issue)"),
+                Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+            },
+            _ => {}
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1204,6 +1261,21 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             self.rebuild_menu();
         }
         self.sync_tray();
+        // Transcribing spinner: animate the tray icon on a 250 ms cadence
+        // while the worker transcribes (main thread would otherwise sit
+        // idle with a static icon). Any other state → plain Wait: no wakeups,
+        // no battery cost. State exit repaints the static icon via sync_tray.
+        if self.state == AppState::Transcribing {
+            self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            if let Err(e) = self.tray.set_icon(Some(spinner_frame(self.spinner_tick))) {
+                tracing::warn!("tray spinner failed: {e:?}");
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(250),
+            ));
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
     }
 }
 
@@ -1358,6 +1430,7 @@ fn app_main(
         test_record_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
         test_record_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pill: crate::ui::pill::Pill::new(),
+        spinner_tick: 0,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
@@ -1418,6 +1491,30 @@ mod tests {
             rgba[i] > 200 && rgba[i + 1] < 80 && rgba[i + 2] < 80,
             "center must be red"
         );
+    }
+
+    #[test]
+    fn spinner_frames_cycle() {
+        // 4 distinct frames, then wraparound: frame N matches frame N mod 4.
+        let frames: Vec<Vec<u8>> = (0..4).map(spinner_rgba).collect();
+        for (i, a) in frames.iter().enumerate() {
+            assert_eq!(a.len(), 32 * 32 * 4, "frame {i} is 32x32 RGBA");
+            for (j, b) in frames.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "frames {i} and {j} must differ");
+                }
+            }
+        }
+        assert_eq!(spinner_rgba(4), frames[0], "frame 4 wraps to frame 0");
+        assert_eq!(spinner_rgba(102), frames[2], "large ticks wrap");
+        // Center dot stays Transcribing-blue in every frame.
+        for (i, f) in frames.iter().enumerate() {
+            let c = (16 * 32 + 16) * 4;
+            assert!(
+                f[c] < 100 && f[c + 1] > 150 && f[c + 2] > 200,
+                "frame {i} center stays blue"
+            );
+        }
     }
 
     #[test]
