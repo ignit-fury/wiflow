@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
 use crate::core::hotkey::{PttEvent, PushToTalk};
+use crate::core::traits::{CleanupProvider, ContextProvider, SpeechRecognizer};
 
 /// Monotonic PTT session counter: every PttDown starts a new session and
 /// all lifecycle log lines between that Down and its Up carry the same id,
@@ -216,113 +217,54 @@ fn pipeline_on_worker(
         });
         return;
     }
-    let model_path = match ensure_model_for_config() {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = proxy.send_event(DaemonEvent::Failed(format!("model unavailable: {e}")));
-            return;
-        }
-    };
-    // Hoisted ABOVE transcribe: one config read per cycle, reused for the
-    // initial prompt, STT language/provider, and the cleanup context below.
     let cfg = crate::core::config::load_config();
-    let prompt = crate::core::stt::read_prompt();
     let t0 = std::time::Instant::now();
-    // STT provider branch: "groq" = cloud whisper-large-v3 (OPT-IN), any
-    // other value = local on-device whisper. Cloud failure → tray alert +
-    // local fallback (never lose the transcript to a network error).
-    let text = if cfg.stt_provider == "groq" {
-        match crate::core::groq_stt::transcribe_cloud(
-            &kept,
-            crate::core::vad::VAD_SAMPLE_RATE,
-            &cfg,
-        ) {
-            Ok(t) => {
-                tracing::info!("cloud stt (whisper-large-v3) done");
-                t
-            }
-            Err(e) => {
-                let _ = proxy.send_event(DaemonEvent::CleanupIssue(format!(
-                    "Groq STT failed: {e} — using local whisper"
-                )));
-                match crate::core::stt::transcribe_shared(
-                    &model_path,
-                    &kept,
-                    &prompt,
-                    &cfg.stt_language,
-                ) {
-                    Ok(t) => t,
-                    Err(e2) => {
-                        let _ = proxy
-                            .send_event(DaemonEvent::Failed(format!("transcribe failed: {e2}")));
-                        return;
-                    }
-                }
-            }
-        }
-    } else {
-        match crate::core::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
-                return;
-            }
+    // STT via trait (groq→local fallback, same logic).
+    let recognizer = crate::core::traits::RouterRecognizer;
+    let text = match recognizer.transcribe(&kept, crate::core::vad::VAD_SAMPLE_RATE, &cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
+            return;
         }
     };
     let ms = t0.elapsed().as_millis();
     let kept_ms = kept.len() as f64 / crate::core::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
-    // Fast routing: deterministic-clean transcripts inject immediately (no
-    // context call, no provider calls, no issues). Complex ones take the
-    // existing LLM chain below (Groq → OpenRouter → Ollama local, $0).
-    // Issues (rate limits, missing model) surface as tray alerts.
+    // Cleanup via trait (route decision + context gate + chain).
+    let cleanup_provider = crate::core::traits::ChainProvider;
+    let context_provider = crate::core::traits::OsascriptContext;
+    // Context gate: transcript must carry value AND app must be
+    // context-sensitive — otherwise the ~200ms osascript query and the
+    // model call are skipped.
     let route = crate::core::analyze::decide_route(&text, &cfg);
-    let route_name = match &route {
-        crate::core::analyze::CleanupRoute::Direct(_) => "deterministic",
-        crate::core::analyze::CleanupRoute::Llm(_) => "llm",
-    };
-    tracing::info!(
-        "cleanup route={route_name} reason={} score={}",
-        crate::core::analyze::route_reason(&cfg, &route),
-        crate::core::analyze::route_score(&route),
-    );
-    let (cleaned, issues) = match route {
-        crate::core::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
+    let ctx = match &route {
         crate::core::analyze::CleanupRoute::Llm(a) => {
-            // Context synthesis runs first (focused app → 2-sentence hint);
-            // a context failure yields "" and the chain proceeds without.
-            // Gated deterministically: transcript must carry context-valuable
-            // content AND the app must be context-sensitive — otherwise both
-            // the ~200ms osascript query and the model call are skipped.
-            // Cheap transcript check first (skips the ~200ms osascript query
-            // when context could never pay off), then the full gate.
             let key_present = crate::core::cleanup::groq_key().is_some();
-            let ctx =
-                if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
-                    let app = crate::platform::macos::context::focused_app_name();
-                    if crate::core::analyze::context_allowed(
-                        app.as_deref(),
-                        &a,
-                        cfg.cleanup_enabled,
-                        cfg.context_enabled,
-                        key_present,
-                    ) {
-                        crate::core::cleanup::synthesize_context(app.as_deref(), &cfg)
-                    } else {
-                        String::new()
-                    }
+            if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
+                let app = context_provider.focused_app();
+                if crate::core::analyze::context_allowed(
+                    app.as_deref(),
+                    a,
+                    cfg.cleanup_enabled,
+                    cfg.context_enabled,
+                    key_present,
+                ) {
+                    crate::core::cleanup::synthesize_context(app.as_deref(), &cfg)
                 } else {
                     String::new()
-                };
-            let input = crate::core::cleanup::format_cleanup_input(
-                if ctx.is_empty() { None } else { Some(&ctx) },
-                &text,
-            );
-            let outcome = crate::core::cleanup::clean_chain(&input, &cfg);
-            (outcome.text, outcome.issues)
+                }
+            } else {
+                String::new()
+            }
         }
+        _ => String::new(),
     };
+    let outcome =
+        cleanup_provider.clean(&text, if ctx.is_empty() { None } else { Some(&ctx) }, &cfg);
+    let cleaned = outcome.text;
+    let issues = outcome.issues;
     for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
@@ -364,17 +306,6 @@ fn pipeline_on_worker(
     });
 }
 
-/// Model variant follows the live menu config (read per cycle, never cached):
-/// SmallEn downloads small.en on first use, BaseEn uses base.en.
-fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
-    match crate::core::config::load_config().model {
-        crate::core::config::ModelChoice::TinyEn => crate::core::stt::ensure_model_variant("tiny"),
-        crate::core::config::ModelChoice::SmallEn => {
-            crate::core::stt::ensure_model_variant("small")
-        }
-        crate::core::config::ModelChoice::BaseEn => crate::core::stt::ensure_model_variant("base"),
-    }
-}
 /// Safety watchdog (PRD §6): the mic is open but the PttUp that should
 /// have stopped it never arrived. Force-stop the capture (mic dies here),
 /// warn loudly, transcribe what was captured, and tell the app so the

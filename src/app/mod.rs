@@ -10,6 +10,7 @@ use winit::{
 
 use crate::core::config::{Config, ModelChoice};
 use crate::core::history::HistoryEntry;
+use crate::core::traits::TextInjector;
 use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
 use crate::ptt::{Admission, PttMachine};
 
@@ -969,7 +970,8 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     // Main-thread-only: enigo HIToolbox TIS calls trap off-main
                     // (crash report 2026-09-30). The 200ms restore sleep inside
                     // inject_text briefly blocks this thread — accepted for v1.
-                    match crate::platform::macos::inject::inject_text(&text) {
+                    let injector = crate::core::traits::SystemInjector;
+                    match injector.inject(&text) {
                         Ok(r) => tracing::info!(
                             "injected via {} (clipboard restored: {})",
                             r.pasted_via,
@@ -979,7 +981,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
-                            crate::platform::macos::inject::leave_on_clipboard(&text);
+                            injector.leave_on_clipboard(&text);
                             self.set_state(
                                 AppState::Error,
                                 Some(format!("injected to clipboard: {e}")),
