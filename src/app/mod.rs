@@ -1280,6 +1280,17 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 }
 
+/// Actionable note when a PTT hotkey can't be registered (spec §10.3):
+/// names the failed preset + where to pick another. System-wide hotkey
+/// enumeration doesn't exist on macOS, so conflicts are surfaced with
+/// guidance, never faked.
+pub fn hotkey_failure_note(prefer: HotkeyPreset) -> String {
+    format!(
+        "push-to-talk ({}) couldn't be registered — pick another hotkey in the tray menu or Settings window (it takes effect immediately); if all fail, check System Settings → Keyboard for conflicts",
+        crate::daemon::preset_hint(prefer)
+    )
+}
+
 fn app_main(
     event_loop: EventLoop<DaemonEvent>,
     proxy: winit::event_loop::EventLoopProxy<DaemonEvent>,
@@ -1311,6 +1322,18 @@ fn app_main(
         config.hotkey_preset,
         HotkeyPreset::RightOption | HotkeyPreset::Fn
     );
+    // Total registration failure degrades to an Error-state start (never a
+    // silent exit): settings/history stay usable and the tray menu can
+    // switch to a working preset (which re-registers live).
+    let mut startup_note: Option<String> = None;
+    let new_manager_for_degraded_start = || {
+        global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
+            // Without ANY hotkey manager even Esc is impossible — nothing
+            // works, so exiting here is honest (not silent: stderr).
+            eprintln!("hotkey manager: {e:?}");
+            std::process::exit(1);
+        })
+    };
     let (manager, ptt_hotkey, won, tap) = if is_bare {
         // Bare-modifier presets ride a listen-only CGEventTap (raw
         // flagsChanged) — RegisterEventHotKey cannot see them.
@@ -1324,21 +1347,35 @@ fn app_main(
             }
             Err(e) => {
                 tracing::warn!("modifier tap unavailable ({e}) — falling back to CtrlSpace");
-                let (manager, hk, w) = crate::daemon::register_ptt_hotkey(HotkeyPreset::CtrlSpace)
-                    .unwrap_or_else(|e| {
-                        eprintln!("no push-to-talk hotkey: {e}");
-                        std::process::exit(1);
-                    });
-                (manager, Some(hk), w, None)
+                match crate::daemon::register_ptt_hotkey(HotkeyPreset::CtrlSpace) {
+                    Ok((manager, hk, w)) => (manager, Some(hk), w, None),
+                    Err(e2) => {
+                        tracing::warn!("no push-to-talk hotkey ({e2}) — starting degraded");
+                        startup_note = Some(hotkey_failure_note(HotkeyPreset::CtrlSpace));
+                        (
+                            new_manager_for_degraded_start(),
+                            None,
+                            config.hotkey_preset,
+                            None,
+                        )
+                    }
+                }
             }
         }
     } else {
-        let (manager, hk, w) = crate::daemon::register_ptt_hotkey(config.hotkey_preset)
-            .unwrap_or_else(|e| {
-                eprintln!("no push-to-talk hotkey: {e}");
-                std::process::exit(1);
-            });
-        (manager, Some(hk), w, None)
+        match crate::daemon::register_ptt_hotkey(config.hotkey_preset) {
+            Ok((manager, hk, w)) => (manager, Some(hk), w, None),
+            Err(e) => {
+                tracing::warn!("no push-to-talk hotkey ({e}) — starting degraded");
+                startup_note = Some(hotkey_failure_note(config.hotkey_preset));
+                (
+                    new_manager_for_degraded_start(),
+                    None,
+                    config.hotkey_preset,
+                    None,
+                )
+            }
+        }
     };
     tracing::info!(
         "ptt hotkey registered: {won:?} ({})",
@@ -1433,6 +1470,11 @@ fn app_main(
         pill: crate::ui::pill::Pill::new(),
         spinner_tick: 0,
     };
+    if let Some(note) = startup_note {
+        // Degraded start: no PTT hotkey. Error state + actionable note
+        // instead of exit(1); the tray menu can still switch presets.
+        app.set_state(AppState::Error, Some(note));
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
         std::process::exit(1);
@@ -1459,6 +1501,27 @@ mod tests {
         assert!(AppState::Recording.tooltip(p).contains("recording"));
         assert!(AppState::Transcribing.tooltip(p).contains("transcribing"));
         assert!(AppState::Error.tooltip(p).contains("error"));
+    }
+
+    #[test]
+    fn hotkey_failure_note_names_preset_and_next_action() {
+        // Registration failure must surface an ACTIONABLE note, never a
+        // silent exit: which preset failed + what to do about it.
+        for preset in [
+            HotkeyPreset::RightOption,
+            HotkeyPreset::Fn,
+            HotkeyPreset::CtrlSpace,
+        ] {
+            let note = hotkey_failure_note(preset);
+            assert!(
+                note.contains(crate::daemon::preset_hint(preset)),
+                "names the failed preset, got: {note}"
+            );
+            assert!(
+                note.to_lowercase().contains("menu") || note.to_lowercase().contains("settings"),
+                "tells the user where to pick another, got: {note}"
+            );
+        }
     }
 
     #[test]
