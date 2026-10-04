@@ -7,7 +7,7 @@
 //! yields `None` and writes a warn log (H19). Watchdog timeout uses
 //! `WIFLOW_MAX_RECORDING_MS`, the same env var read by the worker.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::core::config::Config;
 use crate::core::traits::ContextProvider;
@@ -61,7 +61,7 @@ pub struct Session {
 /// - Reads `WIFLOW_MAX_RECORDING_MS` env (same source as worker).
 /// - Clones the full `Config` so later mutations don't affect this session.
 #[allow(dead_code)] // consumed by orchestrator in Task 8
-pub fn begin_session(settings: &Config, ctx: impl ContextProvider) -> Session {
+pub fn begin_session(settings: &Config, ctx: impl ContextProvider + Send + 'static) -> Session {
     let id = next_session();
     let started_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -74,7 +74,7 @@ pub fn begin_session(settings: &Config, ctx: impl ContextProvider) -> Session {
         .unwrap_or(60_000);
 
     // Bounded context acquisition (≤500ms).
-    let app_context = bounded_context_fetch(&ctx, Duration::from_millis(500));
+    let app_context = bounded_context_fetch(ctx, Duration::from_millis(500));
 
     let audio_ref = AudioRef { session_id: id };
     let media = MediaSnapshot::default();
@@ -99,19 +99,21 @@ pub fn begin_session(settings: &Config, ctx: impl ContextProvider) -> Session {
 
 /// Fetch context with a bounded timeout. Returns `None` on timeout or panic.
 ///
-/// In production `focused_app()` is a fast osascript subprocess call
-/// (<500ms). The timeout guard ensures we never block the startup path
-/// unboundedly (H19).
-fn bounded_context_fetch(ctx: &impl ContextProvider, timeout: Duration) -> Option<String> {
-    let start = Instant::now();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.focused_app()));
-    let elapsed = start.elapsed();
+/// Spawns a thread for the actual `focused_app()` call so the deadline is
+/// enforced even when the provider blocks. The orphaned thread is left to
+/// finish on its own (H19 — never blocks the startup path unboundedly).
+fn bounded_context_fetch(
+    ctx: impl ContextProvider + Send + 'static,
+    timeout: Duration,
+) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    if elapsed > timeout {
-        None
-    } else {
-        result.ok().flatten()
-    }
+    std::thread::spawn(move || {
+        let result = ctx.focused_app();
+        let _ = tx.send(result);
+    });
+
+    rx.recv_timeout(timeout).unwrap_or(None)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -144,21 +146,33 @@ mod tests {
         }
     }
 
+    /// Fake that sleeps past the bounded deadline (proves the timeout guard
+    /// actually aborts rather than waiting forever).
+    struct FakeContextSlow;
+    impl ContextProvider for FakeContextSlow {
+        fn focused_app(&self) -> Option<String> {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Some("SlowApp".to_string())
+        }
+    }
+
     // ── Test: snapshot freezes settings ───────────────────────────────────
 
     #[test]
     fn snapshot_freezes_settings() {
-        let mut cfg = Config::default();
-        cfg.stt_provider = "groq".to_string();
+        let cfg = Config {
+            stt_provider: "groq".to_string(),
+            ..Default::default()
+        };
 
         let session = begin_session(&cfg, FakeContextApp("TestApp".to_string()));
 
         // Session must have a full clone, not a reference.
         assert_eq!(session.settings.stt_provider, "groq");
 
-        // Mutate the original config — session must NOT see the change.
-        let mut cfg = cfg;
-        cfg.stt_provider = "local".to_string();
+        // Mutate a clone of the config — session must NOT see the change.
+        let mut mutated = cfg.clone();
+        mutated.stt_provider = "local".to_string();
 
         assert_eq!(
             session.settings.stt_provider, "groq",
@@ -179,6 +193,24 @@ mod tests {
         );
         // Must complete without panic.
         assert!(session.started_at_ms > 0);
+    }
+
+    #[test]
+    fn context_slow_provider_actually_times_out() {
+        // Provider that sleeps 600ms — past the 500ms bounded deadline.
+        // The call must return None and complete well before 600ms.
+        let t0 = std::time::Instant::now();
+        let session = begin_session(&Config::default(), FakeContextSlow);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            session.app_context, None,
+            "app_context must be None when context provider sleeps past the deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(550),
+            "bounded fetch must return before the fake's 600ms sleep completes (took {elapsed:?})"
+        );
     }
 
     #[test]
