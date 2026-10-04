@@ -1,10 +1,22 @@
 use arboard::Clipboard;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InjectReport {
-    pub pasted_via: &'static str,
-    pub clipboard_restored: bool,
+// InjectReport now lives in core::traits (finding 2); re-exported for
+// backward compatibility with any call sites still using the old path.
+pub use crate::core::traits::InjectReport;
+use crate::core::traits::TextInjector;
+
+/// Production `TextInjector`: clipboard save → set → Cmd+V → restore
+/// (enigo). Lives here (not in core) per H25 — core owns the trait.
+pub struct SystemInjector;
+
+impl TextInjector for SystemInjector {
+    fn inject(&self, text: &str) -> Result<InjectReport, String> {
+        inject_text(text)
+    }
+    fn leave_on_clipboard(&self, text: &str) {
+        leave_on_clipboard(text)
+    }
 }
 
 fn enigo_err(ctx: &str, e: impl std::fmt::Debug) -> String {
@@ -62,6 +74,13 @@ pub fn leave_on_clipboard(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_system_injector_rejects_empty() {
+        let injector = SystemInjector;
+        assert!(injector.inject("").is_err());
+        assert!(injector.inject("   ").is_err());
+    }
 
     #[test]
     fn test_inject_empty_is_err() {

@@ -50,6 +50,10 @@ pub struct Config {
     /// Context-synthesis layer (focused app → 2-sentence context hint).
     #[serde(default = "default_true")]
     pub context_enabled: bool,
+    /// Duck competing laptop audio while the mic is hot (output-volume dip
+    /// + delayed Music/Spotify pause, both restored exactly after).
+    #[serde(default = "default_true")]
+    pub duck_audio: bool,
     /// Small model for context synthesis.
     #[serde(default = "default_context_model")]
     pub context_model: String,
@@ -103,6 +107,7 @@ impl Default for Config {
             cleanup_provider: "auto".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
+            duck_audio: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -257,6 +262,7 @@ mod tests {
             cleanup_provider: "auto".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
+            duck_audio: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -285,6 +291,11 @@ mod tests {
         std::fs::write(&p, "{nope").unwrap();
         assert_eq!(load_config_from(&p), Config::default());
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn test_duck_audio_defaults_on() {
+        assert!(Config::default().duck_audio);
     }
 
     #[test]

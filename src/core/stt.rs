@@ -21,17 +21,68 @@ fn num_threads() -> i32 {
         .min(8)
 }
 
+/// Compute backend for model load: Metal first, CPU as fallback.
+/// Test-pinned policy (`backend_selection_policy`); `Stt::load` implements
+/// it as try-Metal-then-fallback since availability is only proven by trying.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Metal,
+    Cpu,
+}
+
+/// Pure backend decision: Metal when available, CPU otherwise.
+/// (`Stt::load` implements the retry; this pins the policy for tests.)
+#[allow(dead_code)]
+pub(crate) fn backend_for(metal_ok: bool) -> Backend {
+    if metal_ok {
+        Backend::Metal
+    } else {
+        Backend::Cpu
+    }
+}
+
+/// Does this load error smell like a Metal/GPU init failure (worth a CPU
+/// retry) rather than a model-file problem (retry would fail identically)?
+/// Conservative by design: only explicit GPU markers trigger the retry.
+/// NOTE: hard aborts (`ggml_abort` inside Metal teardown/init) kill the
+/// process and can never reach this classifier — the fallback covers
+/// error-returning init failures only.
+fn is_metal_init_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("metal") || m.contains("ggml_metal") || m.contains("mtl") || m.contains("gpu")
+}
+
 impl Stt {
     pub fn load(path: &Path) -> Result<Self, String> {
+        // Metal first (fast path, unchanged behavior on success); on a
+        // Metal/GPU init failure, retry the SAME model on CPU instead of
+        // failing the cycle (diagram GPU/CPU fallback). File errors
+        // (missing/corrupt model) are NOT retried — a CPU reload would fail
+        // identically after re-parsing gigabytes.
+        match Self::load_with_gpu(path, true) {
+            Ok(stt) => Ok(stt),
+            Err(e) if is_metal_init_error(&e) => {
+                tracing::warn!("Metal backend failed ({e}) — retrying on CPU");
+                Self::load_with_gpu(path, false).map_err(|e2| {
+                    format!("cpu fallback failed after metal failure: {e2} (metal: {e})")
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn load_with_gpu(path: &Path, gpu: bool) -> Result<Self, String> {
         let mut ctx_params = WhisperContextParameters::new();
-        // Explicit: Metal GPU with `metal` feature (default would also be true via _gpu).
-        ctx_params.use_gpu(true);
+        // Explicit GPU flag (was hardcoded `true`): Metal with the `metal`
+        // feature, CPU otherwise (default would also be true via _gpu).
+        ctx_params.use_gpu(gpu);
         let ctx = WhisperContext::new_with_params(path, ctx_params)
             .map_err(|e| format!("load model {}: {e:?}", path.display()))?;
-        // Create the Metal state once — allocates kv-cache, compute buffers, and
-        // compiles Metal pipelines here so `transcribe` never pays that cost again
-        // (~200 ms saved per transcription; eliminates per-cycle ggml_metal_init
-        // and whisper_init_state overhead).
+        // Create the backend state once — allocates kv-cache, compute
+        // buffers, and compiles Metal pipelines here so `transcribe` never
+        // pays that cost again (~200 ms saved per transcription; eliminates
+        // per-cycle ggml_metal_init and whisper_init_state overhead).
         let state = ctx
             .create_state()
             .map_err(|e| format!("create state: {e:?}"))?;
@@ -114,7 +165,7 @@ pub fn transcribe_shared(
 /// Read the initial-prompt vocabulary (prompt.txt); missing file → empty.
 /// Null bytes stripped (set_initial_prompt panics on them).
 pub fn read_prompt() -> String {
-    std::fs::read_to_string(crate::config::prompt_path())
+    std::fs::read_to_string(crate::core::config::prompt_path())
         .unwrap_or_default()
         .chars()
         .filter(|c| *c != '\0')
@@ -452,6 +503,29 @@ mod tests {
     }
 
     #[test]
+    fn backend_selection_policy() {
+        assert_eq!(backend_for(true), Backend::Metal);
+        assert_eq!(backend_for(false), Backend::Cpu);
+    }
+
+    #[test]
+    fn metal_init_classifier() {
+        // GPU smells → retry-worthy.
+        assert!(is_metal_init_error("ggml_metal_init failed: no device"));
+        assert!(is_metal_init_error(
+            "load model x.bin: Metal context creation failed (mtl)"
+        ));
+        assert!(is_metal_init_error("GPU backend unavailable"));
+        // File problems → fail fast, never retry (a CPU reload would fail
+        // identically after re-parsing gigabytes).
+        assert!(!is_metal_init_error(
+            "load model /nonexistent/ggml.bin: failed to open file"
+        ));
+        assert!(!is_metal_init_error("create state: out of memory"));
+        assert!(!is_metal_init_error(""));
+    }
+
+    #[test]
     fn test_model_path_name() {
         assert_eq!(model_path().file_name().unwrap(), MODEL_NAME);
     }
@@ -481,7 +555,7 @@ mod tests {
     #[test]
     fn test_read_prompt_missing_is_empty() {
         // Default machine state: prompt.txt not yet created → empty prompt.
-        let p = crate::config::prompt_path();
+        let p = crate::core::config::prompt_path();
         let existed = p.exists();
         if existed {
             let saved = std::fs::read_to_string(&p).unwrap();
@@ -598,12 +672,12 @@ mod tests {
         // Whitespace runs still collapse (math stage splits on them).
         assert_eq!(post_process("hello   world"), "Hello   world");
         assert_eq!(
-            crate::baseline::deterministic_clean("hello   world"),
+            crate::core::baseline::deterministic_clean("hello   world"),
             "Hello world"
         );
         // Multibyte text through the byte-walk strip + stream post-process.
         assert_eq!(
-            crate::baseline::deterministic_clean("café [MUSIC] naïve"),
+            crate::core::baseline::deterministic_clean("café [MUSIC] naïve"),
             "Café naïve"
         );
         assert_eq!(post_process("über alles"), "Über alles");

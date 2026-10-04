@@ -2,12 +2,12 @@ use serde_json::json;
 use std::time::Duration;
 
 /// The literal dictation cleanup layer system prompt (verbatim, user-provided).
-const SYSTEM_PROMPT: &str = include_str!("cleanup_prompt.txt");
+const SYSTEM_PROMPT: &str = include_str!("../cleanup_prompt.txt");
 
 /// The literal context-synthesis system prompt (verbatim, user-provided):
 /// two sentences describing what the user is doing and what they are about
 /// to dictate, used only as a formatting hint by the cleanup model.
-const CONTEXT_PROMPT: &str = include_str!("context_prompt.txt");
+const CONTEXT_PROMPT: &str = include_str!("../context_prompt.txt");
 
 pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
@@ -48,7 +48,7 @@ fn key_from_file(field: &str) -> Option<String> {
 }
 
 fn keys_file_path() -> std::path::PathBuf {
-    crate::config::app_support_dir().join("keys.json")
+    crate::core::config::app_support_dir().join("keys.json")
 }
 
 /// Save one API key field (`groq_api_key` / `openrouter_api_key`), preserving
@@ -72,7 +72,7 @@ fn save_key_to(path: &std::path::Path, field: &str, value: &str) -> Result<(), S
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir keys: {e:?}"))?;
     }
-    crate::config::atomic_write_json(path, &map)
+    crate::core::config::atomic_write_json(path, &map)
 }
 
 /// Clear one API key field (sibling preserved).
@@ -175,7 +175,7 @@ impl Provider {
 }
 
 /// Model id a provider uses (per-provider config field).
-fn provider_model(p: Provider, cfg: &crate::config::Config) -> &str {
+fn provider_model(p: Provider, cfg: &crate::core::config::Config) -> &str {
     match p {
         Provider::Groq => &cfg.cleanup_groq_model,
         Provider::OpenRouter => &cfg.cleanup_openrouter_model,
@@ -219,7 +219,7 @@ fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<Stri
 /// The fallback error stands when the fallback equals the primary.
 fn try_provider_with_retry(
     p: Provider,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
     transcript: &str,
 ) -> Result<String, String> {
     let primary = provider_model(p, cfg);
@@ -241,7 +241,7 @@ fn try_provider_with_retry(
 
 /// Run the full provider chain. Never fails: worst case the input is
 /// returned unchanged with issues recorded for the UI alert.
-pub fn clean_chain(transcript: &str, cfg: &crate::config::Config) -> CleanupOutcome {
+pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> CleanupOutcome {
     let mut issues = Vec::new();
     if !cfg.cleanup_enabled || transcript.trim().is_empty() {
         return CleanupOutcome {
@@ -272,7 +272,7 @@ pub fn clean_chain(transcript: &str, cfg: &crate::config::Config) -> CleanupOutc
 /// back to `next` (when present). Returns Some(cleaned) on success.
 fn chain_step(
     p: Provider,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
     transcript: &str,
     next: Option<Provider>,
     issues: &mut Vec<String>,
@@ -304,7 +304,7 @@ fn chain_step(
 /// skipping cloud providers with no key.
 fn full_chain(
     transcript: &str,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
     issues: &mut Vec<String>,
 ) -> Option<String> {
     // 1. Groq (fastest cloud, generous free tier). No key → skip silently.
@@ -340,7 +340,7 @@ fn full_chain(
 /// the provider IS ollama.
 fn single_provider_chain(
     transcript: &str,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
     providers: &[Provider],
     issues: &mut Vec<String>,
 ) -> Option<String> {
@@ -780,14 +780,14 @@ fn plain_transcript_of(input: &str) -> String {
 /// sequential 1B call costs ~1s and yields hedge-filled text ("unknown
 /// field… unclear") that confuses the cleanup SLM, so it is skipped and the
 /// plain transcript goes to cleanup.
-pub fn synthesize_context(app_name: Option<&str>, cfg: &crate::config::Config) -> String {
+pub fn synthesize_context(app_name: Option<&str>, cfg: &crate::core::config::Config) -> String {
     synthesize_context_with_key(app_name, cfg, groq_key())
 }
 
 /// Key-injected core (testable without touching env/keys.json or network).
 fn synthesize_context_with_key(
     app_name: Option<&str>,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
     key: Option<String>,
 ) -> String {
     let Some(app) = app_name.filter(|a| !is_vague_app(a)) else {
@@ -843,14 +843,14 @@ mod tests {
 
     #[test]
     fn test_clean_chain_disabled_and_empty() {
-        let cfg = crate::config::Config {
+        let cfg = crate::core::config::Config {
             cleanup_enabled: false,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         let out = clean_chain("hello world", &cfg);
         assert_eq!(out.text, "hello world");
         assert!(out.issues.is_empty());
-        let cfg = crate::config::Config::default();
+        let cfg = crate::core::config::Config::default();
         let out = clean_chain("", &cfg);
         assert_eq!(out.text, "");
         assert!(out.issues.is_empty());
@@ -861,9 +861,9 @@ mod tests {
         // Explicit "ollama" provider: never calls the cloud APIs from tests
         // (the real Groq key lives in keys.json — live cloud verification is
         // Task 5's job). Ollama may or may not be running locally.
-        let cfg = crate::config::Config {
+        let cfg = crate::core::config::Config {
             cleanup_provider: "ollama".into(),
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         let out = clean_chain("hello world", &cfg);
         assert!(!out.text.is_empty(), "cleaned text must not be empty");
@@ -880,7 +880,7 @@ mod tests {
         // env wins over keys.json; missing both → None. Uses a throwaway key
         // file written to the REAL app dir (outside repo, gitignored by
         // location). A real keys.json is backed up and restored afterwards.
-        let dir = crate::config::app_support_dir();
+        let dir = crate::core::config::app_support_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let keys_path = dir.join("keys.json");
         let backup = std::fs::read_to_string(&keys_path).ok();
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_synthesize_context_disabled_or_missing_app() {
-        let cfg = crate::config::Config::default();
+        let cfg = crate::core::config::Config::default();
         // No app name → empty context (never invent — prompt rule).
         assert_eq!(synthesize_context(None, &cfg), "");
         // Vague/generic apps skip the second LLM call entirely (latency).
@@ -1006,9 +1006,9 @@ mod tests {
     fn test_synthesize_context_skips_local_without_cloud_key() {
         // All-local setups must not burn a second sequential 1B call for
         // context. Key-injected: no env/file/network involved, race-free.
-        let cfg = crate::config::Config {
+        let cfg = crate::core::config::Config {
             context_enabled: true,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         assert_eq!(
             synthesize_context_with_key(Some("Electron"), &cfg, None),

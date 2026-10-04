@@ -48,22 +48,21 @@ pub fn parse_transcript(body: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Cloud STT via Groq whisper-large-v3 (OPT-IN: audio leaves the device only
-/// when stt_provider == "groq" — privacy rule).
+/// Wire model id for Groq STT (spec D4). Single source: the multipart
+/// builder, both call sites, and the pinning test below all use this.
+pub const GROQ_STT_MODEL: &str = "whisper-large-v3-turbo";
+
+/// Cloud STT via Groq whisper-large-v3-turbo (OPT-IN: audio leaves the
+/// device only when stt_provider == "groq" — privacy rule).
 pub fn transcribe_cloud(
     samples: &[f32],
     rate: u32,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
 ) -> Result<String, String> {
-    let key = crate::cleanup::groq_key().ok_or("no Groq key (set GROQ_API_KEY)")?;
+    let key = crate::core::cleanup::groq_key().ok_or("no Groq key (set GROQ_API_KEY)")?;
     let wav = encode_wav16(samples, rate);
     let boundary = "wiflow-audio-boundary-7f3a";
-    let body = build_multipart(
-        boundary,
-        &wav,
-        "whisper-large-v3",
-        lang_opt(&cfg.stt_language),
-    );
+    let body = build_multipart(boundary, &wav, GROQ_STT_MODEL, lang_opt(&cfg.stt_language));
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
@@ -106,13 +105,20 @@ mod tests {
     }
 
     #[test]
+    fn groq_default_model_is_turbo() {
+        // D4: the wire model id. If Groq renames it, this test names the
+        // exact literal to update (spec §10.1).
+        assert_eq!(GROQ_STT_MODEL, "whisper-large-v3-turbo");
+    }
+
+    #[test]
     fn test_build_multipart_shape() {
         let wav = vec![1u8, 2, 3];
-        let body = build_multipart("BOUNDARY123", &wav, "whisper-large-v3", None);
+        let body = build_multipart("BOUNDARY123", &wav, "whisper-large-v3-turbo", None);
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("--BOUNDARY123"));
         assert!(s.contains("name=\"model\""));
-        assert!(s.contains("whisper-large-v3"));
+        assert!(s.contains("whisper-large-v3-turbo"));
         assert!(s.contains("name=\"file\"; filename=\"audio.wav\""));
         assert!(s.contains("Content-Type: audio/wav"));
         assert!(s.ends_with("--BOUNDARY123--\r\n"));
@@ -120,11 +126,11 @@ mod tests {
 
     #[test]
     fn test_build_multipart_with_language() {
-        let body = build_multipart("B", &[1u8], "whisper-large-v3", Some("en"));
+        let body = build_multipart("B", &[1u8], "whisper-large-v3-turbo", Some("en"));
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("name=\"language\""));
         assert!(s.contains("\r\nen\r\n"));
-        let auto = build_multipart("B", &[1u8], "whisper-large-v3", None);
+        let auto = build_multipart("B", &[1u8], "whisper-large-v3-turbo", None);
         assert!(!String::from_utf8_lossy(&auto).contains("name=\"language\""));
     }
 

@@ -3,10 +3,28 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
-use crate::hotkey::{PttEvent, PushToTalk};
+use crate::core::hotkey::{PttEvent, PushToTalk};
+use crate::core::traits::{CleanupProvider, ContextProvider, SpeechRecognizer};
+
+/// Monotonic PTT session counter: every PttDown starts a new session and
+/// all lifecycle log lines between that Down and its Up carry the same id,
+/// so a wedged recording can be traced end-to-end through the log file.
+static SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// Start a new PTT session (called on every PttDown) and return its id.
+pub fn next_session() -> u64 {
+    SESSION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Current session id (0 before the first press).
+pub fn current_session() -> u64 {
+    SESSION.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HotkeyPreset {
@@ -41,6 +59,25 @@ pub enum DaemonEvent {
     PttDown,
     PttUp,
     Cancel,
+    /// Worker reports that `AudioCapture::start(...)` succeeded.
+    ///
+    /// Carries the pre-duck media truth (probed worker-side, off the event
+    /// loop — R17): the orchestrator fills the frozen session snapshot from
+    /// these fields without blocking on OS queries. Ordering is still the
+    /// core contract (sent immediately after capture start-ok).
+    CaptureStarted {
+        output_device: Option<String>,
+        was_playing: bool,
+    },
+    /// Safety watchdog fired: the recording ran past the max duration
+    /// because PttUp never arrived. The worker force-stopped the mic and is
+    /// transcribing what it captured; the app must leave Recording.
+    Watchdog {
+        duration_ms: u64,
+    },
+    /// Event-tap health problem needing user attention (tap dead after a
+    /// re-enable attempt, permission lost mid-run).
+    TapIssue(String),
     Done {
         text: String,
         duration_ms: u64,
@@ -96,7 +133,7 @@ pub fn register_cancel_hotkey(manager: &GlobalHotKeyManager) -> Result<HotKey, S
 /// Commands from the winit thread to the dictation worker.
 /// The winit thread never blocks: it only `send()`s these and renders
 /// `DaemonEvent::Done/Failed` results.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Control {
     Down,
     Up,
@@ -139,40 +176,42 @@ pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
                 None
             };
             if let Some(out) = out {
+                // Session-tagged so combo-preset cycles are traceable in the
+                // log file the same way tap-preset cycles are.
+                let name = match &out {
+                    DaemonEvent::PttDown => "PttDown",
+                    DaemonEvent::PttUp => "PttUp",
+                    DaemonEvent::Cancel => "Cancel",
+                    _ => "other",
+                };
+                let session = match out {
+                    DaemonEvent::PttDown => next_session(),
+                    _ => current_session(),
+                };
+                tracing::info!("[session={session}] hotkey bridge -> {name}");
                 if proxy.send_event(out).is_err() {
+                    tracing::error!(
+                        "[session={session}] hotkey bridge: event loop gone, {name} lost"
+                    );
                     break;
                 }
             }
         }
+        tracing::warn!("hotkey bridge receiver closed — global hotkey events stop here");
     });
-}
-
-/// Frontmost app name via System Events (osascript subprocess, ~200ms).
-/// None when the query fails or returns empty.
-pub fn focused_app_name() -> Option<String> {
-    let out = std::process::Command::new("osascript")
-        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
-        .output()
-        .ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 /// Model-switch-failure semantics (via `stt::transcribe_shared`): a failed
 /// new-model load returns Err and keeps the previously loaded model cached,
 /// so the caller only needs to warn and can retry with a fixed path.
 fn pipeline_on_worker(
-    capture: crate::audio::AudioCapture,
+    capture: crate::core::audio::AudioCapture,
     duration_ms: u64,
     proxy: &EventLoopProxy<DaemonEvent>,
 ) {
     let out = capture.stop();
-    let mut vad = crate::vad::Vad::new();
-    let kept = crate::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
+    let mut vad = crate::core::vad::Vad::new();
+    let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
     tracing::info!(
         "captured {} vad-ready samples ({} raw @ {}Hz)",
         kept.len(),
@@ -188,109 +227,63 @@ fn pipeline_on_worker(
         });
         return;
     }
-    let model_path = match ensure_model_for_config() {
-        Ok(p) => p,
+    let cfg = crate::core::config::load_config();
+    let t0 = std::time::Instant::now();
+    // STT via trait (groq→local fallback, same logic).
+    let recognizer = crate::core::traits::RouterRecognizer;
+    let transcript = match recognizer.transcribe(&kept, crate::core::vad::VAD_SAMPLE_RATE, &cfg) {
+        Ok(t) => t,
         Err(e) => {
-            let _ = proxy.send_event(DaemonEvent::Failed(format!("model unavailable: {e}")));
+            let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
             return;
         }
     };
-    // Hoisted ABOVE transcribe: one config read per cycle, reused for the
-    // initial prompt, STT language/provider, and the cleanup context below.
-    let cfg = crate::config::load_config();
-    let prompt = crate::stt::read_prompt();
-    let t0 = std::time::Instant::now();
-    // STT provider branch: "groq" = cloud whisper-large-v3 (OPT-IN), any
-    // other value = local on-device whisper. Cloud failure → tray alert +
-    // local fallback (never lose the transcript to a network error).
-    let text = if cfg.stt_provider == "groq" {
-        match crate::groq_stt::transcribe_cloud(&kept, crate::vad::VAD_SAMPLE_RATE, &cfg) {
-            Ok(t) => {
-                tracing::info!("cloud stt (whisper-large-v3) done");
-                t
-            }
-            Err(e) => {
-                let _ = proxy.send_event(DaemonEvent::CleanupIssue(format!(
-                    "Groq STT failed: {e} — using local whisper"
-                )));
-                match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language)
-                {
-                    Ok(t) => t,
-                    Err(e2) => {
-                        let _ = proxy
-                            .send_event(DaemonEvent::Failed(format!("transcribe failed: {e2}")));
-                        return;
-                    }
-                }
-            }
-        }
-    } else {
-        match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
-                return;
-            }
-        }
-    };
+    // Surface provider warnings as tray alerts (exact pre-task message text).
+    for warning in &transcript.warnings {
+        let _ = proxy.send_event(DaemonEvent::CleanupIssue(warning.clone()));
+    }
+    let text = transcript.text;
     let ms = t0.elapsed().as_millis();
-    let kept_ms = kept.len() as f64 / crate::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
+    let kept_ms = kept.len() as f64 / crate::core::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
-    // Fast routing: deterministic-clean transcripts inject immediately (no
-    // context call, no provider calls, no issues). Complex ones take the
-    // existing LLM chain below (Groq → OpenRouter → Ollama local, $0).
-    // Issues (rate limits, missing model) surface as tray alerts.
-    let route = crate::analyze::decide_route(&text, &cfg);
-    let route_name = match &route {
-        crate::analyze::CleanupRoute::Direct(_) => "deterministic",
-        crate::analyze::CleanupRoute::Llm(_) => "llm",
-    };
-    tracing::info!(
-        "cleanup route={route_name} reason={} score={}",
-        crate::analyze::route_reason(&cfg, &route),
-        crate::analyze::route_score(&route),
-    );
-    let (cleaned, issues) = match route {
-        crate::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
-        crate::analyze::CleanupRoute::Llm(a) => {
-            // Context synthesis runs first (focused app → 2-sentence hint);
-            // a context failure yields "" and the chain proceeds without.
-            // Gated deterministically: transcript must carry context-valuable
-            // content AND the app must be context-sensitive — otherwise both
-            // the ~200ms osascript query and the model call are skipped.
-            // Cheap transcript check first (skips the ~200ms osascript query
-            // when context could never pay off), then the full gate.
-            let key_present = crate::cleanup::groq_key().is_some();
-            let ctx =
-                if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
-                    let app = focused_app_name();
-                    if crate::analyze::context_allowed(
-                        app.as_deref(),
-                        &a,
-                        cfg.cleanup_enabled,
-                        cfg.context_enabled,
-                        key_present,
-                    ) {
-                        crate::cleanup::synthesize_context(app.as_deref(), &cfg)
-                    } else {
-                        String::new()
-                    }
+    // Cleanup via trait (route decision + context gate + chain).
+    let cleanup_provider = crate::core::traits::ChainProvider;
+    let context_provider = crate::platform::macos::context::OsascriptContext;
+    // Context gate: transcript must carry value AND app must be
+    // context-sensitive — otherwise the ~200ms osascript query and the
+    // model call are skipped.
+    let route = crate::core::analyze::decide_route(&text, &cfg);
+    let ctx = match &route {
+        crate::core::analyze::CleanupRoute::Llm(a) => {
+            let key_present = crate::core::cleanup::groq_key().is_some();
+            if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
+                let app = context_provider.focused_app();
+                if crate::core::analyze::context_allowed(
+                    app.as_deref(),
+                    a,
+                    cfg.cleanup_enabled,
+                    cfg.context_enabled,
+                    key_present,
+                ) {
+                    crate::core::cleanup::synthesize_context(app.as_deref(), &cfg)
                 } else {
                     String::new()
-                };
-            let input = crate::cleanup::format_cleanup_input(
-                if ctx.is_empty() { None } else { Some(&ctx) },
-                &text,
-            );
-            let outcome = crate::cleanup::clean_chain(&input, &cfg);
-            (outcome.text, outcome.issues)
+                }
+            } else {
+                String::new()
+            }
         }
+        _ => String::new(),
     };
+    let outcome =
+        cleanup_provider.clean(&text, if ctx.is_empty() { None } else { Some(&ctx) }, &cfg);
+    let cleaned = outcome.text;
+    let issues = outcome.issues;
     for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
-    if crate::cleanup::is_filler_result(&cleaned) {
+    if crate::core::cleanup::is_filler_result(&cleaned) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
         let _ = proxy.send_event(DaemonEvent::Done {
@@ -310,7 +303,7 @@ fn pipeline_on_worker(
         return;
     }
     // History BEFORE inject: a paste failure must not lose the transcript.
-    if let Err(e) = crate::history::push_history(crate::history::HistoryEntry {
+    if let Err(e) = crate::core::history::push_history(crate::core::history::HistoryEntry {
         text: text.clone(),
         at_ms: now_ms(),
         duration_ms,
@@ -328,85 +321,375 @@ fn pipeline_on_worker(
     });
 }
 
-/// Model variant follows the live menu config (read per cycle, never cached):
-/// SmallEn downloads small.en on first use, BaseEn uses base.en.
-fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
-    match crate::config::load_config().model {
-        crate::config::ModelChoice::TinyEn => crate::stt::ensure_model_variant("tiny"),
-        crate::config::ModelChoice::SmallEn => crate::stt::ensure_model_variant("small"),
-        crate::config::ModelChoice::BaseEn => crate::stt::ensure_model_variant("base"),
+trait DaemonEventSender {
+    fn send_event(&self, event: DaemonEvent) -> Result<(), ()>;
+}
+
+impl DaemonEventSender for EventLoopProxy<DaemonEvent> {
+    fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+        self.send_event(event).map_err(|_| ())
     }
 }
-/// Worker entry: owns `PushToTalk` + the live `AudioCapture`, so every
-/// `Duration`-blocking call (device open, capture stop, model download,
-/// transcribe, inject) runs here, never on the winit thread.
-pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Control>) {
-    let mut ptt = PushToTalk::new(300, 60_000);
-    let mut capture: Option<crate::audio::AudioCapture> = None;
-    for ctl in rx {
-        match ctl {
-            Control::Down => match ptt.on_key_down(now_ms()) {
-                PttEvent::Started => {
-                    // Menu-selected mic, re-read per hold (never cached).
-                    let mic = crate::config::load_config().mic_name;
-                    match crate::audio::AudioCapture::start(mic) {
-                        Ok(cap) => capture = Some(cap),
-                        Err(e) => {
-                            tracing::warn!("capture failed: {e}");
-                            capture = None;
-                            let _ = proxy
-                                .send_event(DaemonEvent::Failed(format!("capture failed: {e}")));
-                        }
+
+fn worker_on_control_down<S: DaemonEventSender>(
+    sender: &S,
+    ptt: &mut PushToTalk,
+    capture: &mut Option<crate::core::audio::AudioCapture>,
+    capture_start: &mut Option<Instant>,
+    duck: &crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
+) {
+    let now = now_ms();
+    match ptt.on_key_down(now) {
+        PttEvent::Started => {
+            // Menu-selected mic + duck toggle, re-read per hold.
+            let live = crate::core::config::load_config();
+            duck.set_enabled(live.duck_audio);
+            let mic = live.mic_name;
+            match crate::core::audio::AudioCapture::start(mic) {
+                Ok(cap) => {
+                    *capture = Some(cap);
+                    *capture_start = Some(Instant::now());
+                    tracing::info!("[session={}] capture started — mic open", current_session());
+                    // Close any previous hold first (a retap while its
+                    // Done is still queued), then duck fresh.
+                    duck.restore();
+                    duck.duck();
+
+                    // Pre-duck media truth for the session snapshot, probed
+                    // here on the worker (never on the event loop — R17).
+                    // Cost when nothing plays: one CoreAudio query + two
+                    // pgrep calls (~ms). Duck state is unaffected by probing.
+                    let probe_device = duck.current_device().map(|d| d.to_string());
+                    let probe_playing = duck.any_playing();
+
+                    // Emit before any transcription begins.
+                    if sender
+                        .send_event(DaemonEvent::CaptureStarted {
+                            output_device: probe_device,
+                            was_playing: probe_playing,
+                        })
+                        .is_err()
+                    {
+                        tracing::error!(
+                            "[session={}] capture-start notice lost — dropping capture",
+                            current_session()
+                        );
+                        // Mirror capture-failure semantics: clear hold
+                        // bookkeeping so the NEXT press is a fresh cycle.
+                        let _ = ptt.on_cancel();
+                        *capture = None;
+                        *capture_start = None;
                     }
                 }
-                e => tracing::debug!("ptt down ignored: {e:?}"),
-            },
-            Control::Up => match ptt.on_key_up(now_ms()) {
-                PttEvent::Transcribe { duration_ms } => match capture.take() {
-                    Some(cap) => pipeline_on_worker(cap, duration_ms, &proxy),
-                    None => {
-                        let _ = proxy
-                            .send_event(DaemonEvent::Failed("no capture for transcribe".into()));
+                Err(e) => {
+                    tracing::warn!(
+                        "[session={}] capture failed: {e} — recording cannot start",
+                        current_session()
+                    );
+                    *capture = None;
+                    *capture_start = None;
+                    // Failed leaves the app's Recording phase and
+                    // this clears the hold bookkeeping, so the
+                    // NEXT press is a fresh cycle (not dead).
+                    let _ = ptt.on_cancel();
+                    if sender
+                        .send_event(DaemonEvent::Failed(format!("capture failed: {e}")))
+                        .is_err()
+                    {
+                        tracing::error!(
+                            "[session={}] capture-failure notice lost",
+                            current_session()
+                        );
                     }
-                },
-                // <300ms discards never touch the model: drop audio, reset tray.
-                PttEvent::DiscardedShort { duration_ms } => {
-                    capture = None;
-                    tracing::info!("discarded short hold ({duration_ms}ms)");
-                    let _ = proxy.send_event(DaemonEvent::Done {
-                        text: String::new(),
-                        duration_ms,
-                        rtf: 0.0,
-                    });
                 }
-                e => {
-                    capture = None;
-                    tracing::debug!("ptt up ignored: {e:?}");
-                    // Reset the tray: the winit side optimistically shows
-                    // Transcribing on every PttUp, so a stray release (no
-                    // prior press) must still resolve, never stick.
-                    let _ = proxy.send_event(DaemonEvent::Done {
-                        text: String::new(),
-                        duration_ms: 0,
-                        rtf: 0.0,
-                    });
-                }
-            },
-            Control::Cancel => match ptt.on_cancel() {
-                PttEvent::Cancelled => {
-                    capture = None;
-                    tracing::info!("dictation cancelled (Esc)");
-                    let _ = proxy.send_event(DaemonEvent::Failed("cancelled (Esc)".into()));
-                }
-                e => tracing::debug!("cancel ignored: {e:?}"),
-            },
+            }
+        }
+        e => tracing::debug!("ptt down ignored: {e:?}"),
+    }
+}
+
+/// Safety watchdog (PRD §6): the mic is open but the PttUp that should
+/// have stopped it never arrived. Force-stop the capture (mic dies here),
+/// warn loudly, transcribe what was captured, and tell the app so the
+/// tray leaves Recording. This is a SAFETY NET — a watchdog fire always
+/// means the PttUp path broke somewhere above, and the WARN line says so.
+fn watchdog(
+    ptt: &mut PushToTalk,
+    capture: &mut Option<crate::core::audio::AudioCapture>,
+    capture_start: &mut Option<Instant>,
+    proxy: &EventLoopProxy<DaemonEvent>,
+    max_ms: u64,
+    duck: &crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
+) {
+    let duration_ms = capture_start
+        .map(|s| s.elapsed().as_millis() as u64)
+        .unwrap_or(max_ms)
+        .min(max_ms);
+    *capture_start = None;
+    // Clear the hold bookkeeping: the key-up will never be processed for
+    // this cycle (and a late one is dropped by app-side admission anyway).
+    let _ = ptt.on_cancel();
+    // Restore audio before force-transcribing (same guarantee as normal exits).
+    duck.restore();
+    tracing::warn!(
+        "[session={}] WATCHDOG: PttUp LOST — force-stopping recording after {duration_ms}ms (mic would have stayed open forever)",
+        current_session()
+    );
+    match capture.take() {
+        Some(cap) => {
+            if proxy
+                .send_event(DaemonEvent::Watchdog { duration_ms })
+                .is_err()
+            {
+                tracing::error!(
+                    "[session={}] watchdog notice lost (event loop gone)",
+                    current_session()
+                );
+            }
+            pipeline_on_worker(cap, duration_ms, proxy);
+        }
+        None => {
+            tracing::warn!(
+                "[session={}] watchdog fired with no live capture — nothing to stop",
+                current_session()
+            );
         }
     }
 }
 
+/// Worker entry: owns `PushToTalk` + the live `AudioCapture`, so every
+/// `Duration`-blocking call (device open, capture stop, model download,
+/// transcribe, inject) runs here, never on the winit thread.
+///
+/// While the mic is open the receive is armed with the watchdog deadline
+/// (`WIFLOW_MAX_RECORDING_MS`, default 60s per PRD §6), so a lost PttUp
+/// can never leave the microphone running indefinitely.
+pub fn worker_main(
+    proxy: EventLoopProxy<DaemonEvent>,
+    rx: mpsc::Receiver<Control>,
+    duck: crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
+) {
+    let mut ptt = PushToTalk::new(300, 60_000);
+    let mut capture: Option<crate::core::audio::AudioCapture> = None;
+    let mut capture_start: Option<Instant> = None;
+    let max_ms: u64 = std::env::var("WIFLOW_MAX_RECORDING_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+    tracing::info!(
+        "[session={}] worker started (recording watchdog max {max_ms}ms)",
+        current_session()
+    );
+    loop {
+        // Mic closed → block normally. Mic open → block only until the
+        // watchdog deadline; on expiry the watchdog fires instead.
+        let ctl = match capture_start {
+            Some(start) => {
+                let deadline = start + Duration::from_millis(max_ms);
+                let now = Instant::now();
+                if now >= deadline {
+                    watchdog(
+                        &mut ptt,
+                        &mut capture,
+                        &mut capture_start,
+                        &proxy,
+                        max_ms,
+                        &duck,
+                    );
+                    continue;
+                }
+                match rx.recv_timeout(deadline - now) {
+                    Ok(c) => c,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        watchdog(
+                            &mut ptt,
+                            &mut capture,
+                            &mut capture_start,
+                            &proxy,
+                            max_ms,
+                            &duck,
+                        );
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match rx.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            },
+        };
+        match ctl {
+            Control::Down => {
+                tracing::info!("[session={}] worker Control::Down", current_session());
+                worker_on_control_down(&proxy, &mut ptt, &mut capture, &mut capture_start, &duck);
+            }
+            Control::Up => {
+                tracing::info!("[session={}] worker Control::Up", current_session());
+                match ptt.on_key_up(now_ms()) {
+                    PttEvent::Transcribe { duration_ms } => {
+                        capture_start = None;
+                        match capture.take() {
+                            Some(cap) => {
+                                tracing::info!(
+                                    "[session={}] capture stop requested ({duration_ms}ms hold)",
+                                    current_session()
+                                );
+                                // Restore happens on the MAIN thread after injection
+                                // completes — duck stays through transcription so
+                                // speech + processing stay clean.
+                                pipeline_on_worker(cap, duration_ms, &proxy);
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "[session={}] no live capture to stop for this Up",
+                                    current_session()
+                                );
+                                if proxy
+                                    .send_event(DaemonEvent::Failed(
+                                        "no capture for transcribe".into(),
+                                    ))
+                                    .is_err()
+                                {
+                                    tracing::error!(
+                                        "[session={}] failure notice lost",
+                                        current_session()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // <300ms discards never touch the model: drop audio, reset tray.
+                    PttEvent::DiscardedShort { duration_ms } => {
+                        capture = None;
+                        capture_start = None;
+                        duck.restore();
+                        tracing::info!(
+                            "[session={}] discarded short hold ({duration_ms}ms)",
+                            current_session()
+                        );
+                        if proxy
+                            .send_event(DaemonEvent::Done {
+                                text: String::new(),
+                                duration_ms,
+                                rtf: 0.0,
+                            })
+                            .is_err()
+                        {
+                            tracing::error!("[session={}] discard notice lost", current_session());
+                        }
+                    }
+                    e => {
+                        // App-side admission (PttMachine) already drops stray
+                        // releases before they reach here; this only logs if
+                        // one slips through. NEVER fake a Done from here —
+                        // that masked the very lost-PttUp bug we're hunting.
+                        tracing::warn!(
+                            "[session={}] worker Control::Up ignored: {e:?}",
+                            current_session()
+                        );
+                    }
+                }
+            }
+            Control::Cancel => {
+                tracing::info!("[session={}] worker Control::Cancel", current_session());
+                match ptt.on_cancel() {
+                    PttEvent::Cancelled => {
+                        capture = None;
+                        capture_start = None;
+                        duck.restore();
+                        tracing::info!(
+                            "[session={}] dictation cancelled (Esc) — mic released",
+                            current_session()
+                        );
+                        if proxy
+                            .send_event(DaemonEvent::Failed("cancelled (Esc)".into()))
+                            .is_err()
+                        {
+                            tracing::error!("[session={}] cancel notice lost", current_session());
+                        }
+                    }
+                    e => tracing::debug!("cancel ignored: {e:?}"),
+                }
+            }
+        }
+    }
+    tracing::warn!(
+        "[session={}] worker control channel closed — worker exiting",
+        current_session()
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_capture_started_not_emitted_on_capture_failure() {
+        // CI runs without a real mic; still, make the failure deterministic
+        // by pointing the config at a known-missing device.
+        let home = std::env::temp_dir().join(format!(
+            "wiflow-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::env::set_var("HOME", &home);
+
+        let support_dir = crate::core::config::app_support_dir();
+        std::fs::create_dir_all(&support_dir).unwrap();
+        std::fs::write(
+            support_dir.join("config.json"),
+            r#"{"mic_name":"no-such-device-xyz"}"#,
+        )
+        .unwrap();
+
+        let cfg = crate::core::config::load_config();
+        assert_eq!(cfg.mic_name.as_deref(), Some("no-such-device-xyz"));
+
+        struct FakeSender {
+            failed_msg: std::sync::Mutex<Option<String>>,
+            capture_started_seen: std::sync::Mutex<bool>,
+        }
+
+        impl DaemonEventSender for FakeSender {
+            fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+                match event {
+                    DaemonEvent::Failed(msg) => {
+                        *self.failed_msg.lock().unwrap() = Some(msg);
+                    }
+                    DaemonEvent::CaptureStarted { .. } => {
+                        *self.capture_started_seen.lock().unwrap() = true;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+
+        let sender = FakeSender {
+            failed_msg: Default::default(),
+            capture_started_seen: Default::default(),
+        };
+
+        let mut ptt = PushToTalk::new(300, 60_000);
+        let mut capture: Option<crate::core::audio::AudioCapture> = None;
+        let mut capture_start: Option<Instant> = None;
+        let duck = crate::platform::macos::duck::AudioDuck::new(
+            crate::platform::macos::duck::OsBackend,
+            false, // duck_audio is false in the test config; irrelevant for this test
+            crate::platform::macos::duck::PAUSE_DELAY,
+        );
+        worker_on_control_down(&sender, &mut ptt, &mut capture, &mut capture_start, &duck);
+
+        let failed = sender.failed_msg.lock().unwrap().clone();
+        let started = *sender.capture_started_seen.lock().unwrap();
+        assert!(failed.is_some());
+        let msg = failed.unwrap();
+        assert!(msg.starts_with("capture failed:"), "{msg}");
+        assert!(!started);
+    }
 
     #[test]
     fn test_presets_are_distinct_ids() {

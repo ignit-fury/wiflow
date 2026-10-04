@@ -1,4 +1,4 @@
-use crate::audio::rms;
+use crate::core::audio::rms;
 use webrtc_vad::{SampleRate, Vad as WebrtcVad, VadMode};
 
 pub const VAD_SAMPLE_RATE: u32 = 16_000;

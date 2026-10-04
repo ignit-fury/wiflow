@@ -1,3 +1,9 @@
+pub mod headless;
+pub mod orchestrator;
+pub mod session;
+
+pub use orchestrator::{Action, Orchestrator};
+
 use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::{
@@ -6,9 +12,26 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::config::{Config, ModelChoice};
-use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
-use crate::history::HistoryEntry;
+use crate::core::config::{Config, ModelChoice};
+use crate::core::history::HistoryEntry;
+use crate::core::traits::TextInjector;
+use crate::daemon::{
+    current_session, preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset,
+};
+
+fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
+    match ev {
+        DaemonEvent::PttDown => "PttDown",
+        DaemonEvent::PttUp => "PttUp",
+        DaemonEvent::Cancel => "Cancel",
+        DaemonEvent::CaptureStarted { .. } => "CaptureStarted",
+        DaemonEvent::Watchdog { .. } => "Watchdog",
+        DaemonEvent::TapIssue { .. } => "TapIssue",
+        DaemonEvent::Done { .. } => "Done",
+        DaemonEvent::Failed { .. } => "Failed",
+        DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -67,6 +90,38 @@ pub fn make_icon(state: AppState) -> Icon {
     Icon::from_rgba(icon_rgba(state), 32, 32).expect("generated icon is valid RGBA")
 }
 
+/// Transcribing spinner frames: the state dot stays Transcribing-blue while
+/// a satellite dot orbits (4 positions, one per 250 ms tick). `tick` usually
+/// comes from `about_to_wait`'s animation driver; any wraparound works
+/// (`wrapping` arithmetic — frame N matches frame N mod 4).
+pub fn spinner_rgba(tick: u64) -> Vec<u8> {
+    // Satellite centers for the 4 frames: E, S, W, N at radius 11.
+    const SAT: [(i32, i32); 4] = [(27, 16), (16, 27), (5, 16), (16, 5)];
+    let (sx, sy) = SAT[(tick % 4) as usize];
+    let mut px = Vec::with_capacity(32 * 32 * 4);
+    for y in 0..32i32 {
+        for x in 0..32i32 {
+            let dx = x - 16;
+            let dy = y - 16;
+            let sdx = x - sx;
+            let sdy = y - sy;
+            let (r, g, b) = if dx * dx + dy * dy <= 49 {
+                (60, 180, 255)
+            } else if sdx * sdx + sdy * sdy <= 4 {
+                (240, 240, 240)
+            } else {
+                (24, 24, 24)
+            };
+            px.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    px
+}
+
+pub fn spinner_frame(tick: u64) -> Icon {
+    Icon::from_rgba(spinner_rgba(tick), 32, 32).expect("generated spinner is valid RGBA")
+}
+
 #[derive(Debug, Clone)]
 pub struct MenuIds {
     status: MenuId,
@@ -84,6 +139,7 @@ pub struct MenuIds {
     edit_vocab: MenuId,
     cleanup_toggle: MenuId,
     ctx_toggle: MenuId,
+    duck_toggle: MenuId,
     prov_auto: MenuId,
     prov_groq: MenuId,
     prov_openrouter: MenuId,
@@ -96,6 +152,8 @@ pub struct MenuIds {
     key_or_clear: MenuId,
     ollama_models: Vec<(String, MenuId)>,
     ollama_refresh: MenuId,
+    show_logs: MenuId,
+    settings_window: MenuId,
     quit: MenuId,
 }
 
@@ -130,6 +188,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
         edit_vocab: MenuId::new("wiflow:edit:vocab"),
         cleanup_toggle: MenuId::new("wiflow:cleanup:toggle"),
         ctx_toggle: MenuId::new("wiflow:ctx:toggle"),
+        duck_toggle: MenuId::new("wiflow:duck:toggle"),
         prov_auto: MenuId::new("wiflow:prov:auto"),
         prov_groq: MenuId::new("wiflow:prov:groq"),
         prov_openrouter: MenuId::new("wiflow:prov:openrouter"),
@@ -146,6 +205,8 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
             .map(|(i, m)| (m.clone(), MenuId::new(format!("wiflow:ollama:{i}"))))
             .collect(),
         ollama_refresh: MenuId::new("wiflow:ollama:refresh"),
+        show_logs: MenuId::new("wiflow:show:logs"),
+        settings_window: MenuId::new("wiflow:settings:open"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -272,6 +333,16 @@ pub fn build_menu(
         None,
     );
 
+    // Audio prioritization: duck competing output + pause scriptable players
+    // while the mic is hot, restored exactly afterwards.
+    let duck_toggle = CheckMenuItem::with_id(
+        ids.duck_toggle.clone(),
+        "Duck Audio While Dictating",
+        true,
+        config.duck_audio,
+        None,
+    );
+
     // Cleanup provider: auto chain or a single provider (Ollama fallback on
     // quota errors only). Empty config value counts as auto.
     let cp = if config.cleanup_provider.is_empty() {
@@ -320,7 +391,7 @@ pub fn build_menu(
     );
     let stt_groq = CheckMenuItem::with_id(
         ids.stt_groq.clone(),
-        "Transcription: Groq cloud (whisper-large-v3)",
+        "Transcription: Groq cloud (whisper-large-v3-turbo)",
         true,
         config.stt_provider == "groq",
         None,
@@ -333,8 +404,8 @@ pub fn build_menu(
     // entry via native secure dialog (tray app has no windows). Model list
     // is the live Ollama inventory passed in by the caller.
     let ai_menu = Submenu::new("AI Keys && Models", true);
-    let groq_set = crate::cleanup::groq_key().is_some();
-    let or_set = crate::cleanup::openrouter_key().is_some();
+    let groq_set = crate::core::cleanup::groq_key().is_some();
+    let or_set = crate::core::cleanup::openrouter_key().is_some();
     let key_groq = MenuItem::with_id(
         ids.key_groq.clone(),
         format!(
@@ -410,6 +481,12 @@ pub fn build_menu(
     // editor — plain text so hand-editing can't corrupt JSON config.
     let edit_vocab = MenuItem::with_id(ids.edit_vocab.clone(), "Edit Vocabulary…", true, None);
 
+    // Lifecycle log (wiflow.log): opens in Console — the diagnosis trail
+    // for PTT issues must be reachable without a terminal.
+    let show_logs = MenuItem::with_id(ids.show_logs.clone(), "Show Logs…", true, None);
+
+    let settings_window = MenuItem::with_id(ids.settings_window.clone(), "Settings…", true, None);
+
     let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
 
     menu.append(&status).expect("menu append");
@@ -421,6 +498,7 @@ pub fn build_menu(
     menu.append(&launch_login).expect("menu append");
     menu.append(&cleanup_toggle).expect("menu append");
     menu.append(&ctx_toggle).expect("menu append");
+    menu.append(&duck_toggle).expect("menu append");
     menu.append(&prov_menu).expect("menu append");
     menu.append(&stt_menu).expect("menu append");
     menu.append(&ai_menu).expect("menu append");
@@ -428,6 +506,8 @@ pub fn build_menu(
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
     menu.append(&edit_vocab).expect("menu append");
+    menu.append(&show_logs).expect("menu append");
+    menu.append(&settings_window).expect("menu append");
     menu.append(&perm_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
@@ -443,12 +523,14 @@ struct DaemonApp {
     // None when the PTT rides the CGEventTap (bare modifier presets).
     hotkey: Option<global_hotkey::hotkey::HotKey>,
     // Live tap handle for bare-modifier presets; Drop stops listening.
-    tap: Option<crate::tap::ModifierTap>,
+    tap: Option<crate::platform::macos::tap::ModifierTap>,
     preset: HotkeyPreset,
     config: Config,
     devices: Vec<String>,
     proxy: EventLoopProxy<DaemonEvent>,
     tx: std::sync::mpsc::Sender<Control>,
+    /// Central lifecycle coordinator — replaces the old inline PttMachine.
+    orchestrator: Orchestrator,
     state: AppState,
     /// Warn override (e.g. inject-fail, cancel): shown instead of the state tooltip.
     note: Option<String>,
@@ -456,6 +538,22 @@ struct DaemonApp {
     applied_tooltip: String,
     menu_ids: MenuIds,
     menu_dirty: bool,
+    /// Live settings window (S4, pure Rust): created on demand from the
+    /// tray menu on the existing event loop; closed via its X button.
+    settings_window: Option<crate::ui::settings::SettingsWindow>,
+    /// Set by the tray "Settings…" item; consumed in `about_to_wait` (which
+    /// has the `ActiveEventLoop` needed to create the window).
+    open_settings_requested: bool,
+    /// Mic-probe result for the settings window's Test-record button:
+    /// written by an App-owned 1 s capture thread, polled per frame (H20:
+    /// the window renders App-owned state, never captures itself).
+    test_record_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    test_record_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Recording pill (S4, pure Rust): observational indicator owned by the
+    /// App shell, driven by ShowPill/HidePill actions (H21/H22).
+    pill: crate::ui::pill::Pill,
+    /// Transcribing spinner position (about_to_wait animation driver).
+    spinner_tick: u64,
 }
 
 impl DaemonApp {
@@ -464,6 +562,20 @@ impl DaemonApp {
         self.note = note;
         // Status item shows the state → menu needs a rebuild.
         self.menu_dirty = true;
+    }
+
+    /// Queue a worker command. A closed channel used to be swallowed by
+    /// `let _ =`, wedging the tray with no trace — now it's a visible error.
+    fn send_control(&mut self, ctl: Control) {
+        if let Err(e) = self.tx.send(ctl) {
+            // SendError carries the undelivered control back (e.0).
+            tracing::error!("worker channel closed, control {:?} dropped", e.0);
+            self.set_state(
+                AppState::Error,
+                Some("dictation worker is not running — restart Wiflow".into()),
+            );
+            self.sync_tray();
+        }
     }
 
     fn current_tooltip(&self) -> String {
@@ -491,10 +603,10 @@ impl DaemonApp {
     }
 
     fn rebuild_menu(&mut self) {
-        let history = crate::history::load_history();
+        let history = crate::core::history::load_history();
         // Live Ollama inventory (≤500ms, empty when down). Only fetched on
         // rebuilds, never per event-loop tick.
-        let models = crate::cleanup::list_ollama_models();
+        let models = crate::core::cleanup::list_ollama_models();
         let (menu, ids) = build_menu(
             &self.config,
             &self.devices,
@@ -508,9 +620,113 @@ impl DaemonApp {
     }
 
     fn save(&mut self) {
-        if let Err(e) = crate::config::save_config(&self.config) {
+        if let Err(e) = crate::core::config::save_config(&self.config) {
             tracing::warn!("save config failed: {e}");
         }
+    }
+
+    /// Launch-at-login behind one path for the tray menu AND the settings
+    /// window intent (H20). On failure the tray note explains; the caller
+    /// that staged the value (settings window) reverts its own copy.
+    fn apply_launch_at_login(&mut self, enable: bool) -> bool {
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
+        match crate::core::config::set_launch_at_login(enable, &exe, true) {
+            Ok(()) => {
+                self.config.launch_at_login = enable;
+                self.save();
+                self.menu_dirty = true;
+                tracing::info!("launch at login: {enable}");
+                true
+            }
+            Err(e) => {
+                self.warn_note(format!("launch-at-login failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Execute one settings-window intent (H20: the window proposes, the
+    /// App disposes — tray menu paths reused wherever they exist).
+    fn execute_settings_intent(&mut self, intent: crate::ui::settings::SettingsIntent) {
+        use crate::ui::settings::SettingsIntent as I;
+        match intent {
+            I::Save(cfg) => {
+                self.config = cfg;
+                self.save();
+                self.menu_dirty = true;
+                tracing::info!("settings saved (apply to the next hold)");
+            }
+            I::SwitchHotkey(want) => self.switch_hotkey(want),
+            I::CopyHistory(text) => match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.set_text(text) {
+                    Ok(()) => tracing::info!("history entry copied"),
+                    Err(e) => self.warn_note(format!("copy failed: {e:?}")),
+                },
+                Err(e) => self.warn_note(format!("clipboard unavailable: {e:?}")),
+            },
+            I::ClearHistory => {
+                let path = crate::core::history::history_path();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        tracing::info!("history file deleted");
+                        if let Some(w) = self.settings_window.as_mut() {
+                            w.clear_history_view();
+                        }
+                    }
+                    Err(e) => self.warn_note(format!("clear history failed: {e}")),
+                }
+            }
+            I::TestRecord => self.run_test_record(),
+            I::SetLaunchAtLogin(enable) => {
+                if !self.apply_launch_at_login(enable) {
+                    // OS refused: revert the window's staged copy so disk,
+                    // OS, and window agree again.
+                    if let Some(w) = self.settings_window.as_mut() {
+                        w.set_launch_at_login(!enable);
+                    }
+                }
+            }
+            I::OpenMicSettings => crate::core::config::permissions::open_mic_settings(),
+            I::OpenAccessibilitySettings => {
+                crate::core::config::permissions::open_accessibility_settings()
+            }
+        }
+    }
+
+    /// 1 s mic probe for the settings window's Test-record button. Runs in
+    /// an App-owned thread (never on the event loop, never in the window);
+    /// the result is polled per frame via `test_record_status` (H20).
+    /// Amplitude only — no audio stored, no STT.
+    fn run_test_record(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.test_record_running.swap(true, Ordering::SeqCst) {
+            return; // A probe is already running.
+        }
+        let out = self.test_record_result.clone();
+        let running = self.test_record_running.clone();
+        let mic = self.config.mic_name.clone();
+        std::thread::spawn(move || {
+            let line = (|| {
+                let cap = crate::core::audio::AudioCapture::start(mic)
+                    .map_err(|e| format!("mic unavailable: {e}"))?;
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let got = cap.stop();
+                let rms = crate::core::audio::rms(&got.samples_mono);
+                Ok::<String, String>(crate::ui::settings::format_test_record_result(
+                    rms,
+                    got.samples_mono.len(),
+                    got.sample_rate,
+                ))
+            })();
+            *out.lock().unwrap() = Some(line.unwrap_or_else(|e| e));
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Latest mic-probe result for the settings window to render (if any).
+    fn test_record_status(&self) -> Option<String> {
+        self.test_record_result.lock().unwrap().clone()
     }
 
     /// Note only when it won't clobber the recording indicator.
@@ -532,7 +748,7 @@ impl DaemonApp {
             if let Some(old) = self.hotkey.take() {
                 let _ = self.hotkey_manager.unregister(old);
             }
-            match crate::tap::spawn(want, self.proxy.clone()) {
+            match crate::platform::macos::tap::spawn(want, self.proxy.clone()) {
                 Ok(t) => {
                     self.tap = Some(t);
                     self.preset = want;
@@ -566,7 +782,7 @@ impl DaemonApp {
                 Err(e) => {
                     // Rollback: restore the old mechanism.
                     if Self::old_is_bare_preset(old_preset) {
-                        match crate::tap::spawn(old_preset, self.proxy.clone()) {
+                        match crate::platform::macos::tap::spawn(old_preset, self.proxy.clone()) {
                             Ok(t) => self.tap = Some(t),
                             Err(e2) => tracing::warn!("tap restore failed: {e2:?}"),
                         }
@@ -627,22 +843,12 @@ impl DaemonApp {
         }
         if *id == ids.launch_login {
             let enable = !self.config.launch_at_login;
-            let exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
-            match crate::config::set_launch_at_login(enable, &exe, true) {
-                Ok(()) => {
-                    self.config.launch_at_login = enable;
-                    self.save();
-                    self.menu_dirty = true;
-                    tracing::info!("launch at login: {enable}");
-                }
-                Err(e) => self.warn_note(format!("launch-at-login failed: {e}")),
-            }
+            self.apply_launch_at_login(enable);
             return;
         }
         if *id == ids.edit_vocab {
             // Ensure prompt.txt exists (empty), then open in default editor.
-            let path = crate::config::prompt_path();
+            let path = crate::core::config::prompt_path();
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -686,6 +892,16 @@ impl DaemonApp {
             );
             return;
         }
+        if *id == ids.duck_toggle {
+            self.config.duck_audio = !self.config.duck_audio;
+            self.save();
+            self.menu_dirty = true;
+            tracing::info!(
+                "audio ducking: {}",
+                if self.config.duck_audio { "on" } else { "off" }
+            );
+            return;
+        }
         if *id == ids.prov_auto {
             self.config.cleanup_provider = "auto".into();
             self.save();
@@ -725,12 +941,12 @@ impl DaemonApp {
             self.config.stt_provider = "groq".into();
             self.save();
             self.menu_dirty = true;
-            tracing::info!("stt provider: groq cloud (whisper-large-v3)");
+            tracing::info!("stt provider: groq cloud (whisper-large-v3-turbo)");
             return;
         }
         if *id == ids.key_groq {
-            match crate::cleanup::prompt_for_key("Wiflow", "Paste your Groq API key:") {
-                Some(v) => match crate::cleanup::save_key("groq_api_key", &v) {
+            match crate::core::cleanup::prompt_for_key("Wiflow", "Paste your Groq API key:") {
+                Some(v) => match crate::core::cleanup::save_key("groq_api_key", &v) {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("groq api key saved");
@@ -742,8 +958,8 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_openrouter {
-            match crate::cleanup::prompt_for_key("Wiflow", "Paste your OpenRouter API key:") {
-                Some(v) => match crate::cleanup::save_key("openrouter_api_key", &v) {
+            match crate::core::cleanup::prompt_for_key("Wiflow", "Paste your OpenRouter API key:") {
+                Some(v) => match crate::core::cleanup::save_key("openrouter_api_key", &v) {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("openrouter api key saved");
@@ -755,7 +971,7 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_groq_clear {
-            match crate::cleanup::clear_key("groq_api_key") {
+            match crate::core::cleanup::clear_key("groq_api_key") {
                 Ok(()) => {
                     self.menu_dirty = true;
                     tracing::info!("groq api key cleared");
@@ -765,7 +981,7 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_or_clear {
-            match crate::cleanup::clear_key("openrouter_api_key") {
+            match crate::core::cleanup::clear_key("openrouter_api_key") {
                 Ok(()) => {
                     self.menu_dirty = true;
                     tracing::info!("openrouter api key cleared");
@@ -786,17 +1002,39 @@ impl DaemonApp {
             tracing::info!("ollama cleanup model: {name} (takes effect next hold)");
             return;
         }
+        if *id == ids.settings_window {
+            // Created in about_to_wait (needs the ActiveEventLoop).
+            self.open_settings_requested = true;
+            return;
+        }
+        if *id == ids.show_logs {
+            let path = crate::logfile::log_path();
+            let opened = std::process::Command::new("open")
+                .args(["-a", "Console"])
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if opened {
+                tracing::info!("log opened in Console ({})", path.display());
+            } else if open::that(&path).is_err() {
+                self.warn_note(format!("cannot open log file ({})", path.display()));
+            }
+            return;
+        }
         if *id == ids.perm_mic {
-            crate::config::permissions::open_mic_settings();
+            crate::core::config::permissions::open_mic_settings();
             return;
         }
         if *id == ids.perm_a11y {
-            crate::config::permissions::open_accessibility_settings();
+            crate::core::config::permissions::open_accessibility_settings();
             return;
         }
         if *id == ids.quit {
             tracing::info!("quit via menu");
-            crate::stt::shutdown();
+            // Orchestrator cleanup before worker teardown.
+            let _ = self.orchestrator.handle_shutdown();
+            crate::core::stt::shutdown();
             std::process::exit(0);
         }
         if let Some((dev, _)) = ids.mic_items.iter().find(|(_, mid)| mid == id) {
@@ -807,7 +1045,7 @@ impl DaemonApp {
             return;
         }
         if let Some((text, _)) = ids.history_items.iter().find(|(_, hid)| hid == id) {
-            crate::inject::leave_on_clipboard(text);
+            crate::platform::macos::inject::leave_on_clipboard(text);
             self.note = Some("history copied to clipboard".to_string());
             tracing::info!("history entry copied to clipboard");
             return;
@@ -822,10 +1060,52 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        _event: winit::event::WindowEvent,
+        window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
     ) {
-        // Tray-only app: no windows exist.
+        // The process owns at most two winit Windows (settings + pill).
+        // Unknown ids are ignored defensively. Borrows are statement-local
+        // (NLL): each `as_mut` ends before App methods run.
+        if self
+            .settings_window
+            .as_ref()
+            .is_some_and(|w| w.window_id() == window_id)
+        {
+            let intents = self
+                .settings_window
+                .as_mut()
+                .map(|w| w.handle_event(&event))
+                .unwrap_or_default();
+            for intent in intents {
+                self.execute_settings_intent(intent);
+            }
+            if matches!(event, winit::event::WindowEvent::RedrawRequested) {
+                let status = self.test_record_status();
+                let intents = self
+                    .settings_window
+                    .as_mut()
+                    .map(|w| w.paint(status.as_deref()))
+                    .unwrap_or_default();
+                for intent in intents {
+                    self.execute_settings_intent(intent);
+                }
+            }
+            let closed = self
+                .settings_window
+                .as_ref()
+                .map(|w| w.close_requested())
+                .unwrap_or(false);
+            if closed {
+                self.settings_window = None;
+                tracing::info!("settings window closed");
+            }
+            return;
+        }
+        if self.pill.window_id() == Some(window_id)
+            && matches!(event, winit::event::WindowEvent::RedrawRequested)
+        {
+            self.pill.frame();
+        }
     }
 
     fn device_event(
@@ -839,83 +1119,176 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             if key.state == ElementState::Pressed
                 && matches!(key.physical_key, PhysicalKey::Code(KeyCode::Escape))
             {
-                let _ = self.proxy.send_event(DaemonEvent::Cancel);
+                if let Err(e) = self.proxy.send_event(DaemonEvent::Cancel) {
+                    tracing::warn!("Esc: event loop closed, cancel lost: {e:?}");
+                }
             }
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
-        match event {
-            DaemonEvent::PttDown => {
-                self.set_state(AppState::Recording, None);
-                self.sync_tray();
-                let _ = self.tx.send(Control::Down);
-            }
-            DaemonEvent::PttUp => {
-                self.set_state(AppState::Transcribing, None);
-                self.sync_tray();
-                let _ = self.tx.send(Control::Up);
-            }
-            DaemonEvent::Cancel => {
-                let _ = self.tx.send(Control::Cancel);
-            }
-            DaemonEvent::Done {
-                text,
-                duration_ms,
-                rtf,
-            } => {
-                if text.is_empty() {
-                    tracing::debug!("cycle done, no text (discard/silence)");
-                } else {
-                    tracing::info!("dictated {duration_ms}ms (RTF {rtf:.2}): {text:?}");
-                    // Main-thread-only: enigo HIToolbox TIS calls trap off-main
-                    // (crash report 2026-09-30). The 200ms restore sleep inside
-                    // inject_text briefly blocks this thread — accepted for v1.
-                    match crate::inject::inject_text(&text) {
-                        Ok(r) => tracing::info!(
-                            "injected via {} (clipboard restored: {})",
-                            r.pasted_via,
-                            r.clipboard_restored
-                        ),
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DaemonEvent) {
+        let before = self.orchestrator.phase();
+        let actions = self.orchestrator.handle(&event);
+        if actions.is_empty() {
+            // Empty actions ≠ rejected: pure-transition events (e.g. the
+            // first CaptureStarted) apply a phase change with no side
+            // effects. Only an unchanged phase means the machine ignored it.
+            let after = self.orchestrator.phase();
+            tracing::info!(
+                "[session={}] {} produced no actions (phase {:?} -> {:?}){}",
+                current_session(),
+                daemon_event_variant_name(&event),
+                before,
+                after,
+                if before == after { " — ignored" } else { "" }
+            );
+        }
+        for action in actions {
+            match action {
+                Action::SendControl(ctl) => self.send_control(ctl),
+                Action::SetTray(state, note) => {
+                    self.set_state(state, note);
+                    self.sync_tray();
+                }
+                Action::Notify(msg) => self.warn_note(msg),
+                Action::ShowPill => self.pill.show(event_loop),
+                Action::HidePill => self.pill.hide(),
+                Action::Inject(text) => {
+                    let injector = crate::platform::macos::inject::SystemInjector;
+                    let result = match injector.inject(&text) {
+                        Ok(r) => {
+                            tracing::info!(
+                                "injected via {} (clipboard restored: {})",
+                                r.pasted_via,
+                                r.clipboard_restored
+                            );
+                            Ok(r)
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
-                            crate::inject::leave_on_clipboard(&text);
-                            self.set_state(
-                                AppState::Error,
-                                Some(format!("injected to clipboard: {e}")),
-                            );
-                            self.sync_tray();
-                            return;
+                            injector.leave_on_clipboard(&text);
+                            // No early return: the result flows into
+                            // finish_inject below (INJECTING → RESTORING →
+                            // finalize → ERROR). Returning here used to wedge
+                            // the machine in INJECTING (next press ignored).
+                            Err(e)
+                        }
+                    };
+                    // Feed inject result back to the orchestrator, which drives
+                    // the machine through RESTORING → finalize (restoring
+                    // media) and returns the appropriate tray action.
+                    // NOTE: finalize always appends HidePill — handle it
+                    // (never unreachable!: a panic here kills the event
+                    // loop, as a live run proved).
+                    for fi_action in self.orchestrator.finish_inject(result) {
+                        match fi_action {
+                            Action::SetTray(state, note) => {
+                                self.set_state(state, note);
+                                self.sync_tray();
+                            }
+                            Action::Notify(msg) => self.warn_note(msg),
+                            Action::HidePill => self.pill.hide(),
+                            Action::SendControl(_) | Action::Inject(_) | Action::ShowPill => {
+                                unreachable!("finish_inject only emits SetTray/Notify/HidePill")
+                            }
                         }
                     }
+                    // Injection completed: the orchestrator's finalize (via
+                    // finish_inject above) already restored media.
                 }
-                self.set_state(AppState::Idle, None);
-                self.sync_tray();
+            }
+        }
+        // Native notifications, best-effort (H23): failures fall back to the
+        // tray note the handlers above already set — the `let _` is load
+        // bearing, never "fix" it into a `?`. CleanupIssue stays tray-only
+        // (a broken provider would banner-spam every cycle).
+        match &event {
+            DaemonEvent::Done { text, .. } if !text.trim().is_empty() => {
+                match crate::ui::notify::notify("wiflow", text) {
+                    Ok(()) => tracing::info!("notification posted (transcript preview)"),
+                    Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+                }
             }
             DaemonEvent::Failed(msg) => {
-                tracing::warn!("dictation failed: {msg}");
-                self.set_state(AppState::Error, Some(msg));
-                self.sync_tray();
+                match crate::ui::notify::notify("wiflow", &format!("Dictation failed: {msg}")) {
+                    Ok(()) => tracing::info!("notification posted (failure)"),
+                    Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+                }
             }
-            DaemonEvent::CleanupIssue(msg) => {
-                // Alert: rate-limit exhausted / Ollama missing — tray warn-note.
-                tracing::warn!("cleanup issue: {msg}");
-                self.warn_note(msg);
-            }
+            DaemonEvent::TapIssue(msg) => match crate::ui::notify::notify("wiflow", msg) {
+                Ok(()) => tracing::info!("notification posted (tap issue)"),
+                Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+            },
+            _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
             self.handle_menu_event(&ev.id);
+        }
+        // Open the settings window on demand (needs the ActiveEventLoop).
+        if self.open_settings_requested {
+            self.open_settings_requested = false;
+            if self.settings_window.is_none() {
+                let history = crate::core::history::load_history();
+                let mics = crate::core::audio::list_devices();
+                match crate::ui::settings::SettingsWindow::open(event_loop, history, mics) {
+                    Ok(w) => {
+                        self.settings_window = Some(w);
+                        tracing::info!("settings window opened");
+                    }
+                    Err(e) => self.warn_note(format!("settings window failed: {e}")),
+                }
+            }
+        }
+        // Supervision deadline check.
+        for action in self.orchestrator.tick() {
+            match action {
+                Action::SendControl(ctl) => self.send_control(ctl),
+                Action::SetTray(state, note) => {
+                    self.set_state(state, note);
+                    self.sync_tray();
+                }
+                Action::Notify(msg) => self.warn_note(msg),
+                Action::ShowPill => unreachable!("tick never emits ShowPill"),
+                Action::HidePill => self.pill.hide(),
+                Action::Inject(_) => unreachable!("tick never emits Inject"),
+            }
         }
         if self.menu_dirty {
             self.rebuild_menu();
         }
         self.sync_tray();
+        // Transcribing spinner: animate the tray icon on a 250 ms cadence
+        // while the worker transcribes (main thread would otherwise sit
+        // idle with a static icon). Any other state → plain Wait: no wakeups,
+        // no battery cost. State exit repaints the static icon via sync_tray.
+        if self.state == AppState::Transcribing {
+            self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            if let Err(e) = self.tray.set_icon(Some(spinner_frame(self.spinner_tick))) {
+                tracing::warn!("tray spinner failed: {e:?}");
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(250),
+            ));
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        }
     }
+}
+
+/// Actionable note when a PTT hotkey can't be registered (spec §10.3):
+/// names the failed preset + where to pick another. System-wide hotkey
+/// enumeration doesn't exist on macOS, so conflicts are surfaced with
+/// guidance, never faked.
+pub fn hotkey_failure_note(prefer: HotkeyPreset) -> String {
+    format!(
+        "push-to-talk ({}) couldn't be registered — pick another hotkey in the tray menu or Settings window (it takes effect immediately); if all fail, check System Settings → Keyboard for conflicts",
+        crate::daemon::preset_hint(prefer)
+    )
 }
 
 fn app_main(
@@ -923,9 +1296,9 @@ fn app_main(
     proxy: winit::event_loop::EventLoopProxy<DaemonEvent>,
     mut config: Config,
 ) -> ! {
-    let devices = crate::audio::list_devices();
-    let history = crate::history::load_history();
-    let models = crate::cleanup::list_ollama_models();
+    let devices = crate::core::audio::list_devices();
+    let history = crate::core::history::load_history();
+    let models = crate::core::cleanup::list_ollama_models();
     let (menu, ids) = build_menu(
         &config,
         &devices,
@@ -949,10 +1322,22 @@ fn app_main(
         config.hotkey_preset,
         HotkeyPreset::RightOption | HotkeyPreset::Fn
     );
+    // Total registration failure degrades to an Error-state start (never a
+    // silent exit): settings/history stay usable and the tray menu can
+    // switch to a working preset (which re-registers live).
+    let mut startup_note: Option<String> = None;
+    let new_manager_for_degraded_start = || {
+        global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
+            // Without ANY hotkey manager even Esc is impossible — nothing
+            // works, so exiting here is honest (not silent: stderr).
+            eprintln!("hotkey manager: {e:?}");
+            std::process::exit(1);
+        })
+    };
     let (manager, ptt_hotkey, won, tap) = if is_bare {
         // Bare-modifier presets ride a listen-only CGEventTap (raw
         // flagsChanged) — RegisterEventHotKey cannot see them.
-        match crate::tap::spawn(config.hotkey_preset, proxy.clone()) {
+        match crate::platform::macos::tap::spawn(config.hotkey_preset, proxy.clone()) {
             Ok(t) => {
                 let manager = global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
                     eprintln!("hotkey manager: {e:?}");
@@ -962,21 +1347,35 @@ fn app_main(
             }
             Err(e) => {
                 tracing::warn!("modifier tap unavailable ({e}) — falling back to CtrlSpace");
-                let (manager, hk, w) = crate::daemon::register_ptt_hotkey(HotkeyPreset::CtrlSpace)
-                    .unwrap_or_else(|e| {
-                        eprintln!("no push-to-talk hotkey: {e}");
-                        std::process::exit(1);
-                    });
-                (manager, Some(hk), w, None)
+                match crate::daemon::register_ptt_hotkey(HotkeyPreset::CtrlSpace) {
+                    Ok((manager, hk, w)) => (manager, Some(hk), w, None),
+                    Err(e2) => {
+                        tracing::warn!("no push-to-talk hotkey ({e2}) — starting degraded");
+                        startup_note = Some(hotkey_failure_note(HotkeyPreset::CtrlSpace));
+                        (
+                            new_manager_for_degraded_start(),
+                            None,
+                            config.hotkey_preset,
+                            None,
+                        )
+                    }
+                }
             }
         }
     } else {
-        let (manager, hk, w) = crate::daemon::register_ptt_hotkey(config.hotkey_preset)
-            .unwrap_or_else(|e| {
-                eprintln!("no push-to-talk hotkey: {e}");
-                std::process::exit(1);
-            });
-        (manager, Some(hk), w, None)
+        match crate::daemon::register_ptt_hotkey(config.hotkey_preset) {
+            Ok((manager, hk, w)) => (manager, Some(hk), w, None),
+            Err(e) => {
+                tracing::warn!("no push-to-talk hotkey ({e}) — starting degraded");
+                startup_note = Some(hotkey_failure_note(config.hotkey_preset));
+                (
+                    new_manager_for_degraded_start(),
+                    None,
+                    config.hotkey_preset,
+                    None,
+                )
+            }
+        }
     };
     tracing::info!(
         "ptt hotkey registered: {won:?} ({})",
@@ -1002,7 +1401,7 @@ fn app_main(
     };
     // Persist the actual winner so tooltip + next launch agree.
     config.hotkey_preset = won;
-    if let Err(e) = crate::config::save_config(&config) {
+    if let Err(e) = crate::core::config::save_config(&config) {
         tracing::warn!("save config failed: {e}");
     }
     crate::daemon::spawn_hotkey_bridge(proxy.clone(), esc_hotkey.id());
@@ -1018,7 +1417,7 @@ fn app_main(
             if !check_enabled {
                 return;
             }
-            match crate::cleanup::check_ollama_ready(&check_model) {
+            match crate::core::cleanup::check_ollama_ready(&check_model) {
                 Ok(()) => tracing::info!("ollama cleanup ready ({check_model})"),
                 Err(e) => {
                     tracing::warn!("ollama check: {e}");
@@ -1028,9 +1427,18 @@ fn app_main(
         });
     }
 
+    // One shared duck instance: worker ducks at capture-Ok on the same
+    // One shared duck instance: the worker ducks at capture-Ok on the same
+    // Arc state the orchestrator records and restores (Task 12 wiring).
+    let media = crate::platform::macos::media::CoreAudioDuck::new(
+        crate::platform::macos::duck::OsBackend,
+        config.duck_audio,
+        crate::platform::macos::duck::PAUSE_DELAY,
+    );
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();
-    std::thread::spawn(move || crate::daemon::worker_main(worker_proxy, rx));
+    let worker_duck = media.shared_inner();
+    std::thread::spawn(move || crate::daemon::worker_main(worker_proxy, rx, worker_duck));
 
     let mut app = DaemonApp {
         tray,
@@ -1042,13 +1450,31 @@ fn app_main(
         devices,
         proxy,
         tx,
+        orchestrator: Orchestrator::new(
+            crate::core::traits::RouterRecognizer,
+            crate::core::traits::ChainProvider,
+            crate::platform::macos::inject::SystemInjector,
+            crate::platform::macos::context::OsascriptContext,
+            media,
+        ),
         state: AppState::Idle,
         note: None,
         applied_state: AppState::Idle,
         applied_tooltip: AppState::Idle.tooltip(won),
         menu_ids: ids,
         menu_dirty: false,
+        settings_window: None,
+        open_settings_requested: false,
+        test_record_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        test_record_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pill: crate::ui::pill::Pill::new(),
+        spinner_tick: 0,
     };
+    if let Some(note) = startup_note {
+        // Degraded start: no PTT hotkey. Error state + actionable note
+        // instead of exit(1); the tray menu can still switch presets.
+        app.set_state(AppState::Error, Some(note));
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
         std::process::exit(1);
@@ -1075,6 +1501,27 @@ mod tests {
         assert!(AppState::Recording.tooltip(p).contains("recording"));
         assert!(AppState::Transcribing.tooltip(p).contains("transcribing"));
         assert!(AppState::Error.tooltip(p).contains("error"));
+    }
+
+    #[test]
+    fn hotkey_failure_note_names_preset_and_next_action() {
+        // Registration failure must surface an ACTIONABLE note, never a
+        // silent exit: which preset failed + what to do about it.
+        for preset in [
+            HotkeyPreset::RightOption,
+            HotkeyPreset::Fn,
+            HotkeyPreset::CtrlSpace,
+        ] {
+            let note = hotkey_failure_note(preset);
+            assert!(
+                note.contains(crate::daemon::preset_hint(preset)),
+                "names the failed preset, got: {note}"
+            );
+            assert!(
+                note.to_lowercase().contains("menu") || note.to_lowercase().contains("settings"),
+                "tells the user where to pick another, got: {note}"
+            );
+        }
     }
 
     #[test]
@@ -1108,6 +1555,30 @@ mod tests {
             rgba[i] > 200 && rgba[i + 1] < 80 && rgba[i + 2] < 80,
             "center must be red"
         );
+    }
+
+    #[test]
+    fn spinner_frames_cycle() {
+        // 4 distinct frames, then wraparound: frame N matches frame N mod 4.
+        let frames: Vec<Vec<u8>> = (0..4).map(spinner_rgba).collect();
+        for (i, a) in frames.iter().enumerate() {
+            assert_eq!(a.len(), 32 * 32 * 4, "frame {i} is 32x32 RGBA");
+            for (j, b) in frames.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "frames {i} and {j} must differ");
+                }
+            }
+        }
+        assert_eq!(spinner_rgba(4), frames[0], "frame 4 wraps to frame 0");
+        assert_eq!(spinner_rgba(102), frames[2], "large ticks wrap");
+        // Center dot stays Transcribing-blue in every frame.
+        for (i, f) in frames.iter().enumerate() {
+            let c = (16 * 32 + 16) * 4;
+            assert!(
+                f[c] < 100 && f[c + 1] > 150 && f[c + 2] > 200,
+                "frame {i} center stays blue"
+            );
+        }
     }
 
     #[test]
@@ -1170,6 +1641,7 @@ mod tests {
             ids.edit_vocab,
             ids.cleanup_toggle,
             ids.ctx_toggle,
+            ids.duck_toggle,
             ids.prov_auto,
             ids.prov_groq,
             ids.prov_openrouter,
@@ -1181,6 +1653,8 @@ mod tests {
             ids.key_groq_clear,
             ids.key_or_clear,
             ids.ollama_refresh,
+            ids.show_logs,
+            ids.settings_window,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));
@@ -1205,6 +1679,7 @@ mod tests {
         assert_eq!(a.hk_ctrl, b.hk_ctrl);
         assert_eq!(a.key_groq, b.key_groq);
         assert_eq!(a.ollama_refresh, b.ollama_refresh);
+        assert_eq!(a.settings_window, b.settings_window);
     }
 
     #[test]

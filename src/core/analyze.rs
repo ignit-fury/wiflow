@@ -143,7 +143,7 @@ pub enum CleanupRoute {
 /// old chain returned its input unchanged in that case, and the deterministic
 /// stages are idempotent so re-running them changes nothing — see
 /// `test_deterministic_idempotent`).
-pub fn decide_route(stt_text: &str, cfg: &crate::config::Config) -> CleanupRoute {
+pub fn decide_route(stt_text: &str, cfg: &crate::core::config::Config) -> CleanupRoute {
     if !cfg.cleanup_enabled {
         return CleanupRoute::Direct(analyze_transcript(stt_text));
     }
@@ -194,7 +194,7 @@ fn has_mid_sentence_capital(text: &str) -> bool {
 /// Finder, Electron wrappers, unknown — fails closed to skip the call.
 /// Vague names never pass (checked first).
 pub fn app_allows_context(app: &str) -> bool {
-    if crate::cleanup::is_vague_app(app) {
+    if crate::core::cleanup::is_vague_app(app) {
         return false;
     }
     const ALLOW: &[&str] = &[
@@ -269,7 +269,7 @@ pub fn route_score(route: &CleanupRoute) -> u8 {
 }
 
 /// Compact reason label for `cleanup route=…` logs (never transcript text).
-pub fn route_reason(cfg: &crate::config::Config, route: &CleanupRoute) -> String {
+pub fn route_reason(cfg: &crate::core::config::Config, route: &CleanupRoute) -> String {
     match route {
         CleanupRoute::Direct(_) if !cfg.cleanup_enabled => "cleanup_disabled".into(),
         CleanupRoute::Direct(a) if a.reasons.names().is_empty() => "already_clean".into(),
@@ -286,9 +286,9 @@ pub fn analyze_transcript(input: &str) -> CleanupAnalysis {
     let text = if input.is_empty() {
         String::new()
     } else {
-        let stripped = crate::stt::strip_hallucination_tokens(input);
-        let processed = crate::stt::post_process(&stripped);
-        crate::stt::plus_to_symbol(&processed)
+        let stripped = crate::core::stt::strip_hallucination_tokens(input);
+        let processed = crate::core::stt::post_process(&stripped);
+        crate::core::stt::plus_to_symbol(&processed)
     };
     let reasons = detect_reasons(input, &text);
     let needs_llm = reasons.filler
@@ -551,7 +551,7 @@ mod tests {
     fn bench_analyzer_overhead() {
         use std::hint::black_box;
         use std::time::Instant;
-        for f in crate::baseline::FIXTURES {
+        for f in crate::core::baseline::FIXTURES {
             let iters = if f.input.len() > 120 { 300 } else { 2000 };
             for _ in 0..100 {
                 black_box(analyze_transcript(black_box(f.input)));
@@ -576,22 +576,22 @@ mod tests {
     fn test_deterministic_idempotent() {
         // The pipeline feeds STT output (already cleaned once) back through
         // the same stages on the Direct route — output must be a fixed point.
-        for f in crate::baseline::FIXTURES {
-            let once = crate::baseline::deterministic_clean(f.input);
-            let twice = crate::baseline::deterministic_clean(&once);
+        for f in crate::core::baseline::FIXTURES {
+            let once = crate::core::baseline::deterministic_clean(f.input);
+            let twice = crate::core::baseline::deterministic_clean(&once);
             assert_eq!(once, twice, "not idempotent: {}", f.name);
         }
     }
 
     #[test]
     fn test_decide_route() {
-        let on = crate::config::Config {
+        let on = crate::core::config::Config {
             cleanup_enabled: true,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
-        let off = crate::config::Config {
+        let off = crate::core::config::Config {
             cleanup_enabled: false,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         // Simple → direct inject, no LLM.
         match decide_route("hello how are you", &on) {
@@ -610,7 +610,7 @@ mod tests {
             CleanupRoute::Direct(a) => {
                 assert_eq!(
                     a.text,
-                    crate::baseline::deterministic_clean("um the the thing")
+                    crate::core::baseline::deterministic_clean("um the the thing")
                 )
             }
             CleanupRoute::Llm(_) => panic!("disabled cleanup must never route to LLM"),
@@ -624,13 +624,13 @@ mod tests {
 
     #[test]
     fn test_route_reason_labels() {
-        let on = crate::config::Config {
+        let on = crate::core::config::Config {
             cleanup_enabled: true,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
-        let off = crate::config::Config {
+        let off = crate::core::config::Config {
             cleanup_enabled: false,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         assert_eq!(
             route_reason(&on, &decide_route("hello how are you", &on)),
@@ -703,10 +703,10 @@ mod tests {
 
     #[test]
     fn test_context_allowed_matrix() {
-        let cfg_on = || crate::config::Config {
+        let cfg_on = || crate::core::config::Config {
             cleanup_enabled: true,
             context_enabled: true,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         let rich = analyze_transcript("hello Priya Nair thanks");
         let plain = analyze_transcript("hello how are you");
@@ -728,12 +728,12 @@ mod tests {
         // Context calls on the corpus (Mail app, cloud key): only transcripts
         // with spelling-sensitive content keep the second model call.
         let mut ctx = Vec::new();
-        for f in crate::baseline::FIXTURES {
+        for f in crate::core::baseline::FIXTURES {
             if let CleanupRoute::Llm(a) = decide_route(
                 f.input,
-                &crate::config::Config {
+                &crate::core::config::Config {
                     cleanup_enabled: true,
-                    ..crate::config::Config::default()
+                    ..crate::core::config::Config::default()
                 },
             ) {
                 if context_allowed(Some("Mail"), &a, true, true, true) {
@@ -833,13 +833,13 @@ mod tests {
     #[test]
     fn test_corpus_calls_avoided() {
         // Estimated LLM calls avoided on the Phase 1 corpus with cleanup on.
-        let on = crate::config::Config {
+        let on = crate::core::config::Config {
             cleanup_enabled: true,
-            ..crate::config::Config::default()
+            ..crate::core::config::Config::default()
         };
         let mut direct = 0;
         let mut llm = 0;
-        for f in crate::baseline::FIXTURES {
+        for f in crate::core::baseline::FIXTURES {
             match decide_route(f.input, &on) {
                 CleanupRoute::Direct(_) => direct += 1,
                 CleanupRoute::Llm(_) => llm += 1,
@@ -854,10 +854,10 @@ mod tests {
         // Phase 1 corpus through the analyzer: expect only genuinely complex
         // fixtures to need the LLM.
         let mut llm = Vec::new();
-        for f in crate::baseline::FIXTURES {
+        for f in crate::core::baseline::FIXTURES {
             let a = analyzed(f.input);
             // Analyzer text must equal the deterministic baseline bytes.
-            assert_eq!(a.text, crate::baseline::deterministic_clean(f.input));
+            assert_eq!(a.text, crate::core::baseline::deterministic_clean(f.input));
             if a.needs_llm {
                 llm.push((f.name, a.reasons.names()));
             }

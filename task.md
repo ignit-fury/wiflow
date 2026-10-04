@@ -112,3 +112,38 @@
 
 ## Done Definition (v1)
 - Offline push-to-talk <2s on M1 base, $0 default, permissions handled, history works, docs updated, release signed.
+
+## S4 egui spike (Task 13) — 2026-10-04: GO with one condition
+- [x] egui 0.31 + egui-winit 0.31 + egui_glow 0.31 + glutin 0.32 resolve and compile on rustc 1.95 (`examples/egui_spike.rs` builds warning-free)
+- [x] Runtime proven: spike window renders egui frames error-free for 9s (GL context + painter + event input all live)
+- [x] (a)/(c) by API: `ActiveEventLoop::create_window` available in `user_event`; `Window::set_visible` covers show/hide
+- [ ] CONDITION (user decision required): adopting egui needs MSRV 1.75 → 1.81 (egui 0.31 floor). Confirm before Tasks 14-16 move deps to [dependencies].
+
+## Architecture Alignment S0–S5 (complete 2026-10-04, branch `arch-alignment`)
+- [x] S0 housekeeping commit (PTT lifecycle work)
+- [x] S1 structure + traits (core/platform/app/ui, 4 traits, bootstrap-only main)
+- [x] S2 orchestrator (8-phase machine, Session snapshots, centralized finalize, supervision, shutdown) + live regression gate (matrix + suppression proof)
+- [x] S3 media duck (cherry-picks d9172df/a8e3fed/40a7233, MediaController + epoch state, lifecycle wiring, universal restore; R16/R17/R18 fixes)
+- [x] S4 UI (egui spike GO; settings window; non-activating pill; notifications + spinner) — MSRV CONDITION confirmed by user → 1.81
+- [x] S5 minors (Groq turbo id pinned; CPU fallback; hotkey failure note; H25 impl move)
+- [x] Docs reconciliation (architecture.md rewritten with deviations-vs-status; memory.md program entry)
+- [x] Suite: 250 passed / 0 failed (baseline was 129)
+
+## Acceptance gate (spec §10.5 H32) — run 2026-10-04
+- [x] structure (layout on disk; H25 verified zero core→platform/ui refs; H26 main dispatch-only)
+- [x] traits (5/5 bound; fakes; impls in platform)
+- [x] state machine (admission + recovery + R18; ERROR-hold; supervision; 28 machine tests)
+- [x] media lifecycle (11+13 headless scenarios green; duck 0.6→0.12→0.6 exact, same device, live ×7)
+- [x] UI (settings renders all panels; pill renders + never steals focus; notifications fire)
+- [ ] provider deltas — CONDITIONAL: turbo id pinned + CPU classifier pinned, BUT no live Groq cycle (no key in env) and no Music pause (no library). No waiver: see user items below.
+- [x] error cleanup (finalize funnel; ERROR ordering; finalize-from-every-phase tests)
+- [x] tests (250/0 green, gates clean)
+- [ ] live cycle — CONDITIONAL: full cycles incl. non-empty STT→inject live; Music duck/restore partial (volume exact, pause unit-only)
+- [x] docs (this reconciliation)
+
+## User acceptance batch (explicit, not waived — do in daily use)
+- [ ] One real dictation with provider=groq + key: confirm `cloud stt (whisper-large-v3-turbo)` line in wiflow.log
+- [ ] Play music, dictate, confirm pause + resume + volume restore
+- [ ] Transcription banner appears with Focus/DND off
+- [ ] Settings click-through: record hotkey, change mic, Save, reopen, Test-record
+- [ ] Spinner animation eyeballed during a long transcription

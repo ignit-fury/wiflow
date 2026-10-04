@@ -1,23 +1,12 @@
-mod analyze;
 mod app;
-mod audio;
-// Fixture harness: test-only until a later phase needs it in production.
-#[cfg(test)]
-mod baseline;
-mod cleanup;
-mod config;
+mod core;
 mod daemon;
-mod groq_stt;
-mod history;
-mod hotkey;
-mod inject;
-mod stt;
-mod tap;
-mod vad;
+pub mod logfile;
+mod platform;
+mod ptt;
+pub mod ui;
 
 use clap::Parser;
-use hotkey::{PttEvent, PushToTalk};
-use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "wiflow-dictation")]
@@ -42,237 +31,33 @@ struct Args {
     app: bool,
 }
 
-fn dump_wav(path: &str, samples: &[f32], rate: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut w = hound::WavWriter::create(path, spec)?;
-    for &s in samples {
-        w.write_sample(crate::audio::f32_to_i16(s))?;
-    }
-    w.finalize()?;
-    Ok(())
-}
-
-fn maybe_dump_wav(args: &Args, kept: &[f32]) {
-    if args.dump_wav {
-        match dump_wav("/tmp/wiflow_hold.wav", kept, vad::VAD_SAMPLE_RATE) {
-            Ok(()) => info!("dumped /tmp/wiflow_hold.wav"),
-            Err(e) => warn!("wav dump failed: {e}"),
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn main() {
-    tracing_subscriber::fmt::init();
+    logfile::init();
     let args = Args::parse();
-    if args.app {
-        app::run(config::load_config());
-    }
+
     if args.list_devices {
-        for d in audio::list_devices() {
+        for d in crate::core::audio::list_devices() {
             println!("{d}");
         }
         return;
     }
-    let mut ptt = PushToTalk::new(300, 60_000);
+
+    if args.app {
+        app::run(crate::core::config::load_config());
+    }
+
     if let Some(hold) = args.simulate_hold_ms {
-        info!("simulate hold {hold}ms (no hotkey needed)");
-        assert!(matches!(ptt.on_key_down(0), PttEvent::Started));
-        let cap = match audio::AudioCapture::start(args.device.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("capture failed (expected in CI without mic): {e}");
-                return;
-            }
+        let sim = app::headless::SimulateArgs {
+            hold_ms: hold,
+            dump_wav: args.dump_wav,
+            device: args.device.clone(),
+            model: args.model.clone(),
+            no_inject: args.no_inject,
         };
-        std::thread::sleep(std::time::Duration::from_millis(hold.min(3000)));
-        let out = cap.stop();
-        info!(
-            "captured {} samples @ {}Hz device-ms={} rms={:.3}",
-            out.samples_mono.len(),
-            out.sample_rate,
-            out.duration_ms,
-            audio::rms(&out.samples_mono)
-        );
-        let mut vad = vad::Vad::new();
-        let kept = vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
-        info!(
-            "vad kept {}/{} raw @ {}Hz",
-            kept.len(),
-            out.samples_mono.len(),
-            out.sample_rate
-        );
-        if kept.is_empty() {
-            info!("no speech detected");
-            return;
-        }
-        maybe_dump_wav(&args, &kept);
-        match ptt.on_key_up(out.duration_ms) {
-            PttEvent::Transcribe { duration_ms } => {
-                info!(
-                    "would transcribe {duration_ms}ms ({} vad samples)",
-                    kept.len()
-                );
-                let model_path = match &args.model {
-                    Some(p) => {
-                        if !stt::verify_model(p) {
-                            warn!(
-                                "custom model fails size check, attempting load anyway: {}",
-                                p.display()
-                            );
-                        }
-                        p.clone()
-                    }
-                    None => match stt::ensure_model() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("model unavailable: {e}");
-                            return;
-                        }
-                    },
-                };
-                let t0 = std::time::Instant::now();
-                // Hoisted ABOVE transcribe: reused for the STT language/
-                // provider branch and the cleanup context below.
-                let cfg = config::load_config();
-                let prompt = stt::read_prompt();
-                // Same STT provider branch as the daemon: "groq" = cloud
-                // whisper-large-v3 (OPT-IN, tray alert + local fallback on
-                // failure), otherwise local on-device whisper.
-                let text = if cfg.stt_provider == "groq" {
-                    match crate::groq_stt::transcribe_cloud(&kept, vad::VAD_SAMPLE_RATE, &cfg) {
-                        Ok(t) => {
-                            info!("cloud stt (whisper-large-v3) done");
-                            t
-                        }
-                        Err(e) => {
-                            warn!("Groq STT failed: {e} — using local whisper");
-                            match stt::transcribe_shared(
-                                &model_path,
-                                &kept,
-                                &prompt,
-                                &cfg.stt_language,
-                            ) {
-                                Ok(t) => t,
-                                Err(e2) => {
-                                    warn!("transcribe failed: {e2}");
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("transcribe failed: {e}");
-                            return;
-                        }
-                    }
-                };
-                let ms = t0.elapsed().as_millis();
-                let kept_ms = kept.len() as f64 / vad::VAD_SAMPLE_RATE as f64 * 1000.0;
-                let rtf = ms as f64 / kept_ms.max(1.0);
-                info!("transcribed in {ms}ms (RTF {rtf:.2})");
-                // Same routing as the daemon: deterministic-clean transcripts
-                // skip the LLM chain; complex ones run it (Groq→OpenRouter→
-                // Ollama) with the focused-app context synthesized first.
-                let route = analyze::decide_route(&text, &cfg);
-                let route_name = match &route {
-                    analyze::CleanupRoute::Direct(_) => "deterministic",
-                    analyze::CleanupRoute::Llm(_) => "llm",
-                };
-                info!(
-                    "cleanup route={route_name} reason={} score={}",
-                    analyze::route_reason(&cfg, &route),
-                    analyze::route_score(&route),
-                );
-                let (cleaned, issues) = match route {
-                    analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
-                    analyze::CleanupRoute::Llm(a) => {
-                        let key_present = cleanup::groq_key().is_some();
-                        let ctx = if a.wants_context()
-                            && cfg.cleanup_enabled
-                            && cfg.context_enabled
-                            && key_present
-                        {
-                            let app = daemon::focused_app_name();
-                            if analyze::context_allowed(
-                                app.as_deref(),
-                                &a,
-                                cfg.cleanup_enabled,
-                                cfg.context_enabled,
-                                key_present,
-                            ) {
-                                cleanup::synthesize_context(app.as_deref(), &cfg)
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        };
-                        let input = cleanup::format_cleanup_input(
-                            if ctx.is_empty() { None } else { Some(&ctx) },
-                            &text,
-                        );
-                        let outcome = cleanup::clean_chain(&input, &cfg);
-                        (outcome.text, outcome.issues)
-                    }
-                };
-                for issue in &issues {
-                    warn!("cleanup issue: {issue}");
-                }
-                let text = cleaned;
-                if cleanup::is_filler_result(&text) {
-                    info!("transcript empty or filler-only after cleanup");
-                    return;
-                }
-                println!("TRANSCRIPT: {text}");
-                if text.trim().is_empty() {
-                    info!("empty transcript, nothing to inject");
-                } else {
-                    let entry = history::HistoryEntry {
-                        text: text.clone(),
-                        at_ms: now_ms(),
-                        duration_ms,
-                        rtf,
-                    };
-                    if let Err(e) = history::push_history(entry) {
-                        warn!("history push failed: {e}");
-                    }
-                    if args.no_inject {
-                        info!("--no-inject: skipping cursor injection");
-                    } else {
-                        match inject::inject_text(&text) {
-                            Ok(r) => info!(
-                                "injected via {} (clipboard restored: {})",
-                                r.pasted_via, r.clipboard_restored
-                            ),
-                            Err(e) => {
-                                warn!("inject failed ({e}) — text left on clipboard, press Cmd+V");
-                                inject::leave_on_clipboard(&text);
-                            }
-                        }
-                    }
-                }
-            }
-            e => info!("discarded: {:?}", e),
-        }
-        stt::shutdown();
+        app::headless::run_simulate_hold(&sim);
         return;
     }
+
     println!(
         "Phase 5: tray + global-hotkey wiring lands here. Use --simulate-hold-ms 1500 for now."
     );
