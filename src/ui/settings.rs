@@ -132,18 +132,10 @@ pub enum SettingsIntent {
 
 // ── Window (winit + egui, lives on the existing event loop) ─────────────────
 
-use std::sync::Arc;
-
-use glutin::config::ConfigTemplateBuilder;
-use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
-use glutin::display::GetGlDisplay;
-use glutin::prelude::*;
-use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
-use glutin_winit::{DisplayBuilder, GlWindow};
-use raw_window_handle::HasWindowHandle;
+use super::gl::{GlWindow, GlWindowOpts};
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::WindowId;
 
 use crate::core::config::ModelChoice;
 use crate::core::history::HistoryEntry;
@@ -152,12 +144,7 @@ use crate::core::history::HistoryEntry;
 /// staged view-model. Created on demand from the tray menu on the EXISTING
 /// event loop (H25: one loop per process); closed via the window X button.
 pub struct SettingsWindow {
-    window: Window,
-    gl_surface: glutin::surface::Surface<WindowSurface>,
-    gl_context: PossiblyCurrentContext,
-    painter: egui_glow::Painter,
-    egui_ctx: egui::Context,
-    egui_state: egui_winit::State,
+    gl: GlWindow,
     vm: SettingsViewModel,
     mic_list: Vec<String>,
     history: Vec<HistoryEntry>,
@@ -176,60 +163,19 @@ impl SettingsWindow {
         history: Vec<HistoryEntry>,
         mic_list: Vec<String>,
     ) -> Result<Self, String> {
-        use winit::dpi::LogicalSize;
-        let attrs = WindowAttributes::default()
-            .with_title("wiflow Settings")
-            .with_inner_size(LogicalSize::new(580.0, 660.0))
-            .with_resizable(true);
-        let template = ConfigTemplateBuilder::new();
-        let (window, gl_config) = DisplayBuilder::new()
-            .with_window_attributes(Some(attrs))
-            .build(event_loop, template, |mut configs| {
-                configs.next().expect("no gl configs")
-            })
-            .map_err(|e| format!("settings display: {e:?}"))?;
-        let (window, gl_config) = (window.ok_or("settings window not created")?, gl_config);
-        let raw = window
-            .window_handle()
-            .map_err(|e| format!("window handle: {e:?}"))?
-            .as_raw();
-        let gl_display = gl_config.display();
-        let context_attributes = ContextAttributesBuilder::new().build(Some(raw));
-        let context = unsafe { gl_display.create_context(&gl_config, &context_attributes) }
-            .map_err(|e| format!("gl context: {e:?}"))?;
-        let surface_attributes = window
-            .build_surface_attributes(SurfaceAttributesBuilder::new())
-            .map_err(|e| format!("surface attrs: {e:?}"))?;
-        let surface = unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes) }
-            .map_err(|e| format!("surface: {e:?}"))?;
-        let context = context
-            .make_current(&surface)
-            .map_err(|e| format!("make current: {e:?}"))?;
-        let gl = unsafe {
-            glow::Context::from_loader_function(|s| {
-                let cstr = std::ffi::CString::new(s).unwrap();
-                gl_display.get_proc_address(&cstr) as *const _
-            })
-        };
-        let painter = egui_glow::Painter::new(Arc::new(gl), "", None, false)
-            .map_err(|e| format!("painter: {e:?}"))?;
-        let egui_ctx = egui::Context::default();
-        let egui_state = egui_winit::State::new(
-            egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-        window.set_visible(true);
+        let gl = GlWindow::open(
+            event_loop,
+            &GlWindowOpts {
+                title: "wiflow Settings",
+                width: 580.0,
+                height: 660.0,
+                decorations: true,
+                always_on_top: false,
+                position: None,
+            },
+        )?;
         Ok(Self {
-            window,
-            gl_surface: surface,
-            gl_context: context,
-            painter,
-            egui_ctx,
-            egui_state,
+            gl,
             vm: SettingsViewModel::load(),
             mic_list,
             history,
@@ -242,7 +188,7 @@ impl SettingsWindow {
     }
 
     pub fn window_id(&self) -> WindowId {
-        self.window.id()
+        self.gl.window_id()
     }
 
     /// Closed via the window X button — the App drops the window then.
@@ -302,9 +248,9 @@ impl SettingsWindow {
             }
             _ => {}
         }
-        let repaint = self.egui_state.on_window_event(&self.window, event).repaint;
+        let repaint = self.gl.handle_event(event);
         if repaint {
-            self.window.request_redraw();
+            self.gl.request_redraw();
         }
         intents
     }
@@ -313,9 +259,15 @@ impl SettingsWindow {
     /// `test_status`: App-owned mic-probe result line, if any.
     pub fn paint(&mut self, test_status: Option<&str>) -> Vec<SettingsIntent> {
         let mut intents = Vec::new();
-        let raw_input = self.egui_state.take_egui_input(&self.window);
+        // Split borrows up front: the frame closure captures locals, never
+        // `self`, while `gl.paint` holds `&mut self.gl`.
         let vm = &mut self.vm;
-        let output = self.egui_ctx.run(raw_input, |ctx| {
+        let recording_keys = &mut self.recording_keys;
+        let record_msg = &mut self.record_msg;
+        let save_msg = &mut self.save_msg;
+        let mic_list = &self.mic_list;
+        let history = &mut self.history;
+        self.gl.paint(|ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 // The full panel stack exceeds the window height: scroll.
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -324,15 +276,15 @@ impl SettingsWindow {
                     "Changes save to disk and apply to the next hold — never the active session.",
                 );
                     ui.separator();
-                    Self::hotkey_panel(ui, vm, &mut self.recording_keys, &mut self.record_msg);
+                    Self::hotkey_panel(ui, vm, recording_keys, record_msg);
                     ui.separator();
-                    Self::audio_panel(ui, vm, &self.mic_list);
+                    Self::audio_panel(ui, vm, mic_list);
                     ui.separator();
                     Self::provider_panel(ui, vm);
                     ui.separator();
                     Self::media_panel(ui, vm, &mut intents);
                     ui.separator();
-                    Self::history_panel(ui, &mut self.history, &mut intents);
+                    Self::history_panel(ui, history, &mut intents);
                     ui.separator();
                     Self::permissions_panel(ui, test_status, &mut intents);
                     ui.separator();
@@ -340,38 +292,25 @@ impl SettingsWindow {
                         if ui.button("Save").clicked() {
                             match vm.save() {
                                 Ok(()) => {
-                                    self.save_msg = Some("saved — applies to the next hold".into());
+                                    *save_msg = Some("saved — applies to the next hold".into());
                                 }
                                 Err(e) => {
-                                    self.save_msg = Some(format!("save failed: {e}"));
+                                    *save_msg = Some(format!("save failed: {e}"));
                                 }
                             }
                         }
                         if ui.button("Revert").clicked() {
                             vm.revert();
-                            self.save_msg = Some("reverted to disk".into());
+                            *save_msg = Some("reverted to disk".into());
                         }
-                        if let Some(msg) = &self.save_msg {
+                        if let Some(msg) = &*save_msg {
                             ui.label(msg.as_str());
                         }
                     });
                 });
             });
-        });
-        self.egui_state
-            .handle_platform_output(&self.window, output.platform_output);
-        let clipped = self
-            .egui_ctx
-            .tessellate(output.shapes, output.pixels_per_point);
-        let dims = self.window.inner_size();
-        self.painter.paint_and_update_textures(
-            [dims.width, dims.height],
-            output.pixels_per_point,
-            &clipped,
-            &output.textures_delta,
-        );
-        self.gl_surface.swap_buffers(&self.gl_context).unwrap();
-        self.window.request_redraw();
+        }); // end paint closure
+        self.gl.request_redraw();
         intents
     }
 }

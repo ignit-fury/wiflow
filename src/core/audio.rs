@@ -4,10 +4,39 @@ use ringbuf::{
     HeapCons, HeapProd, HeapRb,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc,
 };
 use tracing::{info, warn};
+
+/// Live mic amplitude for the recording pill: ONE f32 RMS value per capture
+/// block, shared as raw bits. Amplitude only — no samples, no history, no
+/// content ever crosses this boundary (privacy rule). Reset on every start.
+static RECORDING_RMS_BITS: AtomicU32 = AtomicU32::new(0); // +0.0f32 bits (to_bits is not const on MSRV 1.81)
+
+/// Read the current capture amplitude (0.0 when idle).
+pub fn recording_rms() -> f32 {
+    f32::from_bits(RECORDING_RMS_BITS.load(Ordering::Relaxed))
+}
+
+/// Publish one capture block's amplitude (realtime thread: RELAXED, single
+/// writer, torn reads impossible for u32).
+pub fn store_recording_rms(rms: f32) {
+    RECORDING_RMS_BITS.store(rms.to_bits(), Ordering::Relaxed);
+}
+
+/// Fold one sample into a running sum-of-squares (fused into the push loop
+/// so the realtime callback pays no second pass).
+fn acc_block(sum_sq: &mut f64, s: f32) {
+    *sum_sq += s as f64 * s as f64;
+}
+
+/// Publish the RMS of a just-pushed block of `n` samples.
+fn publish_block_rms(sum_sq: f64, n: usize) {
+    if n > 0 {
+        store_recording_rms((sum_sq / n as f64).sqrt() as f32);
+    }
+}
 
 // Phase 1: AudioCapture/rms consumed by Task 4 wiring.
 #[derive(Debug)]
@@ -125,11 +154,14 @@ impl AudioCapture {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
+                    let mut sum_sq = 0.0f64;
                     for &s in data {
                         if producer.try_push(s).is_err() {
                             dropped_cb.fetch_add(1, Ordering::Relaxed);
                         }
+                        acc_block(&mut sum_sq, s);
                     }
+                    publish_block_rms(sum_sq, data.len());
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -137,11 +169,15 @@ impl AudioCapture {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
+                    let mut sum_sq = 0.0f64;
                     for &s in data {
-                        if producer.try_push(i16_to_f32(s)).is_err() {
+                        let f = i16_to_f32(s);
+                        if producer.try_push(f).is_err() {
                             dropped_cb.fetch_add(1, Ordering::Relaxed);
                         }
+                        acc_block(&mut sum_sq, f);
                     }
+                    publish_block_rms(sum_sq, data.len());
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -149,11 +185,15 @@ impl AudioCapture {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
+                    let mut sum_sq = 0.0f64;
                     for &s in data {
-                        if producer.try_push(u16_to_f32(s)).is_err() {
+                        let f = u16_to_f32(s);
+                        if producer.try_push(f).is_err() {
                             dropped_cb.fetch_add(1, Ordering::Relaxed);
                         }
+                        acc_block(&mut sum_sq, f);
                     }
+                    publish_block_rms(sum_sq, data.len());
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -163,6 +203,7 @@ impl AudioCapture {
         .map_err(|e| AudioError(e.to_string()))?;
         stream.play().map_err(|e| AudioError(e.to_string()))?;
         info!("capture started @ {sample_rate}Hz");
+        store_recording_rms(0.0); // fresh amplitude baseline per hold
         Ok(Self {
             stream,
             consumer,
@@ -248,5 +289,15 @@ mod tests {
         assert_eq!(f32_to_i16(-1.0), -32767);
         assert_eq!(f32_to_i16(2.0), 32767);
         assert_eq!(f32_to_i16(-2.0), -32767);
+    }
+
+    #[test]
+    fn rms_bits_roundtrip() {
+        // Amplitude-only feed: f32 RMS travels through an AtomicU32 bit
+        // pattern (no samples cross the boundary — privacy rule).
+        for v in [0.0f32, 0.001, 0.123, 1.0] {
+            super::store_recording_rms(v);
+            assert_eq!(super::recording_rms(), v, "bits round-trip {v}");
+        }
     }
 }

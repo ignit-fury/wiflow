@@ -36,6 +36,11 @@ pub enum Action {
     Notify(String),
     /// Inject text into the focused cursor (enigo, main-thread-only).
     Inject(String),
+    /// Show the recording pill (LISTENING entry only).
+    ShowPill,
+    /// Hide the recording pill (every LISTENING exit + terminal cleanup;
+    /// hide is idempotent, so duplicates are safe).
+    HidePill,
 }
 
 // ── Orchestrator ────────────────────────────────────────────────────────────
@@ -233,12 +238,15 @@ impl<M: MediaController> Orchestrator<M> {
         // Idle. Acceptable because the app is exiting.
 
         // Derive tray state from machine phase — single source of truth.
+        // HidePill rides along idempotently: finalize owns terminal cleanup
+        // (H22), so every path out of an active session hides the pill even
+        // if its LISTENING-exit event was lost.
         let (state, note) = match self.machine.phase() {
             Phase::Error => (AppState::Error, Some("session ended".into())),
             _ => (AppState::Idle, None),
         };
 
-        vec![Action::SetTray(state, note)]
+        vec![Action::SetTray(state, note), Action::HidePill]
     }
 
     // ── Internal: event handlers ──────────────────────────────────────────
@@ -271,12 +279,13 @@ impl<M: MediaController> Orchestrator<M> {
             if from_starting {
                 // Release landed before capture started (R18): remembered
                 // by the machine, applied at CaptureStarted. Nothing to
-                // stop yet — no worker traffic.
+                // stop yet — and nothing shown yet, so no HidePill either.
                 return vec![];
             }
             vec![
                 Action::SetTray(AppState::Transcribing, None),
                 Action::SendControl(Control::Up),
+                Action::HidePill,
             ]
         } else {
             vec![]
@@ -286,7 +295,7 @@ impl<M: MediaController> Orchestrator<M> {
     fn handle_cancel(&mut self) -> Vec<Action> {
         if self.machine.on_cancel() == Admission::Accept {
             self.supervision_at = None;
-            vec![Action::SendControl(Control::Cancel)]
+            vec![Action::SendControl(Control::Cancel), Action::HidePill]
         } else {
             vec![]
         }
@@ -323,7 +332,7 @@ impl<M: MediaController> Orchestrator<M> {
                 tracing::info!("applying remembered release at CaptureStarted");
                 return self.handle_ptt_up();
             }
-            vec![]
+            vec![Action::ShowPill]
         } else {
             // Stale event — silently drop (phase gate rejects).
             vec![]
@@ -337,6 +346,7 @@ impl<M: MediaController> Orchestrator<M> {
             vec![
                 Action::Notify(msg.clone()),
                 Action::SetTray(AppState::Transcribing, Some(msg)),
+                Action::HidePill,
             ]
         } else {
             vec![Action::Notify(msg)]
@@ -468,6 +478,14 @@ mod tests {
         actions.iter().any(|a| matches!(a, Action::SendControl(c) if std::mem::discriminant(c) == std::mem::discriminant(expected)))
     }
 
+    fn has_show_pill(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::ShowPill))
+    }
+
+    fn has_hide_pill(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::HidePill))
+    }
+
     fn is_set_tray(actions: &[Action], state: AppState) -> bool {
         actions
             .iter()
@@ -515,7 +533,7 @@ mod tests {
 
     #[test]
     fn happy_path_actions_sequence() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // PttDown from Idle → [SetTray(Recording), SendControl(Down)]
@@ -530,16 +548,14 @@ mod tests {
             "PttDown should send Down control"
         );
 
-        // CaptureStarted → no actions (internal state change, supervision armed)
+        // CaptureStarted → [ShowPill] (pill appears on LISTENING entry)
         let actions = orch.handle(&evt_capture_started());
-        assert!(
-            actions.is_empty(),
-            "CaptureStarted should produce no actions"
-        );
+        assert_eq!(actions.len(), 1, "CaptureStarted should show the pill");
+        assert!(has_show_pill(&actions), "pill appears on LISTENING");
 
-        // PttUp from Listening → [SetTray(Transcribing), SendControl(Up)]
+        // PttUp from Listening → [SetTray(Transcribing), SendControl(Up), HidePill]
         let actions = orch.handle(&evt_ptt_up());
-        assert_eq!(actions.len(), 2, "PttUp should produce 2 actions");
+        assert_eq!(actions.len(), 3, "PttUp should produce 3 actions");
         assert!(
             is_set_tray(&actions, AppState::Transcribing),
             "PttUp should set Transcribing state"
@@ -548,6 +564,7 @@ mod tests {
             is_send_control(&actions, &Control::Up),
             "PttUp should send Up control"
         );
+        assert!(has_hide_pill(&actions), "pill hides when leaving LISTENING");
 
         // Done with text → [Inject(text)] only; no finalize yet.
         let actions = orch.handle(&evt_done("hello world"));
@@ -571,9 +588,10 @@ mod tests {
         let actions = orch.finish_inject(Ok(ok_report));
         assert_eq!(
             actions.len(),
-            1,
-            "finish_inject(Ok) should produce 1 action"
+            2,
+            "finish_inject(Ok) should produce SetTray + HidePill"
         );
+        assert!(has_hide_pill(&actions), "finalize hides the pill");
         assert!(
             is_set_tray(&actions, AppState::Idle),
             "finish_inject(Ok) should set Idle state"
@@ -586,7 +604,7 @@ mod tests {
 
     #[test]
     fn inject_success_ends_idle() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -616,7 +634,7 @@ mod tests {
 
     #[test]
     fn inject_failure_ends_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -645,7 +663,7 @@ mod tests {
     fn on_inject_failed_live_covered() {
         // Verifies that on_inject_failed is exercised through finish_inject,
         // eliminating the dead-code warning from the original commit.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -663,29 +681,30 @@ mod tests {
 
     #[test]
     fn esc_in_starting_cancels_pending_capture() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // PttDown → Starting
         let actions = orch.handle(&evt_ptt_down());
         assert!(!actions.is_empty());
 
-        // Cancel from Starting → [SendControl(Cancel)]
+        // Cancel from Starting → [SendControl(Cancel), HidePill]
         let actions = orch.handle(&evt_cancel());
         assert_eq!(
             actions.len(),
-            1,
-            "Cancel from Starting should produce 1 action"
+            2,
+            "Cancel from Starting should produce 2 actions"
         );
         assert!(
             is_send_control(&actions, &Control::Cancel),
             "Cancel should send Cancel control"
         );
+        assert!(has_hide_pill(&actions), "cancel hides the pill");
     }
 
     #[test]
     fn stale_capture_started_after_cancel_ignored() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // PttDown → Starting
@@ -703,7 +722,7 @@ mod tests {
 
     #[test]
     fn duplicate_done_ignored_by_phase_gate() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // Full happy path to Idle (including finish_inject)
@@ -735,7 +754,7 @@ mod tests {
 
     #[test]
     fn finalize_is_idempotent() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // Get to Restoring (via empty Done from Processing)
@@ -761,7 +780,7 @@ mod tests {
 
     #[test]
     fn supervision_deadline_fires_without_worker_events() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use a very short watchdog to avoid sleeping in the test.
         std::env::set_var("WIFLOW_MAX_RECORDING_MS", "50");
 
@@ -792,7 +811,7 @@ mod tests {
 
     #[test]
     fn shutdown_from_listening_releases_everything() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -817,7 +836,7 @@ mod tests {
 
     #[test]
     fn down_from_error_resumes() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // Go to Error
@@ -1003,7 +1022,7 @@ mod tests {
 
     #[test]
     fn done_empty_finalizes_to_idle() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1020,7 +1039,7 @@ mod tests {
 
     #[test]
     fn failed_from_cancelled_resolves_idle() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1035,7 +1054,7 @@ mod tests {
 
     #[test]
     fn failed_from_active_resolves_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1063,7 +1082,7 @@ mod tests {
 
     #[test]
     fn ptt_down_while_processing_ignored() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1118,7 +1137,7 @@ mod tests {
 
     #[test]
     fn watchdog_from_listening_transitions_and_notifies() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1142,7 +1161,7 @@ mod tests {
 
     #[test]
     fn done_non_empty_from_starting_recovers() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         // PttDown → Starting (CaptureStarted lost)
@@ -1171,7 +1190,7 @@ mod tests {
 
     #[test]
     fn full_cycle_then_done_empty() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1208,7 +1227,7 @@ mod tests {
 
     #[test]
     fn session_created_on_ptt_down() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1217,7 +1236,7 @@ mod tests {
 
     #[test]
     fn session_released_on_finalize() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1235,7 +1254,7 @@ mod tests {
 
     #[test]
     fn session_released_on_finish_inject() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1263,7 +1282,7 @@ mod tests {
 
     #[test]
     fn supervision_armed_on_capture_started() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1281,7 +1300,7 @@ mod tests {
 
     #[test]
     fn supervision_disarmed_on_ptt_up() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut orch = new_orchestrator();
 
         orch.handle(&evt_ptt_down());
@@ -1297,7 +1316,7 @@ mod tests {
 
     #[test]
     fn tick_before_deadline_returns_empty() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("WIFLOW_MAX_RECORDING_MS", "60000");
 
         let mut orch = new_orchestrator();

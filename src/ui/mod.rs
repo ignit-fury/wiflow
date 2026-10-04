@@ -3,4 +3,6 @@
 //! The UI observes App state and emits intent commands; it never drives the
 //! daemon or the PTT machine directly (H20).
 
+pub mod gl;
+pub mod pill;
 pub mod settings;

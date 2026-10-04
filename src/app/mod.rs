@@ -517,6 +517,9 @@ struct DaemonApp {
     /// the window renders App-owned state, never captures itself).
     test_record_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     test_record_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Recording pill (S4, pure Rust): observational indicator owned by the
+    /// App shell, driven by ShowPill/HidePill actions (H21/H22).
+    pill: crate::ui::pill::Pill,
 }
 
 impl DaemonApp {
@@ -1026,40 +1029,48 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        // Settings window owns the only winit Window in the process.
-        let ours = self
+        // The process owns at most two winit Windows (settings + pill).
+        // Unknown ids are ignored defensively. Borrows are statement-local
+        // (NLL): each `as_mut` ends before App methods run.
+        if self
             .settings_window
             .as_ref()
-            .is_some_and(|w| w.window_id() == window_id);
-        if !ours {
-            return;
-        }
-        let intents = self
-            .settings_window
-            .as_mut()
-            .map(|w| w.handle_event(&event))
-            .unwrap_or_default();
-        for intent in intents {
-            self.execute_settings_intent(intent);
-        }
-        if matches!(event, winit::event::WindowEvent::RedrawRequested) {
-            let status = self.test_record_status();
+            .is_some_and(|w| w.window_id() == window_id)
+        {
             let intents = self
                 .settings_window
                 .as_mut()
-                .map(|w| w.paint(status.as_deref()))
+                .map(|w| w.handle_event(&event))
                 .unwrap_or_default();
             for intent in intents {
                 self.execute_settings_intent(intent);
             }
+            if matches!(event, winit::event::WindowEvent::RedrawRequested) {
+                let status = self.test_record_status();
+                let intents = self
+                    .settings_window
+                    .as_mut()
+                    .map(|w| w.paint(status.as_deref()))
+                    .unwrap_or_default();
+                for intent in intents {
+                    self.execute_settings_intent(intent);
+                }
+            }
+            let closed = self
+                .settings_window
+                .as_ref()
+                .map(|w| w.close_requested())
+                .unwrap_or(false);
+            if closed {
+                self.settings_window = None;
+                tracing::info!("settings window closed");
+            }
+            return;
         }
-        if self
-            .settings_window
-            .as_ref()
-            .is_some_and(|w| w.close_requested())
+        if self.pill.window_id() == Some(window_id)
+            && matches!(event, winit::event::WindowEvent::RedrawRequested)
         {
-            self.settings_window = None;
-            tracing::info!("settings window closed");
+            self.pill.frame();
         }
     }
 
@@ -1081,7 +1092,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DaemonEvent) {
         let before = self.orchestrator.phase();
         let actions = self.orchestrator.handle(&event);
         if actions.is_empty() {
@@ -1106,6 +1117,8 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     self.sync_tray();
                 }
                 Action::Notify(msg) => self.warn_note(msg),
+                Action::ShowPill => self.pill.show(event_loop),
+                Action::HidePill => self.pill.hide(),
                 Action::Inject(text) => {
                     let injector = crate::core::traits::SystemInjector;
                     let result = match injector.inject(&text) {
@@ -1139,7 +1152,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 self.sync_tray();
                             }
                             Action::Notify(msg) => self.warn_note(msg),
-                            Action::SendControl(_) | Action::Inject(_) => {
+                            Action::SendControl(_)
+                            | Action::Inject(_)
+                            | Action::ShowPill
+                            | Action::HidePill => {
                                 unreachable!("finish_inject only emits SetTray/Notify")
                             }
                         }
@@ -1179,6 +1195,8 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     self.sync_tray();
                 }
                 Action::Notify(msg) => self.warn_note(msg),
+                Action::ShowPill => unreachable!("tick never emits ShowPill"),
+                Action::HidePill => self.pill.hide(),
                 Action::Inject(_) => unreachable!("tick never emits Inject"),
             }
         }
@@ -1339,6 +1357,7 @@ fn app_main(
         open_settings_requested: false,
         test_record_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
         test_record_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pill: crate::ui::pill::Pill::new(),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
