@@ -957,12 +957,16 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 duration_ms,
                 rtf,
             } => {
-                if self.ptt.on_done() == Admission::Ignore {
-                    // Cannot happen with current rules (Done is accepted
-                    // from every phase) — guard kept for future rules.
+                let admission = if text.is_empty() {
+                    self.ptt.on_empty()
+                } else {
+                    self.ptt.on_transcript()
+                };
+                if admission == Admission::Ignore {
                     tracing::info!("Done ignored (phase {:?})", self.ptt.phase());
                     return;
                 }
+
                 if text.is_empty() {
                     tracing::debug!("cycle done, no text (discard/silence)");
                 } else {
@@ -972,12 +976,16 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     // inject_text briefly blocks this thread — accepted for v1.
                     let injector = crate::core::traits::SystemInjector;
                     match injector.inject(&text) {
-                        Ok(r) => tracing::info!(
-                            "injected via {} (clipboard restored: {})",
-                            r.pasted_via,
-                            r.clipboard_restored
-                        ),
+                        Ok(r) => {
+                            self.ptt.on_inject_ok();
+                            tracing::info!(
+                                "injected via {} (clipboard restored: {})",
+                                r.pasted_via,
+                                r.clipboard_restored
+                            )
+                        }
                         Err(e) => {
+                            self.ptt.on_inject_failed();
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
@@ -987,21 +995,23 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 Some(format!("injected to clipboard: {e}")),
                             );
                             self.sync_tray();
+                            self.ptt.on_finalized();
                             return;
                         }
                     }
                 }
+
+                self.ptt.on_finalized();
                 self.set_state(AppState::Idle, None);
                 self.sync_tray();
             }
             DaemonEvent::Failed(msg) => {
-                // Accepted from every phase (incl. Recording: fatal capture
-                // error must leave Recording, never wedge it).
                 if self.ptt.on_failed() == Admission::Ignore {
                     tracing::info!("Failed ignored (phase {:?}): {msg}", self.ptt.phase());
                     return;
                 }
                 tracing::warn!("dictation failed: {msg}");
+                self.ptt.on_finalized();
                 self.set_state(AppState::Error, Some(msg));
                 self.sync_tray();
             }
