@@ -23,7 +23,8 @@ pub struct AudioRef {
 
 /// Frozen media snapshot at STARTING time.
 ///
-/// S3 fills `was_playing` from real state; S2 defaults to `false` / `None`.
+/// Filled by the orchestrator from the controller's pre-duck probe
+/// (device + playing as found, before this session ducks).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaSnapshot {
     pub output_device: Option<String>,

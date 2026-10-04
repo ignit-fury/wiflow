@@ -77,7 +77,6 @@ struct Inner {
 /// Copyable live view of duck bookkeeping, read by the `MediaController`
 /// wrapper. All fields are flags/ids — no audio, no samples.
 /// Consumed by `platform::macos::media` (Task 11/12 seam).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DuckSnapshot {
     pub active: bool,
@@ -267,7 +266,6 @@ impl<B: MediaBackend> AudioDuck<B> {
     /// Live view of duck bookkeeping for the `MediaController` wrapper
     /// (`platform::macos::media`): explicit, copyable, no samples involved.
     /// Wired in Task 12; unused until then.
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> DuckSnapshot {
         let inner = self.lock();
         DuckSnapshot {
@@ -282,14 +280,12 @@ impl<B: MediaBackend> AudioDuck<B> {
     /// Pre-duck truth for session snapshots: is anything worth pausing
     /// playing right now? Read-only; never mutates hold state.
     /// Wired in Task 12; unused until then.
-    #[allow(dead_code)]
     pub fn any_playing(&self) -> bool {
         PLAYERS.iter().any(|app| self.backend.is_playing(*app))
     }
 
     /// Live output-device id for session snapshots. Read-only.
     /// Wired in Task 12; unused until then.
-    #[allow(dead_code)]
     pub fn current_device(&self) -> Option<u32> {
         self.backend.output_device_id()
     }

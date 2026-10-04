@@ -13,14 +13,15 @@
 
 use std::time::Duration;
 
-use crate::core::traits::MediaController;
+use crate::core::traits::{MediaController, MediaProbe};
 
+#[cfg(test)]
+use super::duck::PlayerApp;
 use super::duck::{AudioDuck, DuckSnapshot, MediaBackend, OsBackend};
 
 /// Explicit media session state (spec §8.2 / H10). Makes "restore only what
 /// Wiflow changed" executable: `restore()` touches exactly flagged state.
 /// Wired into the orchestrator in Task 12; unused until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaSessionState {
     /// Was anything pause-worthy playing when the session ducked?
@@ -38,50 +39,42 @@ pub struct MediaSessionState {
     pub epoch: u64,
 }
 
-/// Pre-duck probe for session snapshots (Task 12 fills `MediaSnapshot` at
-/// STARTING from this — same shape, honest layer boundary: platform probes,
-/// App records). Query only; never mutates hold state.
-/// Wired in Task 12; unused until then.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaProbe {
-    pub output_device: Option<String>,
-    pub was_playing: bool,
-}
-
 /// `MediaController` over `AudioDuck`. Generic over the backend so the
 /// §13.2 scenarios run headless against a fake; production uses `OsBackend`.
 /// Time control is constructor-injected `pause_delay` (short delays in
 /// tests) — no separate clock trait needed.
 /// Wired into the orchestrator in Task 12; unused until then.
-#[allow(dead_code)]
 pub struct CoreAudioDuck<B: MediaBackend = OsBackend> {
     inner: AudioDuck<B>,
     state: MediaSessionState,
+    /// Mirrors the inner enabled flag for the probe gate: a disabled
+    /// controller must not touch the backend at all — hermetic tests AND
+    /// no per-press osascript cost when toggled off.
+    enabled: bool,
 }
 
-// Unwired until Task 12 (see struct docs); one attribute per block so the
-// removal is a clean revert.
-#[allow(dead_code)]
-impl<B: MediaBackend> Clone for CoreAudioDuck<B> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            state: self.state.clone(),
-        }
-    }
-}
-
-#[allow(dead_code)]
 impl<B: MediaBackend> CoreAudioDuck<B> {
     pub fn new(backend: B, enabled: bool, pause_delay: Duration) -> Self {
         Self {
             inner: AudioDuck::new(backend, enabled, pause_delay),
             state: MediaSessionState::default(),
+            enabled,
         }
     }
 
-    /// Current state view (refresh first at decision points).
+    /// Share the inner machine (same Arc state) with another owner —
+    /// used once at the composition root: the worker ducks at capture-Ok
+    /// on this handle while the orchestrator records/restores through the
+    /// wrapper. Idempotent on both ends, so the pair is always coherent.
+    pub fn shared_inner(&self) -> AudioDuck<B> {
+        self.inner.clone()
+    }
+
+    /// Current state view (refresh first at decision points). Read by
+    /// tests and (future) diagnostics; the orchestrator drives the machine
+    /// through the trait and never needs the view to act. Covered by 13
+    /// wrapper scenarios, so this is reserved-not-dead.
+    #[allow(dead_code)]
     pub fn state(&self) -> &MediaSessionState {
         &self.state
     }
@@ -90,14 +83,6 @@ impl<B: MediaBackend> CoreAudioDuck<B> {
     pub fn refresh(&mut self) {
         let snap = self.inner.snapshot();
         self.apply_snapshot(snap);
-    }
-
-    /// Pre-duck probe for STARTING snapshots. No mutation.
-    pub fn pre_duck_probe(&self) -> MediaProbe {
-        MediaProbe {
-            output_device: self.inner.current_device().map(|d| d.to_string()),
-            was_playing: self.inner.any_playing(),
-        }
     }
 
     fn apply_snapshot(&mut self, snap: DuckSnapshot) {
@@ -111,7 +96,6 @@ impl<B: MediaBackend> CoreAudioDuck<B> {
     }
 }
 
-#[allow(dead_code)]
 impl<B: MediaBackend> MediaController for CoreAudioDuck<B> {
     fn duck(&mut self) {
         // Snapshot pre-duck truth first: the session record must describe
@@ -129,106 +113,140 @@ impl<B: MediaBackend> MediaController for CoreAudioDuck<B> {
         self.inner.restore();
         self.refresh();
     }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.inner.set_enabled(enabled);
+    }
+
+    fn pre_duck_probe(&self) -> MediaProbe {
+        if !self.enabled {
+            return MediaProbe {
+                output_device: None,
+                was_playing: false,
+            };
+        }
+        MediaProbe {
+            output_device: self.inner.current_device().map(|d| d.to_string()),
+            was_playing: self.inner.any_playing(),
+        }
+    }
+}
+
+/// Headless test backend shared by `media` and `orchestrator` tests.
+/// Records everything it sees; knobs for playing/mute/device/pause-fail.
+/// Test-only: never compiled into the app binary.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct FakeMediaBackend {
+    state: std::sync::Arc<std::sync::Mutex<FakeMediaState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FakeMediaState {
+    volumes: Vec<f32>,
+    muted: bool,
+    device: Option<u32>,
+    playing: Vec<PlayerApp>,
+    writes: Vec<Vec<f32>>,
+    pauses: Vec<PlayerApp>,
+    resumes: Vec<PlayerApp>,
+    fail_pause: bool,
+}
+
+#[cfg(test)]
+impl FakeMediaBackend {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(FakeMediaState {
+                volumes: vec![0.8],
+                muted: false,
+                device: Some(7),
+                playing: Vec::new(),
+                writes: Vec::new(),
+                pauses: Vec::new(),
+                resumes: Vec::new(),
+                fail_pause: false,
+            })),
+        }
+    }
+
+    pub fn playing_music() -> Self {
+        let f = Self::new();
+        f.state.lock().unwrap().playing = vec![PlayerApp::Music];
+        f
+    }
+
+    pub fn volumes(&self) -> Vec<f32> {
+        self.state.lock().unwrap().volumes.clone()
+    }
+    pub fn pauses(&self) -> Vec<PlayerApp> {
+        self.state.lock().unwrap().pauses.clone()
+    }
+    pub fn resumes(&self) -> Vec<PlayerApp> {
+        self.state.lock().unwrap().resumes.clone()
+    }
+    pub fn write_count(&self) -> usize {
+        self.state.lock().unwrap().writes.len()
+    }
+    pub fn set_device(&self, dev: Option<u32>) {
+        self.state.lock().unwrap().device = dev;
+    }
+    pub fn set_playing(&self, app: PlayerApp) {
+        let mut s = self.state.lock().unwrap();
+        if !s.playing.contains(&app) {
+            s.playing.push(app);
+        }
+    }
+    pub fn set_fail_pause(&self, fail: bool) {
+        self.state.lock().unwrap().fail_pause = fail;
+    }
+}
+
+#[cfg(test)]
+impl MediaBackend for FakeMediaBackend {
+    fn output_device_id(&self) -> Option<u32> {
+        self.state.lock().unwrap().device
+    }
+    fn output_volumes(&self) -> Vec<f32> {
+        self.state.lock().unwrap().volumes.clone()
+    }
+    fn set_output_volumes(&self, v: &[f32]) {
+        let mut s = self.state.lock().unwrap();
+        s.volumes = v.to_vec();
+        s.writes.push(v.to_vec());
+    }
+    fn output_muted(&self) -> bool {
+        self.state.lock().unwrap().muted
+    }
+    fn is_playing(&self, app: PlayerApp) -> bool {
+        self.state.lock().unwrap().playing.contains(&app)
+    }
+    fn pause(&self, app: PlayerApp) {
+        let mut s = self.state.lock().unwrap();
+        if s.fail_pause {
+            return; // Simulated pause failure: nothing happens.
+        }
+        s.playing.retain(|a| a != &app);
+        s.pauses.push(app);
+    }
+    fn resume(&self, app: PlayerApp) {
+        let mut s = self.state.lock().unwrap();
+        if !s.playing.contains(&app) {
+            s.playing.push(app);
+        }
+        s.resumes.push(app);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::macos::duck::PlayerApp;
-    use std::sync::{Arc, Mutex};
 
-    struct FakeState {
-        volumes: Vec<f32>,
-        muted: bool,
-        device: Option<u32>,
-        playing: Vec<PlayerApp>,
-        writes: Vec<Vec<f32>>,
-        pauses: Vec<PlayerApp>,
-        resumes: Vec<PlayerApp>,
-        fail_pause: bool,
-    }
-
-    #[derive(Clone)]
-    struct Fake {
-        state: Arc<Mutex<FakeState>>,
-    }
-
-    impl Fake {
-        fn new() -> Self {
-            Self {
-                state: Arc::new(Mutex::new(FakeState {
-                    volumes: vec![0.8],
-                    muted: false,
-                    device: Some(7),
-                    playing: Vec::new(),
-                    writes: Vec::new(),
-                    pauses: Vec::new(),
-                    resumes: Vec::new(),
-                    fail_pause: false,
-                })),
-            }
-        }
-
-        fn playing_music() -> Self {
-            let f = Self::new();
-            f.state.lock().unwrap().playing = vec![PlayerApp::Music];
-            f
-        }
-
-        fn volumes(&self) -> Vec<f32> {
-            self.state.lock().unwrap().volumes.clone()
-        }
-        fn pauses(&self) -> Vec<PlayerApp> {
-            self.state.lock().unwrap().pauses.clone()
-        }
-        fn resumes(&self) -> Vec<PlayerApp> {
-            self.state.lock().unwrap().resumes.clone()
-        }
-        fn write_count(&self) -> usize {
-            self.state.lock().unwrap().writes.len()
-        }
-        fn set_device(&self, dev: Option<u32>) {
-            self.state.lock().unwrap().device = dev;
-        }
-        fn set_fail_pause(&self, fail: bool) {
-            self.state.lock().unwrap().fail_pause = fail;
-        }
-    }
-
-    impl MediaBackend for Fake {
-        fn output_device_id(&self) -> Option<u32> {
-            self.state.lock().unwrap().device
-        }
-        fn output_volumes(&self) -> Vec<f32> {
-            self.state.lock().unwrap().volumes.clone()
-        }
-        fn set_output_volumes(&self, v: &[f32]) {
-            let mut s = self.state.lock().unwrap();
-            s.volumes = v.to_vec();
-            s.writes.push(v.to_vec());
-        }
-        fn output_muted(&self) -> bool {
-            self.state.lock().unwrap().muted
-        }
-        fn is_playing(&self, app: PlayerApp) -> bool {
-            self.state.lock().unwrap().playing.contains(&app)
-        }
-        fn pause(&self, app: PlayerApp) {
-            let mut s = self.state.lock().unwrap();
-            if s.fail_pause {
-                return; // Simulated pause failure: nothing happens.
-            }
-            s.playing.retain(|a| a != &app);
-            s.pauses.push(app);
-        }
-        fn resume(&self, app: PlayerApp) {
-            let mut s = self.state.lock().unwrap();
-            if !s.playing.contains(&app) {
-                s.playing.push(app);
-            }
-            s.resumes.push(app);
-        }
-    }
+    /// Alias so the scenario tests below read unchanged.
+    type Fake = super::FakeMediaBackend;
 
     fn ducked(fake: Fake) -> CoreAudioDuck<Fake> {
         CoreAudioDuck::new(fake, true, Duration::from_millis(5))
@@ -429,5 +447,23 @@ mod tests {
         assert_eq!(p1.output_device.as_deref(), Some("7"));
         assert!(p1.was_playing);
         assert_eq!(probe_handle.write_count(), 0, "no writes from probing");
+    }
+
+    #[test]
+    fn disabled_probe_returns_default_without_touching_backend() {
+        // The per-session toggle (H24): disabled controllers must not issue
+        // ANY backend call — hermetic tests, no per-press osascript cost.
+        // A read counter would be ideal; behaviorally, a disabled probe on
+        // a device-present, playing backend still reports { None, false }.
+        let fake = Fake::playing_music();
+        let probe_handle = fake.clone();
+        let mut d = ducked(fake);
+        d.set_enabled(false);
+        let p = d.pre_duck_probe();
+        assert_eq!(p.output_device, None);
+        assert!(!p.was_playing);
+        d.duck();
+        assert_eq!(probe_handle.write_count(), 0, "disabled: never dips");
+        assert!(!d.state().restoration_required);
     }
 }

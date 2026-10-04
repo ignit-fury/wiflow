@@ -501,9 +501,6 @@ struct DaemonApp {
     applied_tooltip: String,
     menu_ids: MenuIds,
     menu_dirty: bool,
-    /// Shared with the worker (duck at key-down there, restore here after
-    /// injection). Same instance — paused-list ownership never splits.
-    duck: crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
 }
 
 impl DaemonApp {
@@ -936,10 +933,6 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
-        // Restore ducked audio — but never under a newer hold: if the
-        // user already re-pressed (Recording), that hold owns the duck
-        // and its own Done will restore it.
-        let may_restore = self.state != AppState::Recording;
         let before = self.orchestrator.phase();
         let actions = self.orchestrator.handle(&event);
         if actions.is_empty() {
@@ -980,20 +973,16 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
                             injector.leave_on_clipboard(&text);
-                            if may_restore {
-                                self.duck.restore();
-                            }
-                            self.set_state(
-                                AppState::Error,
-                                Some(format!("injected to clipboard: {e}")),
-                            );
-                            self.sync_tray();
-                            return;
+                            // No early return: the result flows into
+                            // finish_inject below (INJECTING → RESTORING →
+                            // finalize → ERROR). Returning here used to wedge
+                            // the machine in INJECTING (next press ignored).
+                            Err(e)
                         }
                     };
                     // Feed inject result back to the orchestrator, which drives
-                    // the machine through RESTORING → finalize and returns the
-                    // appropriate tray action.
+                    // the machine through RESTORING → finalize (restoring
+                    // media) and returns the appropriate tray action.
                     for fi_action in self.orchestrator.finish_inject(result) {
                         match fi_action {
                             Action::SetTray(state, note) => {
@@ -1006,25 +995,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                             }
                         }
                     }
-                    // Injection completed: volume back to where it was.
-                    if may_restore {
-                        self.duck.restore();
-                    }
+                    // Injection completed: the orchestrator's finalize (via
+                    // finish_inject above) already restored media.
                 }
             }
-        }
-        // Faithful to the pre-S2 duck design (d9172df..40a7233): empty
-        // transcripts and failures restore here (non-empty success restores
-        // after injection above). Guarded by may_restore: never steal a
-        // newer hold's restore. Task 12 unifies all paths under finalize.
-        match &event {
-            DaemonEvent::Done { text, .. } if text.is_empty() && may_restore => {
-                self.duck.restore();
-            }
-            DaemonEvent::Failed(_) if may_restore => {
-                self.duck.restore();
-            }
-            _ => {}
         }
     }
 
@@ -1161,16 +1135,17 @@ fn app_main(
         });
     }
 
-    // One shared duck instance: worker ducks at key-down, main thread
-    // restores after injection completes.
-    let duck = crate::platform::macos::duck::AudioDuck::new(
+    // One shared duck instance: worker ducks at capture-Ok on the same
+    // One shared duck instance: the worker ducks at capture-Ok on the same
+    // Arc state the orchestrator records and restores (Task 12 wiring).
+    let media = crate::platform::macos::media::CoreAudioDuck::new(
         crate::platform::macos::duck::OsBackend,
         config.duck_audio,
         crate::platform::macos::duck::PAUSE_DELAY,
     );
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();
-    let worker_duck = duck.clone();
+    let worker_duck = media.shared_inner();
     std::thread::spawn(move || crate::daemon::worker_main(worker_proxy, rx, worker_duck));
 
     let mut app = DaemonApp {
@@ -1188,6 +1163,7 @@ fn app_main(
             crate::core::traits::ChainProvider,
             crate::core::traits::SystemInjector,
             crate::core::traits::OsascriptContext,
+            media,
         ),
         state: AppState::Idle,
         note: None,
@@ -1195,7 +1171,6 @@ fn app_main(
         applied_tooltip: AppState::Idle.tooltip(won),
         menu_ids: ids,
         menu_dirty: false,
-        duck,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");

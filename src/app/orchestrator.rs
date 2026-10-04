@@ -12,9 +12,12 @@ use std::time::{Duration, Instant};
 use crate::app::session::{begin_session, Session};
 use crate::app::AppState;
 use crate::core::traits::{
-    ChainProvider, InjectReport, OsascriptContext, RouterRecognizer, SystemInjector,
+    ChainProvider, InjectReport, MediaController, OsascriptContext, RouterRecognizer,
+    SystemInjector,
 };
 use crate::daemon::{Control, DaemonEvent};
+use crate::platform::macos::duck::OsBackend;
+use crate::platform::macos::media::CoreAudioDuck;
 use crate::ptt::{Admission, Phase, PttMachine};
 
 // ── Action ──────────────────────────────────────────────────────────────────
@@ -35,29 +38,26 @@ pub enum Action {
     Inject(String),
 }
 
-// ── NoopMedia (S2 seam) ─────────────────────────────────────────────────────
-
-/// S2 safe no-op seam for media restore.
-///
-/// S3 (Task 12) will replace this with real audio-state capture/restore.
-/// In S2, `restore_media()` always returns no actions and is tested as a no-op.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct NoopMedia;
-
 // ── Orchestrator ────────────────────────────────────────────────────────────
 
 /// Central lifecycle coordinator.
 ///
-/// All `DaemonEvent` routing goes through `handle()`. Terminal events
-/// (Done, Failed) funnel through `finalize_session`. Supervision is armed
-/// on entering LISTENING and checked by `tick()`.
-pub struct Orchestrator {
+/// Generic over the media controller so tests drive a fake backend while
+/// production uses CoreAudio (default type param keeps all call sites
+/// unchanged). All `DaemonEvent` routing goes through `handle()`. Terminal
+/// events (Done, Failed) funnel through `finalize_session`. Supervision is
+/// armed on entering LISTENING and checked by `tick()`.
+///
+/// Media ownership (S3/H1): the orchestrator OWNS the `MediaController`
+/// boundary — `duck()` on LISTENING entry, `restore()` ONLY inside
+/// `finalize_session`. The worker ducks at capture-Ok on the SAME shared
+/// `AudioDuck` state (event-loss backstop); both sides are idempotent, so
+/// the pair can never double-dip or strand audio.
+pub struct Orchestrator<M: MediaController = CoreAudioDuck<OsBackend>> {
     machine: PttMachine,
     session: Option<Session>,
     supervision_at: Option<Instant>,
-    /// S3/Task-12 seam: will track output device / playback state.
-    #[allow(dead_code)]
-    media: NoopMedia,
+    media: M,
     /// Brief-pinned constructor signature; final review may prune.
     #[allow(dead_code)]
     recognizer: RouterRecognizer,
@@ -72,19 +72,21 @@ pub struct Orchestrator {
     context: OsascriptContext,
 }
 
-impl Orchestrator {
-    /// Create a new orchestrator with production trait implementations.
+impl<M: MediaController> Orchestrator<M> {
+    /// Create a new orchestrator with production trait implementations and
+    /// the given media controller (shared instance with the worker).
     pub fn new(
         recognizer: RouterRecognizer,
         cleanup: ChainProvider,
         injector: SystemInjector,
         context: OsascriptContext,
+        media: M,
     ) -> Self {
         Self {
             machine: PttMachine::new(),
             session: None,
             supervision_at: None,
-            media: NoopMedia,
+            media,
             recognizer,
             cleanup,
             injector,
@@ -184,10 +186,10 @@ impl Orchestrator {
     /// Step order:
     /// 1. Disarm supervision
     /// 2. Drop capture handle (S2: worker owns it — no-op)
-    /// 3. restore_media() [S2 = safe no-op seam, tested]
+    /// 3. restore media via the controller (universal restore, §8.3)
     /// 4. Hide pill: SetTray(Idle/Error)
     /// 5. Release audio_ref (drop session)
-    /// 6. Session-end log line
+    /// 6. Session-end log line (incl. media state)
     /// 7. on_finalized machine step
     ///
     /// Tray state (Idle vs Error) is derived from `self.machine.phase()`
@@ -201,8 +203,9 @@ impl Orchestrator {
 
         // 2. Drop capture handle — S2 no-op (worker owns the mic handle)
 
-        // 3. Restore media — S2 safe no-op seam
-        self.restore_media();
+        // 3. Restore media: idempotent controller call — safe on every path
+        // (never ducked, already restored, duplicate finalize all no-op).
+        self.media.restore();
 
         // 4/5/6. Session-end log + release resources
         if let Some(s) = &self.session {
@@ -235,22 +238,23 @@ impl Orchestrator {
         vec![Action::SetTray(state, note)]
     }
 
-    // ── Internal: restore_media (S2 seam) ─────────────────────────────────
-
-    /// S2 no-op: nothing to restore.
-    ///
-    /// S3 (Task 12) will implement real media-state capture/restore here.
-    fn restore_media(&mut self) {
-        // Intentionally empty — S2 seam.
-    }
-
     // ── Internal: event handlers ──────────────────────────────────────────
 
     fn handle_ptt_down(&mut self) -> Vec<Action> {
         if self.machine.on_down() == Admission::Accept {
             // Freeze settings + context at STARTING time (H6/H24).
             let config = crate::core::config::load_config();
-            self.session = Some(begin_session(&config, OsascriptContext));
+            let mut session = begin_session(&config, OsascriptContext);
+            // Media, per session snapshot (H24): toggle + pre-duck probe.
+            // The probe runs BEFORE Control::Down reaches the worker, so it
+            // records true pre-duck truth.
+            self.media.set_enabled(session.settings.duck_audio);
+            let probe = self.media.pre_duck_probe();
+            session.media = crate::app::session::MediaSnapshot {
+                output_device: probe.output_device,
+                was_playing: probe.was_playing,
+            };
+            self.session = Some(session);
             vec![
                 Action::SetTray(AppState::Recording, None),
                 Action::SendControl(Control::Down),
@@ -286,6 +290,13 @@ impl Orchestrator {
         if self.machine.on_capture_started() == Admission::Accept {
             // Entered LISTENING → arm supervision deadline.
             self.supervision_at = Some(Instant::now());
+            // Own the MediaController boundary (H11): duck on LISTENING
+            // entry. The worker already ducked at capture-Ok on the shared
+            // machine, so this is normally a no-op there — but it records
+            // the session state view and covers paths where the worker
+            // didn't (e.g. duck re-enabled mid-hold... never: snapshot).
+            // Idempotent either way.
+            self.media.duck();
             vec![]
         } else {
             // Stale event — silently drop (phase gate rejects).
@@ -349,18 +360,37 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::macos::duck::PlayerApp;
+    use crate::platform::macos::media::FakeMediaBackend;
     use std::sync::Mutex;
 
     /// Serializes access to process-level env vars across parallel tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn new_orchestrator() -> Orchestrator {
-        Orchestrator::new(
+    fn new_orchestrator() -> Orchestrator<CoreAudioDuck<FakeMediaBackend>> {
+        orch_with_fake(|_| {}).0
+    }
+
+    /// Test orchestrator with an observable fake backend. The returned
+    /// `FakeMediaBackend` shares state with the orchestrator's controller
+    /// (clone the handle BEFORE driving events).
+    fn orch_with_fake(
+        configure: impl FnOnce(&FakeMediaBackend),
+    ) -> (
+        Orchestrator<CoreAudioDuck<FakeMediaBackend>>,
+        FakeMediaBackend,
+    ) {
+        let fake = FakeMediaBackend::new();
+        configure(&fake);
+        let probe = fake.clone();
+        let orch = Orchestrator::new(
             RouterRecognizer,
             ChainProvider,
             SystemInjector,
             OsascriptContext,
-        )
+            CoreAudioDuck::new(fake, true, Duration::from_millis(5)),
+        );
+        (orch, probe)
     }
 
     fn evt_ptt_down() -> DaemonEvent {
@@ -777,14 +807,119 @@ mod tests {
     }
 
     #[test]
-    fn restore_media_no_op_on_clean_session() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let mut orch = new_orchestrator();
+    fn cancel_in_starting_needs_no_restore() {
+        // Esc before capture starts: nothing ever ducked, so finalize must
+        // perform zero backend writes (restore on a clean session = no-op).
+        let (mut orch, probe) = orch_with_fake(|_| {});
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_cancel());
+        orch.handle(&evt_failed("cancelled (Esc)"));
+        assert_eq!(orch.machine.phase(), Phase::Idle);
+        assert_eq!(probe.write_count(), 0, "never ducked: nothing to restore");
+    }
 
-        // Clean session: never started a session, no media state.
-        // restore_media should be a no-op (no panic, no side effects).
-        orch.restore_media();
-        // No assertion needed — the test passes if it doesn't panic.
+    #[test]
+    fn session_media_snapshot_filled_at_starting() {
+        // H6: STARTING probes device + playing into the frozen snapshot.
+        let (mut orch, _probe) = orch_with_fake(|f| {
+            f.set_device(Some(7));
+        });
+        // NOTE: playing knob lives on the fake; the default fake plays
+        // nothing, so this run asserts the device half. The playing half
+        // is pinned by `playing_snapshot_records_was_playing` below.
+        orch.handle(&evt_ptt_down());
+        let s = orch.session.as_ref().expect("session at STARTING");
+        assert_eq!(s.media.output_device.as_deref(), Some("7"));
+        assert!(!s.media.was_playing);
+    }
+
+    #[test]
+    fn playing_snapshot_records_was_playing() {
+        let (mut orch, _probe) = orch_with_fake(|f| {
+            f.set_playing(PlayerApp::Music);
+        });
+        orch.handle(&evt_ptt_down());
+        let s = orch.session.as_ref().expect("session at STARTING");
+        assert!(s.media.was_playing, "Music playing at STARTING");
+    }
+
+    #[test]
+    fn empty_transcript_restores_duck() {
+        // §8.3 row: silence → Done(empty) → RESTORING → finalize restores.
+        let (mut orch, probe) = orch_with_fake(|_| {});
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+        assert_eq!(probe.write_count(), 1, "dipped at LISTENING");
+        orch.handle(&evt_done(""));
+        assert_eq!(orch.machine.phase(), Phase::Idle);
+        assert_eq!(probe.write_count(), 2, "dip + exact restore");
+        assert!((probe.volumes()[0] - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stt_failure_after_pause_restores() {
+        // §8.3 row: pause fired, then the transcript fails → ERROR path
+        // still resumes + restores exactly.
+        let (mut orch, probe) = orch_with_fake(|f| {
+            f.set_playing(PlayerApp::Music);
+        });
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        std::thread::sleep(Duration::from_millis(50)); // let the gate fire
+        assert_eq!(probe.pauses().len(), 1, "pause fired before failure");
+        orch.handle(&evt_ptt_up());
+        orch.handle(&evt_failed("transcribe failed"));
+        assert_eq!(orch.machine.phase(), Phase::Error);
+        assert_eq!(probe.resumes().len(), 1, "resumed what we paused");
+        assert!((probe.volumes()[0] - 0.8).abs() < 1e-9, "exact restore");
+    }
+
+    #[test]
+    fn injection_failure_after_pause_restores() {
+        // §8.3 row + H8: inject fails after a fired pause → RESTORING →
+        // ERROR, still resumed + restored.
+        let (mut orch, probe) = orch_with_fake(|f| {
+            f.set_playing(PlayerApp::Music);
+        });
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        std::thread::sleep(Duration::from_millis(50));
+        orch.handle(&evt_ptt_up());
+        let actions = orch.handle(&evt_done("dictate this"));
+        assert!(actions.iter().any(|a| matches!(a, Action::Inject(_))));
+        let actions = orch.finish_inject(Err("no injector".into()));
+        assert_eq!(orch.machine.phase(), Phase::Error);
+        assert!(is_set_tray(&actions, AppState::Error), "tray shows Error");
+        assert_eq!(probe.resumes().len(), 1);
+        assert!((probe.volumes()[0] - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn disabled_duck_never_dips() {
+        // Per-session toggle off (H24): full cycle completes, backend
+        // volumes never touched, restore safe. The snapshot enables from
+        // live config here, so simulate a disabled snapshot by flipping
+        // the controller off before LISTENING — the mechanism under test
+        // (disabled ⇒ zero backend interaction) is identical.
+        let fake = FakeMediaBackend::playing_music();
+        let probe = fake.clone();
+        let mut orch = Orchestrator::new(
+            RouterRecognizer,
+            ChainProvider,
+            SystemInjector,
+            OsascriptContext,
+            CoreAudioDuck::new(fake, false, Duration::from_millis(5)),
+        );
+        orch.handle(&evt_ptt_down());
+        // Snapshot read live config (enabled); override to disabled, as a
+        // `duck_audio: false` snapshot would.
+        orch.media.set_enabled(false);
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+        orch.handle(&evt_done(""));
+        assert_eq!(orch.machine.phase(), Phase::Idle);
+        assert_eq!(probe.write_count(), 0, "disabled: zero backend writes");
     }
 
     #[test]
