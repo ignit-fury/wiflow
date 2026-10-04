@@ -15,7 +15,21 @@ use winit::{
 use crate::core::config::{Config, ModelChoice};
 use crate::core::history::HistoryEntry;
 use crate::core::traits::TextInjector;
-use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
+use crate::daemon::{current_session, preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
+
+fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
+    match ev {
+        DaemonEvent::PttDown => "PttDown",
+        DaemonEvent::PttUp => "PttUp",
+        DaemonEvent::Cancel => "Cancel",
+        DaemonEvent::CaptureStarted => "CaptureStarted",
+        DaemonEvent::Watchdog { .. } => "Watchdog",
+        DaemonEvent::TapIssue { .. } => "TapIssue",
+        DaemonEvent::Done { .. } => "Done",
+        DaemonEvent::Failed { .. } => "Failed",
+        DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -895,6 +909,14 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
         let actions = self.orchestrator.handle(&event);
+        if actions.is_empty() {
+            tracing::info!(
+                "[session={}] {} produced no actions (phase {:?}) — ignored",
+                current_session(),
+                daemon_event_variant_name(&event),
+                self.orchestrator.phase()
+            );
+        }
         for action in actions {
             match action {
                 Action::SendControl(ctl) => self.send_control(ctl),

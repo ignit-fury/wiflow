@@ -114,6 +114,11 @@ impl Orchestrator {
         }
     }
 
+    /// Current PTT phase (used for observability in ignored-event logs).
+    pub fn phase(&self) -> Phase {
+        self.machine.phase()
+    }
+
     /// Supervision deadline check. Called every `about_to_wait` tick.
     ///
     /// When in LISTENING, if no worker event arrives within the session's
