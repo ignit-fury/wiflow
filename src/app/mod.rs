@@ -1,4 +1,5 @@
 pub mod headless;
+pub mod session;
 
 use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
