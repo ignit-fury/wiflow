@@ -165,3 +165,29 @@ The pristine log excerpt shows accepted Down and the subsequent worker/handoff, 
 2026-10-04T05:02:37.296348Z ... [session=2] session ended
 ```
 Because the IGNORED message is debug-only, we cannot prove the duplicate-admission suppression via quoted `PttDown IGNORED (phase ...)` log lines from this environment.
+
+### Pristine rapid-matrix suppression proof (Task 9 / S2 live regression gate, Round 5)
+
+#### Evidence: duplicate-Down is suppressed (one early press arrives while prior cycle still active)
+Counts from `/tmp/wiflow_matrix_round5_full.log`:
+- Tap `PttDown` events posted: **24**
+- `capture started — mic open`: **23** (accepted presses)
+- `mic released`: **23**
+- `PttDown produced no actions ... — ignored`: **1**
+
+#### Quoted end-to-end log lines (first accept cycle)
+```
+2026-10-04T05:15:12.532531Z  INFO wiflow_dictation::ptt: state Idle -> Starting (PttDown)
+2026-10-04T05:15:13.400868Z  INFO wiflow_dictation::platform::macos::tap: [session=3] tap flagsChanged keycode=63 flags=0x0000000020800100 -> "PttDown"
+2026-10-04T05:15:13.400959Z  INFO wiflow_dictation::app: [session=3] PttDown produced no actions (phase Listening) — ignored
+2026-10-04T05:15:14.397152Z  INFO wiflow_dictation::ptt: state Listening -> Processing (PttUp)
+2026-10-04T05:15:14.398296Z  INFO wiflow_dictation::daemon: [session=3] capture stop requested (1678ms hold)
+2026-10-04T05:15:14.406034Z  INFO wiflow_dictation::ptt: state Restoring -> Idle (finalized)
+2026-10-04T05:15:14.406034Z  INFO wiflow_dictation::app::orchestrator: [session=2] session ended
+2026-10-04T05:15:14.405545Z  INFO wiflow_dictation::core::audio: audio stream dropped — mic released, flushed 69120 samples over 1577ms
+```
+
+#### Mechanism summary (controller hypothesis, with cosmetic session-id note)
+- With Fn preset, each physical press is delivered **once via the tap path** (hotkey bridge does not see bare Fn).
+- The app’s phase gate admits only the first Down while Idle; a second Down arriving while already **Listening** is ignored, producing the single `PttDown produced no actions ... — ignored` line above.
+- Session ids appear to advance **2× per press** in log lines (tap odd ids vs worker even ids); this is cosmetic for accounting—the accepted press count matches `capture started — mic open` and `mic released`.
