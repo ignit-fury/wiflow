@@ -112,3 +112,9 @@
 
 ## Done Definition (v1)
 - Offline push-to-talk <2s on M1 base, $0 default, permissions handled, history works, docs updated, release signed.
+
+## S4 egui spike (Task 13) — 2026-10-04: GO with one condition
+- [x] egui 0.31 + egui-winit 0.31 + egui_glow 0.31 + glutin 0.32 resolve and compile on rustc 1.95 (`examples/egui_spike.rs` builds warning-free)
+- [x] Runtime proven: spike window renders egui frames error-free for 9s (GL context + painter + event input all live)
+- [x] (a)/(c) by API: `ActiveEventLoop::create_window` available in `user_event`; `Window::set_visible` covers show/hide
+- [ ] CONDITION (user decision required): adopting egui needs MSRV 1.75 → 1.81 (egui 0.31 floor). Confirm before Tasks 14-16 move deps to [dependencies].
