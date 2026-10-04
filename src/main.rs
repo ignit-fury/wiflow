@@ -4,6 +4,7 @@ mod daemon;
 pub mod logfile;
 mod platform;
 mod ptt;
+pub mod ui;
 
 use clap::Parser;
 

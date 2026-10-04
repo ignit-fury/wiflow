@@ -51,14 +51,11 @@ impl Spike {
     }
 
     fn paint(&mut self) {
-        let (window, painter, egui_state) = match (
-            &self.window,
-            &mut self.painter,
-            &mut self.egui_state,
-        ) {
-            (Some(w), Some(p), Some(s)) => (w, p, s),
-            _ => return,
-        };
+        let (window, painter, egui_state) =
+            match (&self.window, &mut self.painter, &mut self.egui_state) {
+                (Some(w), Some(p), Some(s)) => (w, p, s),
+                _ => return,
+            };
         let raw_input = egui_state.take_egui_input(window);
         let output = self.egui_ctx.run(raw_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -98,8 +95,7 @@ impl ApplicationHandler for Spike {
         let window = window.expect("window");
         let raw_handle = window.window_handle().unwrap().as_raw();
         let gl_display = gl_config.display();
-        let context_attributes =
-            ContextAttributesBuilder::new().build(Some(raw_handle));
+        let context_attributes = ContextAttributesBuilder::new().build(Some(raw_handle));
         let fallback = ContextAttributesBuilder::new()
             .with_context_api(glutin::context::ContextApi::Gles(None))
             .build(Some(raw_handle));
@@ -129,8 +125,7 @@ impl ApplicationHandler for Spike {
                 gl_display.get_proc_address(&cstr) as *const _
             })
         };
-        let painter =
-            egui_glow::Painter::new(Arc::new(gl), "", None, false).expect("painter");
+        let painter = egui_glow::Painter::new(Arc::new(gl), "", None, false).expect("painter");
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,

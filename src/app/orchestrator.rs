@@ -845,6 +845,10 @@ mod tests {
         // orphaning until the watchdog.
         let (mut orch, probe) = orch_with_fake(|_| {});
         orch.handle(&evt_ptt_down());
+        // Hermetic toggle (live config is uncontrollable here — learned
+        // from a real failure): pin enabled so dip/restore assertions are
+        // deterministic. Snapshot→toggle wiring is one reviewed line.
+        orch.media.set_enabled(true);
         let up_actions = orch.handle(&evt_ptt_up());
         assert!(up_actions.is_empty(), "nothing to stop during STARTING");
         assert_eq!(orch.machine.phase(), Phase::Starting);
@@ -906,6 +910,7 @@ mod tests {
         // §8.3 row: silence → Done(empty) → RESTORING → finalize restores.
         let (mut orch, probe) = orch_with_fake(|_| {});
         orch.handle(&evt_ptt_down());
+        orch.media.set_enabled(true); // hermetic toggle (see above)
         orch.handle(&evt_capture_started());
         orch.handle(&evt_ptt_up());
         assert_eq!(probe.write_count(), 1, "dipped at LISTENING");
@@ -923,6 +928,7 @@ mod tests {
             f.set_playing(PlayerApp::Music);
         });
         orch.handle(&evt_ptt_down());
+        orch.media.set_enabled(true); // hermetic toggle (see above)
         orch.handle(&evt_capture_started());
         std::thread::sleep(Duration::from_millis(50)); // let the gate fire
         assert_eq!(probe.pauses().len(), 1, "pause fired before failure");
@@ -941,6 +947,7 @@ mod tests {
             f.set_playing(PlayerApp::Music);
         });
         orch.handle(&evt_ptt_down());
+        orch.media.set_enabled(true); // hermetic toggle (see above)
         orch.handle(&evt_capture_started());
         std::thread::sleep(Duration::from_millis(50));
         orch.handle(&evt_ptt_up());

@@ -121,6 +121,7 @@ pub struct MenuIds {
     ollama_models: Vec<(String, MenuId)>,
     ollama_refresh: MenuId,
     show_logs: MenuId,
+    settings_window: MenuId,
     quit: MenuId,
 }
 
@@ -173,6 +174,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
             .collect(),
         ollama_refresh: MenuId::new("wiflow:ollama:refresh"),
         show_logs: MenuId::new("wiflow:show:logs"),
+        settings_window: MenuId::new("wiflow:settings:open"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -451,6 +453,8 @@ pub fn build_menu(
     // for PTT issues must be reachable without a terminal.
     let show_logs = MenuItem::with_id(ids.show_logs.clone(), "Show Logs…", true, None);
 
+    let settings_window = MenuItem::with_id(ids.settings_window.clone(), "Settings…", true, None);
+
     let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
 
     menu.append(&status).expect("menu append");
@@ -471,6 +475,7 @@ pub fn build_menu(
     menu.append(&hist_menu).expect("menu append");
     menu.append(&edit_vocab).expect("menu append");
     menu.append(&show_logs).expect("menu append");
+    menu.append(&settings_window).expect("menu append");
     menu.append(&perm_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
@@ -501,6 +506,17 @@ struct DaemonApp {
     applied_tooltip: String,
     menu_ids: MenuIds,
     menu_dirty: bool,
+    /// Live settings window (S4, pure Rust): created on demand from the
+    /// tray menu on the existing event loop; closed via its X button.
+    settings_window: Option<crate::ui::settings::SettingsWindow>,
+    /// Set by the tray "Settings…" item; consumed in `about_to_wait` (which
+    /// has the `ActiveEventLoop` needed to create the window).
+    open_settings_requested: bool,
+    /// Mic-probe result for the settings window's Test-record button:
+    /// written by an App-owned 1 s capture thread, polled per frame (H20:
+    /// the window renders App-owned state, never captures itself).
+    test_record_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    test_record_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DaemonApp {
@@ -570,6 +586,110 @@ impl DaemonApp {
         if let Err(e) = crate::core::config::save_config(&self.config) {
             tracing::warn!("save config failed: {e}");
         }
+    }
+
+    /// Launch-at-login behind one path for the tray menu AND the settings
+    /// window intent (H20). On failure the tray note explains; the caller
+    /// that staged the value (settings window) reverts its own copy.
+    fn apply_launch_at_login(&mut self, enable: bool) -> bool {
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
+        match crate::core::config::set_launch_at_login(enable, &exe, true) {
+            Ok(()) => {
+                self.config.launch_at_login = enable;
+                self.save();
+                self.menu_dirty = true;
+                tracing::info!("launch at login: {enable}");
+                true
+            }
+            Err(e) => {
+                self.warn_note(format!("launch-at-login failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Execute one settings-window intent (H20: the window proposes, the
+    /// App disposes — tray menu paths reused wherever they exist).
+    fn execute_settings_intent(&mut self, intent: crate::ui::settings::SettingsIntent) {
+        use crate::ui::settings::SettingsIntent as I;
+        match intent {
+            I::Save(cfg) => {
+                self.config = cfg;
+                self.save();
+                self.menu_dirty = true;
+                tracing::info!("settings saved (apply to the next hold)");
+            }
+            I::SwitchHotkey(want) => self.switch_hotkey(want),
+            I::CopyHistory(text) => match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.set_text(text) {
+                    Ok(()) => tracing::info!("history entry copied"),
+                    Err(e) => self.warn_note(format!("copy failed: {e:?}")),
+                },
+                Err(e) => self.warn_note(format!("clipboard unavailable: {e:?}")),
+            },
+            I::ClearHistory => {
+                let path = crate::core::history::history_path();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        tracing::info!("history file deleted");
+                        if let Some(w) = self.settings_window.as_mut() {
+                            w.clear_history_view();
+                        }
+                    }
+                    Err(e) => self.warn_note(format!("clear history failed: {e}")),
+                }
+            }
+            I::TestRecord => self.run_test_record(),
+            I::SetLaunchAtLogin(enable) => {
+                if !self.apply_launch_at_login(enable) {
+                    // OS refused: revert the window's staged copy so disk,
+                    // OS, and window agree again.
+                    if let Some(w) = self.settings_window.as_mut() {
+                        w.set_launch_at_login(!enable);
+                    }
+                }
+            }
+            I::OpenMicSettings => crate::core::config::permissions::open_mic_settings(),
+            I::OpenAccessibilitySettings => {
+                crate::core::config::permissions::open_accessibility_settings()
+            }
+        }
+    }
+
+    /// 1 s mic probe for the settings window's Test-record button. Runs in
+    /// an App-owned thread (never on the event loop, never in the window);
+    /// the result is polled per frame via `test_record_status` (H20).
+    /// Amplitude only — no audio stored, no STT.
+    fn run_test_record(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.test_record_running.swap(true, Ordering::SeqCst) {
+            return; // A probe is already running.
+        }
+        let out = self.test_record_result.clone();
+        let running = self.test_record_running.clone();
+        let mic = self.config.mic_name.clone();
+        std::thread::spawn(move || {
+            let line = (|| {
+                let cap = crate::core::audio::AudioCapture::start(mic)
+                    .map_err(|e| format!("mic unavailable: {e}"))?;
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let got = cap.stop();
+                let rms = crate::core::audio::rms(&got.samples_mono);
+                Ok::<String, String>(crate::ui::settings::format_test_record_result(
+                    rms,
+                    got.samples_mono.len(),
+                    got.sample_rate,
+                ))
+            })();
+            *out.lock().unwrap() = Some(line.unwrap_or_else(|e| e));
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Latest mic-probe result for the settings window to render (if any).
+    fn test_record_status(&self) -> Option<String> {
+        self.test_record_result.lock().unwrap().clone()
     }
 
     /// Note only when it won't clobber the recording indicator.
@@ -686,17 +806,7 @@ impl DaemonApp {
         }
         if *id == ids.launch_login {
             let enable = !self.config.launch_at_login;
-            let exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
-            match crate::core::config::set_launch_at_login(enable, &exe, true) {
-                Ok(()) => {
-                    self.config.launch_at_login = enable;
-                    self.save();
-                    self.menu_dirty = true;
-                    tracing::info!("launch at login: {enable}");
-                }
-                Err(e) => self.warn_note(format!("launch-at-login failed: {e}")),
-            }
+            self.apply_launch_at_login(enable);
             return;
         }
         if *id == ids.edit_vocab {
@@ -855,6 +965,11 @@ impl DaemonApp {
             tracing::info!("ollama cleanup model: {name} (takes effect next hold)");
             return;
         }
+        if *id == ids.settings_window {
+            // Created in about_to_wait (needs the ActiveEventLoop).
+            self.open_settings_requested = true;
+            return;
+        }
         if *id == ids.show_logs {
             let path = crate::logfile::log_path();
             let opened = std::process::Command::new("open")
@@ -908,10 +1023,44 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        _event: winit::event::WindowEvent,
+        window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
     ) {
-        // Tray-only app: no windows exist.
+        // Settings window owns the only winit Window in the process.
+        let ours = self
+            .settings_window
+            .as_ref()
+            .is_some_and(|w| w.window_id() == window_id);
+        if !ours {
+            return;
+        }
+        let intents = self
+            .settings_window
+            .as_mut()
+            .map(|w| w.handle_event(&event))
+            .unwrap_or_default();
+        for intent in intents {
+            self.execute_settings_intent(intent);
+        }
+        if matches!(event, winit::event::WindowEvent::RedrawRequested) {
+            let status = self.test_record_status();
+            let intents = self
+                .settings_window
+                .as_mut()
+                .map(|w| w.paint(status.as_deref()))
+                .unwrap_or_default();
+            for intent in intents {
+                self.execute_settings_intent(intent);
+            }
+        }
+        if self
+            .settings_window
+            .as_ref()
+            .is_some_and(|w| w.close_requested())
+        {
+            self.settings_window = None;
+            tracing::info!("settings window closed");
+        }
     }
 
     fn device_event(
@@ -1002,9 +1151,24 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
             self.handle_menu_event(&ev.id);
+        }
+        // Open the settings window on demand (needs the ActiveEventLoop).
+        if self.open_settings_requested {
+            self.open_settings_requested = false;
+            if self.settings_window.is_none() {
+                let history = crate::core::history::load_history();
+                let mics = crate::core::audio::list_devices();
+                match crate::ui::settings::SettingsWindow::open(event_loop, history, mics) {
+                    Ok(w) => {
+                        self.settings_window = Some(w);
+                        tracing::info!("settings window opened");
+                    }
+                    Err(e) => self.warn_note(format!("settings window failed: {e}")),
+                }
+            }
         }
         // Supervision deadline check.
         for action in self.orchestrator.tick() {
@@ -1171,6 +1335,10 @@ fn app_main(
         applied_tooltip: AppState::Idle.tooltip(won),
         menu_ids: ids,
         menu_dirty: false,
+        settings_window: None,
+        open_settings_requested: false,
+        test_record_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        test_record_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop exited: {e:?}");
@@ -1306,6 +1474,7 @@ mod tests {
             ids.key_or_clear,
             ids.ollama_refresh,
             ids.show_logs,
+            ids.settings_window,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));
@@ -1330,6 +1499,7 @@ mod tests {
         assert_eq!(a.hk_ctrl, b.hk_ctrl);
         assert_eq!(a.key_groq, b.key_groq);
         assert_eq!(a.ollama_refresh, b.ollama_refresh);
+        assert_eq!(a.settings_window, b.settings_window);
     }
 
     #[test]

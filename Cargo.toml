@@ -2,7 +2,7 @@
 name = "wiflow-dictation"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.81"
 
 [[bin]]
 name = "wiflow-dictation"
@@ -27,11 +27,6 @@ muda = "0.19"
 winit = "0.30"
 global-hotkey = "0.7"
 open = "5"
-
-[dev-dependencies]
-approx = "0.5"
-# S4 spike (Task 13, temporary): egui 0.31 line pairs with winit 0.30.
-# If the spike goes GO, these move to [dependencies] pinned.
 egui = "0.31"
 egui-winit = "0.31"
 egui_glow = "0.31"
@@ -39,3 +34,6 @@ glow = "0.16"
 glutin = "0.32"
 glutin-winit = "0.5"
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+approx = "0.5"
