@@ -160,6 +160,8 @@ ANY --supervision deadline (watchdog + grace, no worker event)--> worker-failure
 
 Stale-event rules: `CaptureStarted` arriving when phase ≠ STARTING (e.g. after
 Esc) is ignored; `PttUp` outside LISTENING ignored; duplicate Downs ignored.
+`Done` (text or empty) arriving in LISTENING/STARTING (lost Watchdog/PttUp upstream)
+is accepted as a no-stuck recovery into INJECTING/RESTORING with a loud WARN.
 
 Admission rules: Down only from IDLE or ERROR; Up only from LISTENING; Esc only
 from LISTENING or STARTING; duplicates/stray events ignored.

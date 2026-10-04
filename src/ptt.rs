@@ -81,7 +81,12 @@ impl PttMachine {
         // No-stuck recovery: allow transcript arrival even if we never saw PttUp,
         // matching the old "Done while Recording" behavior.
         match self.phase {
-            Phase::Processing | Phase::Starting | Phase::Listening => {
+            Phase::Processing => self.set(Phase::Injecting, "transcript"),
+            Phase::Starting | Phase::Listening => {
+                tracing::warn!(
+                    "Done text arrived in unexpected phase {:?} — recovering into INJECTING",
+                    self.phase
+                );
                 self.set(Phase::Injecting, "transcript")
             }
             _ => Admission::Ignore,
@@ -89,13 +94,21 @@ impl PttMachine {
     }
 
     /// Empty transcript: PROCESSING → RESTORING (success: no error target).
-    #[allow(dead_code)]
     pub fn on_empty(&mut self) -> Admission {
-        if self.phase == Phase::Processing {
-            self.restoring_error_target = false;
-            self.set(Phase::Restoring, "empty transcript")
-        } else {
-            Admission::Ignore
+        match self.phase {
+            Phase::Processing => {
+                self.restoring_error_target = false;
+                self.set(Phase::Restoring, "empty transcript")
+            }
+            Phase::Starting | Phase::Listening => {
+                tracing::warn!(
+                    "Done (empty) arrived in unexpected phase {:?} — recovering into RESTORING",
+                    self.phase
+                );
+                self.restoring_error_target = false;
+                self.set(Phase::Restoring, "empty transcript")
+            }
+            _ => Admission::Ignore,
         }
     }
 
@@ -422,5 +435,43 @@ mod tests {
 
         assert_eq!(m.on_down(), Admission::Accept);
         assert_eq!(m.phase(), Phase::Starting);
+    }
+
+    #[test]
+    fn empty_from_processing_to_idle() {
+        let mut m = PttMachine::new();
+        assert_eq!(m.on_down(), Admission::Accept);
+        assert_eq!(m.on_capture_started(), Admission::Accept);
+        assert_eq!(m.on_up(), Admission::Accept);
+
+        assert_eq!(m.on_empty(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Restoring);
+        assert_eq!(m.on_finalized(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn empty_from_starting_recovers() {
+        let mut m = PttMachine::new();
+        assert_eq!(m.on_down(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Starting);
+
+        assert_eq!(m.on_empty(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Restoring);
+        assert_eq!(m.on_finalized(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn empty_from_listening_recovers() {
+        let mut m = PttMachine::new();
+        assert_eq!(m.on_down(), Admission::Accept);
+        assert_eq!(m.on_capture_started(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Listening);
+
+        assert_eq!(m.on_empty(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Restoring);
+        assert_eq!(m.on_finalized(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Idle);
     }
 }
