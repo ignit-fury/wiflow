@@ -28,6 +28,7 @@ pub enum Admission {
 pub struct PttMachine {
     phase: Phase,
     restoring_error_target: bool,
+    pending_up: bool,
 }
 
 impl PttMachine {
@@ -35,6 +36,7 @@ impl PttMachine {
         Self {
             phase: Phase::Idle,
             restoring_error_target: false,
+            pending_up: false,
         }
     }
 
@@ -42,23 +44,42 @@ impl PttMachine {
         self.phase
     }
 
+    pub fn take_pending_up(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_up, false)
+    }
+
     /// PttDown: Idle|Error → Starting.
     pub fn on_down(&mut self) -> Admission {
         match self.phase {
-            Phase::Idle | Phase::Error => self.set(Phase::Starting, "PttDown"),
+            Phase::Idle | Phase::Error => {
+                self.pending_up = false;
+                self.set(Phase::Starting, "PttDown")
+            }
             _ => Admission::Ignore,
         }
     }
 
-    /// PttUp: Listening → Processing.
+    /// PttUp: Listening → Processing. Up during STARTING is remembered
+    /// (Accept, no transition — applied at CaptureStarted via take_pending_up).
     pub fn on_up(&mut self) -> Admission {
-        self.transition(Phase::Listening, Phase::Processing, "PttUp")
+        match self.phase {
+            Phase::Listening => self.set(Phase::Processing, "PttUp"),
+            Phase::Starting => {
+                self.pending_up = true;
+                tracing::info!("PttUp during STARTING - remembered for CaptureStarted");
+                Admission::Accept
+            }
+            _ => Admission::Ignore,
+        }
     }
 
-    /// Esc: Listening|Starting → Cancelled.
+    /// Esc: Listening|Starting → Cancelled (clears any remembered release).
     pub fn on_cancel(&mut self) -> Admission {
         match self.phase {
-            Phase::Listening | Phase::Starting => self.set(Phase::Cancelled, "Esc"),
+            Phase::Listening | Phase::Starting => {
+                self.pending_up = false;
+                self.set(Phase::Cancelled, "Esc")
+            }
             _ => Admission::Ignore,
         }
     }
@@ -141,10 +162,12 @@ impl PttMachine {
     pub fn on_failed(&mut self) -> Admission {
         match self.phase {
             Phase::Starting | Phase::Listening | Phase::Processing | Phase::Injecting => {
+                self.pending_up = false;
                 self.restoring_error_target = true;
                 self.set(Phase::Restoring, "Failed")
             }
             Phase::Cancelled => {
+                self.pending_up = false;
                 self.restoring_error_target = false;
                 self.set(Phase::Restoring, "Failed")
             }
@@ -371,8 +394,10 @@ mod tests {
         assert_eq!(m.on_down(), Admission::Accept);
         assert_eq!(m.phase(), Phase::Starting);
 
-        // stray Up while STARTING is ignored
-        assert_eq!(m.on_up(), Admission::Ignore);
+        // Up while STARTING is remembered for CaptureStarted (R18),
+        // not ignored — short holds must complete, not orphan.
+        assert_eq!(m.on_up(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Starting);
 
         // CaptureStarted only accepted from STARTING
         assert_eq!(m.on_capture_started(), Admission::Accept);
@@ -474,5 +499,57 @@ mod tests {
         assert_eq!(m.phase(), Phase::Restoring);
         assert_eq!(m.on_finalized(), Admission::Accept);
         assert_eq!(m.phase(), Phase::Idle);
+    }
+
+    /// R18: release during STARTING is remembered, not ignored.
+    #[test]
+    fn up_during_starting_remembered() {
+        let mut m = PttMachine::new();
+        assert_eq!(m.on_down(), Admission::Accept);
+        assert_eq!(m.on_up(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Starting, "no transition yet");
+        assert_eq!(m.on_capture_started(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Listening);
+        assert!(m.take_pending_up(), "release remembered");
+        assert!(!m.take_pending_up(), "take clears");
+    }
+
+    /// R18: cancel supersedes a remembered release.
+    #[test]
+    fn cancel_clears_pending_up() {
+        let mut m = PttMachine::new();
+        m.on_down();
+        m.on_up();
+        assert_eq!(m.on_cancel(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Cancelled);
+        assert!(!m.take_pending_up(), "cancel wins over release");
+    }
+
+    /// R18: failure clears a remembered release.
+    #[test]
+    fn failed_clears_pending_up() {
+        let mut m = PttMachine::new();
+        m.on_down();
+        m.on_up();
+        assert_eq!(m.on_failed(), Admission::Accept);
+        assert_eq!(m.phase(), Phase::Restoring);
+        assert!(!m.take_pending_up());
+    }
+
+    /// R18: a fresh cycle starts with no release memory (the on_down clear
+    /// is defensive — cancel/failed/take already clear on every path out
+    /// of STARTING; this pins the invariant).
+    #[test]
+    fn fresh_cycle_has_no_release_memory() {
+        let mut m = PttMachine::new();
+        m.on_down();
+        m.on_up();
+        m.on_cancel();
+        m.on_failed();
+        assert_eq!(m.phase(), Phase::Restoring);
+        m.on_finalized();
+        assert_eq!(m.phase(), Phase::Idle);
+        assert_eq!(m.on_down(), Admission::Accept);
+        assert!(!m.take_pending_up(), "fresh cycle has no memory");
     }
 }

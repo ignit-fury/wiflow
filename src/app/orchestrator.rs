@@ -264,9 +264,16 @@ impl<M: MediaController> Orchestrator<M> {
     }
 
     fn handle_ptt_up(&mut self) -> Vec<Action> {
+        let from_starting = self.machine.phase() == Phase::Starting;
         if self.machine.on_up() == Admission::Accept {
             // Leaving LISTENING → disarm supervision.
             self.supervision_at = None;
+            if from_starting {
+                // Release landed before capture started (R18): remembered
+                // by the machine, applied at CaptureStarted. Nothing to
+                // stop yet — no worker traffic.
+                return vec![];
+            }
             vec![
                 Action::SetTray(AppState::Transcribing, None),
                 Action::SendControl(Control::Up),
@@ -309,6 +316,13 @@ impl<M: MediaController> Orchestrator<M> {
             // didn't (e.g. duck re-enabled mid-hold... never: snapshot).
             // Idempotent either way.
             self.media.duck();
+            // A release that landed during STARTING (R18) completes now:
+            // run the normal Up path (PROCESSING + Control::Up) instead of
+            // orphaning the capture until the watchdog.
+            if self.machine.take_pending_up() {
+                tracing::info!("applying remembered release at CaptureStarted");
+                return self.handle_ptt_up();
+            }
             vec![]
         } else {
             // Stale event — silently drop (phase gate rejects).
@@ -821,6 +835,30 @@ mod tests {
             is_set_tray(&actions, AppState::Recording),
             "should set Recording"
         );
+    }
+
+    #[test]
+    fn up_during_starting_completes_at_capture_started() {
+        // R18 live scenario: release lands before slow Down-handling
+        // delivers CaptureStarted. The Up sends no Control (nothing to stop
+        // yet) and the capture completes at CaptureStarted instead of
+        // orphaning until the watchdog.
+        let (mut orch, probe) = orch_with_fake(|_| {});
+        orch.handle(&evt_ptt_down());
+        let up_actions = orch.handle(&evt_ptt_up());
+        assert!(up_actions.is_empty(), "nothing to stop during STARTING");
+        assert_eq!(orch.machine.phase(), Phase::Starting);
+        let actions = orch.handle(&evt_capture_started());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendControl(Control::Up))),
+            "remembered release stops the capture"
+        );
+        assert_eq!(orch.machine.phase(), Phase::Processing);
+        orch.handle(&evt_done(""));
+        assert_eq!(orch.machine.phase(), Phase::Idle);
+        assert_eq!(probe.write_count(), 2, "dip + exact restore");
     }
 
     #[test]
