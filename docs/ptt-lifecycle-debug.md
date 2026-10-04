@@ -145,3 +145,23 @@ Log excerpt from `/tmp/wiflow_pristine_round2.log` for the single `/tmp/poster_k
 **Note:** this pristine run took the `empty transcript` path (so `INJECTING` did not appear), but the microphone was released and the machine returned to `Idle` (`Restoring -> Idle (finalized)`).
 
 Tray: the log shows `tray built (idle, ...)` at startup and ends in `Restoring -> Idle (finalized)` for this single-cycle run.
+
+### Pristine dual-path admission proof attempt (Round 3 / controller hypothesis)
+**Goal:** demonstrate (from logs) that the *second* Down delivered while non-Idle is admitted as a duplicate *ignored* by the phase gate.
+
+#### What the code logs (important constraint)
+- The app’s log sink caps tracing at **INFO**: `logfile.rs` sets `.with_max_level(tracing::Level::INFO)`. 
+- The “PttDown ignored” path is emitted as **debug**: `daemon.rs` has `e => tracing::debug!("ptt down ignored: {e:?}")`.
+=> Therefore, **no `PttDown IGNORED` lines can appear in `~/Library/Logs/wiflow/wiflow.log` under the current logging configuration**.
+
+#### Evidence from the pristine single-cycle log (Round 2)
+The pristine log excerpt shows accepted Down and the subsequent worker/handoff, but contains **no ignored-duplicate line between them**:
+```
+2026-10-04T05:02:36.081431Z ... [session=1] ... -> "PttDown"
+2026-10-04T05:02:36.081493Z ... state Idle -> Starting (PttDown)
+2026-10-04T05:02:36.453625Z ... [session=2] worker Control::Down
+...
+2026-10-04T05:02:37.296320Z ... state Processing -> Restoring (empty transcript)
+2026-10-04T05:02:37.296348Z ... [session=2] session ended
+```
+Because the IGNORED message is debug-only, we cannot prove the duplicate-admission suppression via quoted `PttDown IGNORED (phase ...)` log lines from this environment.
