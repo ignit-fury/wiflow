@@ -1179,6 +1179,9 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     // Feed inject result back to the orchestrator, which drives
                     // the machine through RESTORING → finalize (restoring
                     // media) and returns the appropriate tray action.
+                    // NOTE: finalize always appends HidePill — handle it
+                    // (never unreachable!: a panic here kills the event
+                    // loop, as a live run proved).
                     for fi_action in self.orchestrator.finish_inject(result) {
                         match fi_action {
                             Action::SetTray(state, note) => {
@@ -1186,11 +1189,9 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 self.sync_tray();
                             }
                             Action::Notify(msg) => self.warn_note(msg),
-                            Action::SendControl(_)
-                            | Action::Inject(_)
-                            | Action::ShowPill
-                            | Action::HidePill => {
-                                unreachable!("finish_inject only emits SetTray/Notify")
+                            Action::HidePill => self.pill.hide(),
+                            Action::SendControl(_) | Action::Inject(_) | Action::ShowPill => {
+                                unreachable!("finish_inject only emits SetTray/Notify/HidePill")
                             }
                         }
                     }
