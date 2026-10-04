@@ -143,3 +143,5 @@ Log excerpt from `/tmp/wiflow_pristine_round2.log` for the single `/tmp/poster_k
 ```
 
 **Note:** this pristine run took the `empty transcript` path (so `INJECTING` did not appear), but the microphone was released and the machine returned to `Idle` (`Restoring -> Idle (finalized)`).
+
+Tray: the log shows `tray built (idle, ...)` at startup and ends in `Restoring -> Idle (finalized)` for this single-cycle run.
