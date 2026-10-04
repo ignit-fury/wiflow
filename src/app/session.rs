@@ -202,6 +202,7 @@ mod tests {
 
     #[test]
     fn context_slow_provider_actually_times_out() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Provider that sleeps 600ms — past the 500ms bounded deadline.
         // The call must return None and complete well before 600ms.
         let t0 = std::time::Instant::now();
