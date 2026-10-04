@@ -895,38 +895,46 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
         let actions = self.orchestrator.handle(&event);
-        let mut inject_error = false;
         for action in actions {
             match action {
                 Action::SendControl(ctl) => self.send_control(ctl),
                 Action::SetTray(state, note) => {
-                    if !inject_error {
-                        self.set_state(state, note);
-                    }
+                    self.set_state(state, note);
                     self.sync_tray();
                 }
                 Action::Notify(msg) => self.warn_note(msg),
                 Action::Inject(text) => {
                     let injector = crate::core::traits::SystemInjector;
-                    match injector.inject(&text) {
+                    let result = match injector.inject(&text) {
                         Ok(r) => {
                             tracing::info!(
                                 "injected via {} (clipboard restored: {})",
                                 r.pasted_via,
                                 r.clipboard_restored
                             );
+                            Ok(r)
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
                             injector.leave_on_clipboard(&text);
-                            self.set_state(
-                                AppState::Error,
-                                Some(format!("injected to clipboard: {e}")),
-                            );
-                            self.sync_tray();
-                            inject_error = true;
+                            Err(e)
+                        }
+                    };
+                    // Feed inject result back to the orchestrator, which drives
+                    // the machine through RESTORING → finalize and returns the
+                    // appropriate tray action.
+                    for fi_action in self.orchestrator.finish_inject(result) {
+                        match fi_action {
+                            Action::SetTray(state, note) => {
+                                self.set_state(state, note);
+                                self.sync_tray();
+                            }
+                            Action::Notify(msg) => self.warn_note(msg),
+                            Action::SendControl(_) | Action::Inject(_) => {
+                                unreachable!("finish_inject only emits SetTray/Notify")
+                            }
                         }
                     }
                 }

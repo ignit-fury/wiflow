@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use crate::app::session::{begin_session, Session};
 use crate::app::AppState;
-use crate::core::traits::{ChainProvider, OsascriptContext, RouterRecognizer, SystemInjector};
+use crate::core::traits::{
+    ChainProvider, InjectReport, OsascriptContext, RouterRecognizer, SystemInjector,
+};
 use crate::daemon::{Control, DaemonEvent};
 use crate::ptt::{Admission, Phase, PttMachine};
 
@@ -49,20 +51,24 @@ pub(crate) struct NoopMedia;
 /// All `DaemonEvent` routing goes through `handle()`. Terminal events
 /// (Done, Failed) funnel through `finalize_session`. Supervision is armed
 /// on entering LISTENING and checked by `tick()`.
-#[allow(dead_code)]
 pub struct Orchestrator {
     machine: PttMachine,
     session: Option<Session>,
     supervision_at: Option<Instant>,
+    /// S3/Task-12 seam: will track output device / playback state.
+    #[allow(dead_code)]
     media: NoopMedia,
-    // Stored for constructor contract; used by begin_session (context) and
-    // reserved for future S3 tasks (recognizer, cleanup, injector).
+    /// Brief-pinned constructor signature; final review may prune.
     #[allow(dead_code)]
     recognizer: RouterRecognizer,
+    /// Brief-pinned constructor signature; final review may prune.
     #[allow(dead_code)]
     cleanup: ChainProvider,
+    /// Brief-pinned constructor signature; final review may prune.
     #[allow(dead_code)]
     injector: SystemInjector,
+    /// Brief-pinned constructor signature; final review may prune.
+    #[allow(dead_code)]
     context: OsascriptContext,
 }
 
@@ -142,6 +148,32 @@ impl Orchestrator {
         }
     }
 
+    /// Called by the App after executing `Inject(text)` on the winit thread.
+    ///
+    /// On `Ok`: `on_inject_ok` → RESTORING → `finalize_session(false)` → IDLE.
+    /// On `Err`: `on_inject_failed` → RESTORING → `finalize_session(true)` → ERROR
+    ///   (with the inject error surfaced in the tray note).
+    pub fn finish_inject(&mut self, result: Result<InjectReport, String>) -> Vec<Action> {
+        match result {
+            Ok(_) => {
+                self.machine.on_inject_ok();
+                self.finalize_session(false)
+            }
+            Err(e) => {
+                self.machine.on_inject_failed();
+                let mut actions = self.finalize_session(true);
+                // Override the generic "session ended" note with the actual
+                // inject error so the user sees the real problem.
+                for action in &mut actions {
+                    if let Action::SetTray(AppState::Error, note) = action {
+                        *note = Some(format!("injected to clipboard: {e}"));
+                    }
+                }
+                actions
+            }
+        }
+    }
+
     /// THE funnel (H7): every terminal path ends here.
     ///
     /// Step order:
@@ -152,6 +184,12 @@ impl Orchestrator {
     /// 5. Release audio_ref (drop session)
     /// 6. Session-end log line
     /// 7. on_finalized machine step
+    ///
+    /// Tray state (Idle vs Error) is derived from `self.machine.phase()`
+    /// after `on_finalized()` — single source of truth. The `fatal` param
+    /// is only used for the non-Restoring fallback path (e.g. supervision
+    /// expiry from Listening, where the machine isn't in Restoring and must
+    /// be forced to Error via `on_failed`).
     pub(crate) fn finalize_session(&mut self, fatal: bool) -> Vec<Action> {
         // 1. Disarm supervision
         self.supervision_at = None;
@@ -170,17 +208,23 @@ impl Orchestrator {
         // 7. on_finalized machine step (only valid from Restoring)
         if self.machine.phase() == Phase::Restoring {
             self.machine.on_finalized();
-        }
-
-        // Determine target tray state
-        let (state, note) = if fatal {
-            (AppState::Error, Some("session ended".into()))
-        } else {
-            match self.machine.phase() {
-                Phase::Idle => (AppState::Idle, None),
-                Phase::Error => (AppState::Error, Some("session ended".into())),
-                _ => (AppState::Idle, None),
+        } else if fatal {
+            // Non-Restoring fatal case (e.g. supervision expiry from
+            // Listening): force to Restoring → Error so the machine and
+            // tray agree.
+            self.machine.on_failed();
+            if self.machine.phase() == Phase::Restoring {
+                self.machine.on_finalized();
             }
+        }
+        // For non-fatal non-Restoring (e.g. shutdown from Listening), the
+        // machine stays in its current phase; the tray below defaults to
+        // Idle. Acceptable because the app is exiting.
+
+        // Derive tray state from machine phase — single source of truth.
+        let (state, note) = match self.machine.phase() {
+            Phase::Error => (AppState::Error, Some("session ended".into())),
+            _ => (AppState::Idle, None),
         };
 
         vec![Action::SetTray(state, note)]
@@ -270,13 +314,10 @@ impl Orchestrator {
             }
         } else {
             if self.machine.on_transcript() == Admission::Accept {
-                // Optimistic: assume inject will succeed.
-                // The App executes Inject on the winit thread and handles
-                // failures locally (text left on clipboard).
-                self.machine.on_inject_ok();
-                let mut actions = self.finalize_session(false);
-                actions.insert(0, Action::Inject(text.to_string()));
-                actions
+                // Emit Inject action only. The App executes it on the winit
+                // thread and then calls `finish_inject` with the result,
+                // which drives the machine through RESTORING → finalize.
+                vec![Action::Inject(text.to_string())]
             } else {
                 vec![]
             }
@@ -404,9 +445,7 @@ mod tests {
             .count()
     }
 
-    // ── RED-first marker: these tests describe the expected behavior
-    // before the Orchestrator exists. They should fail to compile,
-    // then pass after implementation.
+    // ── Routing & lifecycle tests ─────────────────────────────────────────
 
     #[test]
     fn happy_path_actions_sequence() {
@@ -444,23 +483,116 @@ mod tests {
             "PttUp should send Up control"
         );
 
-        // Done with text → [Inject(text), SetTray(Idle, None)]
+        // Done with text → [Inject(text)] only; no finalize yet.
         let actions = orch.handle(&evt_done("hello world"));
-        assert_eq!(actions.len(), 2, "Done with text should produce 2 actions");
+        assert_eq!(
+            actions.len(),
+            1,
+            "Done with text should produce Inject only"
+        );
         assert!(is_inject(&actions), "Done should produce Inject action");
         assert_eq!(
             inject_text(&actions),
             Some("hello world"),
             "Inject should carry the transcript text"
         );
+
+        // App executes Inject → calls finish_inject(Ok) → [SetTray(Idle)]
+        let ok_report = InjectReport {
+            pasted_via: "test",
+            clipboard_restored: true,
+        };
+        let actions = orch.finish_inject(Ok(ok_report));
+        assert_eq!(
+            actions.len(),
+            1,
+            "finish_inject(Ok) should produce 1 action"
+        );
         assert!(
             is_set_tray(&actions, AppState::Idle),
-            "Done should set Idle state"
+            "finish_inject(Ok) should set Idle state"
         );
 
         // Next PttDown should work (machine is back in Idle)
         let actions = orch.handle(&evt_ptt_down());
         assert!(!actions.is_empty(), "PttDown from Idle should be accepted");
+    }
+
+    #[test]
+    fn inject_success_ends_idle() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut orch = new_orchestrator();
+
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+
+        // Done text → Inject only
+        let actions = orch.handle(&evt_done("success text"));
+        assert_eq!(count_inject(&actions), 1);
+        assert!(
+            !is_set_tray(&actions, AppState::Idle),
+            "Inject step should not emit SetTray"
+        );
+
+        // finish_inject(Ok) → IDLE
+        let ok_report = InjectReport {
+            pasted_via: "test",
+            clipboard_restored: true,
+        };
+        let actions = orch.finish_inject(Ok(ok_report));
+        assert!(
+            is_set_tray(&actions, AppState::Idle),
+            "inject success must end in IDLE"
+        );
+        assert_eq!(orch.machine.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn inject_failure_ends_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut orch = new_orchestrator();
+
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+
+        // Done text → Inject only
+        let actions = orch.handle(&evt_done("will fail"));
+        assert_eq!(count_inject(&actions), 1);
+
+        // finish_inject(Err) → ERROR with inject-error note
+        let actions = orch.finish_inject(Err("enigo failed".into()));
+        assert!(
+            is_set_tray(&actions, AppState::Error),
+            "inject failure must end in ERROR"
+        );
+        assert_eq!(orch.machine.phase(), Phase::Error);
+        // Verify the note mentions the inject error
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SetTray(AppState::Error, n) if n.as_ref().is_some_and(|n| n.contains("clipboard")))),
+            "tray note must mention clipboard fallback"
+        );
+    }
+
+    #[test]
+    fn on_inject_failed_live_covered() {
+        // Verifies that on_inject_failed is exercised through finish_inject,
+        // eliminating the dead-code warning from the original commit.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut orch = new_orchestrator();
+
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+        orch.handle(&evt_done("text"));
+
+        // Before finish_inject, machine is Injecting
+        assert_eq!(orch.machine.phase(), Phase::Injecting);
+
+        // finish_inject(Err) → on_inject_failed → RESTORING → finalize → ERROR
+        let _actions = orch.finish_inject(Err("fail".into()));
+        assert_eq!(orch.machine.phase(), Phase::Error);
     }
 
     #[test]
@@ -508,17 +640,24 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let mut orch = new_orchestrator();
 
-        // Full happy path to Idle
+        // Full happy path to Idle (including finish_inject)
         orch.handle(&evt_ptt_down());
         orch.handle(&evt_capture_started());
         orch.handle(&evt_ptt_up());
 
-        // First Done: accepted → Inject + SetTray(Idle)
+        // First Done: accepted → Inject
         let actions1 = orch.handle(&evt_done("first transcript"));
         assert!(
             count_inject(&actions1) == 1,
             "first Done should produce exactly 1 Inject"
         );
+
+        // finish_inject → Idle
+        let ok_report = InjectReport {
+            pasted_via: "test",
+            clipboard_restored: true,
+        };
+        let _actions = orch.finish_inject(Ok(ok_report));
 
         // Second Done: machine in Idle → rejected
         let actions2 = orch.handle(&evt_done("second transcript"));
@@ -621,12 +760,7 @@ mod tests {
         orch.handle(&evt_failed("capture failed"));
 
         // Verify we're in Error
-        assert!(
-            orch.machine.phase() == Phase::Error || {
-                // The machine went through Restoring → Error via finalize
-                true
-            }
-        );
+        assert_eq!(orch.machine.phase(), Phase::Error);
 
         // PttDown from Error → accepted (Start new session)
         let actions = orch.handle(&evt_ptt_down());
@@ -815,9 +949,18 @@ mod tests {
             is_inject(&actions),
             "Done from Starting should produce Inject"
         );
+        // Inject only — no SetTray yet (finish_inject drives the rest).
+        assert_eq!(actions.len(), 1, "should produce Inject action only");
+
+        // finish_inject(Ok) → Idle
+        let ok_report = InjectReport {
+            pasted_via: "test",
+            clipboard_restored: true,
+        };
+        let actions = orch.finish_inject(Ok(ok_report));
         assert!(
             is_set_tray(&actions, AppState::Idle),
-            "should finalize to Idle"
+            "should finalize to Idle after successful inject"
         );
     }
 
@@ -882,6 +1025,34 @@ mod tests {
         assert!(
             orch.session.is_none(),
             "finalize should release the session"
+        );
+    }
+
+    #[test]
+    fn session_released_on_finish_inject() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut orch = new_orchestrator();
+
+        orch.handle(&evt_ptt_down());
+        orch.handle(&evt_capture_started());
+        orch.handle(&evt_ptt_up());
+        orch.handle(&evt_done("text"));
+
+        // Session still held (Done text doesn't finalize)
+        assert!(
+            orch.session.is_some(),
+            "session must exist before finish_inject"
+        );
+
+        let ok_report = InjectReport {
+            pasted_via: "test",
+            clipboard_restored: true,
+        };
+        let _actions = orch.finish_inject(Ok(ok_report));
+
+        assert!(
+            orch.session.is_none(),
+            "finish_inject must release the session"
         );
     }
 
