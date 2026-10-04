@@ -1013,6 +1013,19 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 }
             }
         }
+        // Faithful to the pre-S2 duck design (d9172df..40a7233): empty
+        // transcripts and failures restore here (non-empty success restores
+        // after injection above). Guarded by may_restore: never steal a
+        // newer hold's restore. Task 12 unifies all paths under finalize.
+        match &event {
+            DaemonEvent::Done { text, .. } if text.is_empty() && may_restore => {
+                self.duck.restore();
+            }
+            DaemonEvent::Failed(_) if may_restore => {
+                self.duck.restore();
+            }
+            _ => {}
+        }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
