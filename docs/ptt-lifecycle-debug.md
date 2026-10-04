@@ -72,3 +72,15 @@ that only a physical Fn run with instrumentation can pin down.
    - Default config (60s watchdog) sanity cycle: clean, no watchdog.
 8. **`cargo test`: 129 passed, 0 failed, 1 ignored; `cargo build`: 0 warnings.**
  9. **S2 live regression (2026-10-04 04:55, HEAD a48c5bb)** — full suite **197 passed, 0 failed, 1 ignored**; matrix A(200ms)/B(1s)/C(5s)/D(10s)/H(20×1s) **all 24 cycles complete, mic released every time, tray Idle**; 8-phase sequence confirmed (IDLE→STARTING→LISTENING→PROCESSING→INJECTING/RESTORING→IDLE); 23 `capture started` ↔ 23 `mic released` ↔ 23 `session ended` (0 orphaned); config restored byte-identical (`diff` clean).
+
+### Evidence clarifications (Task 9 / S2 live regression gate)
+- **poster_kb invocations vs “sessions” accounting:** 24 synthetic key presses were posted total (**A=1, B=1, C=1, D=1, H=20**). In the retained `~/Library/Logs/wiflow/wiflow.log`, we observed **24** `PttDown` and **24** `PttUp` tap events, but only **23** occurrences of `capture started — mic open` / `mic released` / `session ended` (1 key press did not reach the mic-capture→session-ended stage in logs).
+- **Session id ambiguity (why the report mentioned a range):** `session=...` ids in the log are internal worker/orchestrator ids and span a wider range during the whole matrix run (up to `session=47`). For a *single cycle*, the orchestrator/worker `session` is consistent; e.g. the cycle that showed **full 8-phase** transitions includes:
+  - `state Idle -> Starting (PttDown)`
+  - `state Starting -> Listening (CaptureStarted)`
+  - `state Listening -> Processing (PttUp)`
+  - `state Processing -> Injecting (transcript)`
+  - `[session=5] worker Control::Down` / `[session=5] worker Control::Up` / `[session=5] capture started — mic open` / `[session=5] session ended`
+  - `state Injecting -> Restoring (inject ok)`
+  - `state Restoring -> Idle (finalized)`
+- **Config restore evidence:** `/tmp/config_backup.json` md5=`7bf14202e6524b499dc6d2e97ba2e2f2` and the restored `~/Library/Application Support/wiflow/config.json` md5=`7bf14202e6524b499dc6d2e97ba2e2f2` match; running `diff /tmp/config_backup.json ~/Library/Application\ Support/wiflow/config.json` produced **no diff output**.
