@@ -470,13 +470,27 @@ pub fn worker_main(
                 let deadline = start + Duration::from_millis(max_ms);
                 let now = Instant::now();
                 if now >= deadline {
-                    watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms, &duck);
+                    watchdog(
+                        &mut ptt,
+                        &mut capture,
+                        &mut capture_start,
+                        &proxy,
+                        max_ms,
+                        &duck,
+                    );
                     continue;
                 }
                 match rx.recv_timeout(deadline - now) {
                     Ok(c) => c,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        watchdog(&mut ptt, &mut capture, &mut capture_start, &proxy, max_ms, &duck);
+                        watchdog(
+                            &mut ptt,
+                            &mut capture,
+                            &mut capture_start,
+                            &proxy,
+                            max_ms,
+                            &duck,
+                        );
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
