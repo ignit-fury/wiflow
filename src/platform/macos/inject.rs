@@ -1,11 +1,9 @@
 use arboard::Clipboard;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InjectReport {
-    pub pasted_via: &'static str,
-    pub clipboard_restored: bool,
-}
+// InjectReport now lives in core::traits (finding 2); re-exported for
+// backward compatibility with any call sites still using the old path.
+pub use crate::core::traits::InjectReport;
 
 fn enigo_err(ctx: &str, e: impl std::fmt::Debug) -> String {
     format!("{ctx}: {e:?}")

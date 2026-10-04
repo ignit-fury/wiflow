@@ -221,13 +221,18 @@ fn pipeline_on_worker(
     let t0 = std::time::Instant::now();
     // STT via trait (groq→local fallback, same logic).
     let recognizer = crate::core::traits::RouterRecognizer;
-    let text = match recognizer.transcribe(&kept, crate::core::vad::VAD_SAMPLE_RATE, &cfg) {
+    let transcript = match recognizer.transcribe(&kept, crate::core::vad::VAD_SAMPLE_RATE, &cfg) {
         Ok(t) => t,
         Err(e) => {
             let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
             return;
         }
     };
+    // Surface provider warnings as tray alerts (exact pre-task message text).
+    for warning in &transcript.warnings {
+        let _ = proxy.send_event(DaemonEvent::CleanupIssue(warning.clone()));
+    }
+    let text = transcript.text;
     let ms = t0.elapsed().as_millis();
     let kept_ms = kept.len() as f64 / crate::core::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);

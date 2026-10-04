@@ -7,20 +7,46 @@
 
 use crate::core::cleanup::CleanupOutcome;
 use crate::core::config::{Config, ModelChoice};
-use crate::platform::macos::inject::InjectReport;
+
+// ── Shared types ────────────────────────────────────────────────────────────
+
+/// Transcript from STT: text plus optional provider warnings (e.g. cloud
+/// fell back to local). The daemon maps each warning → CleanupIssue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transcript {
+    pub text: String,
+    pub warnings: Vec<String>,
+}
+
+/// Report from text injection into the focused cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectReport {
+    pub pasted_via: &'static str,
+    pub clipboard_restored: bool,
+}
 
 // ── SpeechRecognizer ────────────────────────────────────────────────────────
 
 /// Speech-to-text: raw audio → transcript.
 pub trait SpeechRecognizer {
-    fn transcribe(&self, audio: &[f32], sample_rate: u32, cfg: &Config) -> Result<String, String>;
+    fn transcribe(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        cfg: &Config,
+    ) -> Result<Transcript, String>;
 }
 
 /// Production: Groq cloud (opt-in) → local whisper fallback.
 pub struct RouterRecognizer;
 
 impl SpeechRecognizer for RouterRecognizer {
-    fn transcribe(&self, audio: &[f32], sample_rate: u32, cfg: &Config) -> Result<String, String> {
+    fn transcribe(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        cfg: &Config,
+    ) -> Result<Transcript, String> {
         let model_path = match cfg.model {
             ModelChoice::TinyEn => crate::core::stt::ensure_model_variant("tiny"),
             ModelChoice::SmallEn => crate::core::stt::ensure_model_variant("small"),
@@ -32,20 +58,38 @@ impl SpeechRecognizer for RouterRecognizer {
             match crate::core::groq_stt::transcribe_cloud(audio, sample_rate, cfg) {
                 Ok(t) => {
                     tracing::info!("cloud stt (whisper-large-v3) done");
-                    Ok(t)
+                    Ok(Transcript {
+                        text: t,
+                        warnings: Vec::new(),
+                    })
                 }
-                Err(_e) => {
-                    // Groq failed → local fallback (alert event moved to call site).
-                    crate::core::stt::transcribe_shared(
+                Err(e) => {
+                    let msg = format!("Groq STT failed: {e} — using local whisper");
+                    tracing::warn!("{msg}");
+                    // Local fallback: warning surfaces at call site.
+                    let text = crate::core::stt::transcribe_shared(
                         &model_path,
                         audio,
                         &prompt,
                         &cfg.stt_language,
-                    )
+                    )?;
+                    Ok(Transcript {
+                        text,
+                        warnings: vec![msg],
+                    })
                 }
             }
         } else {
-            crate::core::stt::transcribe_shared(&model_path, audio, &prompt, &cfg.stt_language)
+            let text = crate::core::stt::transcribe_shared(
+                &model_path,
+                audio,
+                &prompt,
+                &cfg.stt_language,
+            )?;
+            Ok(Transcript {
+                text,
+                warnings: Vec::new(),
+            })
         }
     }
 }
@@ -137,8 +181,28 @@ mod tests {
             _audio: &[f32],
             _sample_rate: u32,
             _cfg: &Config,
-        ) -> Result<String, String> {
-            Ok("fake transcript".to_string())
+        ) -> Result<Transcript, String> {
+            Ok(Transcript {
+                text: "fake transcript".to_string(),
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    /// Fake that returns a transcript with a warning (simulates Groq→local
+    /// fallback so the call-site warning-mapping path can be tested).
+    struct FakeRecognizerWithWarning;
+    impl SpeechRecognizer for FakeRecognizerWithWarning {
+        fn transcribe(
+            &self,
+            _audio: &[f32],
+            _sample_rate: u32,
+            _cfg: &Config,
+        ) -> Result<Transcript, String> {
+            Ok(Transcript {
+                text: "fake fallback transcript".to_string(),
+                warnings: vec!["Groq STT failed: timeout — using local whisper".to_string()],
+            })
         }
     }
 
@@ -208,7 +272,49 @@ mod tests {
         let fake = FakeRecognizer;
         let cfg = Config::default();
         let result = fake.transcribe(&[0.0f32; 100], 16_000, &cfg);
-        assert_eq!(result, Ok("fake transcript".to_string()));
+        assert_eq!(
+            result,
+            Ok(Transcript {
+                text: "fake transcript".to_string(),
+                warnings: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_fake_recognizer_warning_surfaces() {
+        // RED-first test: verifies the warning-mapping path the daemon
+        // worker uses (each warning → CleanupIssue-equivalent).
+        let fake = FakeRecognizerWithWarning;
+        let cfg = Config::default();
+        let transcript = fake
+            .transcribe(&[0.0f32; 100], 16_000, &cfg)
+            .expect("transcript must succeed after fallback");
+
+        assert_eq!(transcript.text, "fake fallback transcript");
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(
+            transcript.warnings[0],
+            "Groq STT failed: timeout — using local whisper"
+        );
+
+        // Simulate the daemon worker's warning→CleanupIssue mapping.
+        let mut cleanup_issues = Vec::new();
+        for w in &transcript.warnings {
+            cleanup_issues.push(w.clone());
+        }
+        assert_eq!(
+            cleanup_issues,
+            vec!["Groq STT failed: timeout — using local whisper".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_transcript_ok_no_warnings() {
+        let fake = FakeRecognizer;
+        let cfg = Config::default();
+        let t = fake.transcribe(&[0.0], 16_000, &cfg).unwrap();
+        assert!(t.warnings.is_empty());
     }
 
     #[test]
@@ -315,9 +421,10 @@ mod tests {
 
         let cfg = Config::default();
         let transcript = recognizer.transcribe(&[0.0f32; 100], 16_000, &cfg).unwrap();
-        assert_eq!(transcript, "fake transcript");
+        assert_eq!(transcript.text, "fake transcript");
+        assert!(transcript.warnings.is_empty());
 
-        let outcome = cleaner.clean(&transcript, None, &cfg);
+        let outcome = cleaner.clean(&transcript.text, None, &cfg);
         assert_eq!(outcome.text, "cleaned: fake transcript");
 
         let report = injector.inject(&outcome.text);
@@ -333,7 +440,7 @@ mod tests {
 
         let cfg = Config::default();
         let transcript = recognizer.transcribe(&[0.0f32; 100], 16_000, &cfg).unwrap();
-        let outcome = cleaner.clean(&transcript, None, &cfg);
+        let outcome = cleaner.clean(&transcript.text, None, &cfg);
 
         let result = injector.inject(&outcome.text);
         if result.is_err() {
@@ -344,5 +451,29 @@ mod tests {
             injector.left_text.borrow().as_str(),
             "cleaned: fake transcript"
         );
+    }
+
+    #[test]
+    fn test_fake_pipeline_with_warning_emits_cleanup_issue() {
+        // Full fake pipeline: recognizer with warning → warning mapped to
+        // CleanupIssue → clean → inject.
+        let recognizer = FakeRecognizerWithWarning;
+        let cleaner = FakeCleaner;
+        let injector = FakeInjectorOk;
+
+        let cfg = Config::default();
+        let transcript = recognizer.transcribe(&[0.0f32; 100], 16_000, &cfg).unwrap();
+
+        // Call-site warning → CleanupIssue mapping (same as daemon worker).
+        let mut issues: Vec<String> = Vec::new();
+        for w in &transcript.warnings {
+            issues.push(w.clone());
+        }
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("Groq STT failed"));
+
+        let outcome = cleaner.clean(&transcript.text, None, &cfg);
+        let report = injector.inject(&outcome.text);
+        assert!(report.is_ok());
     }
 }
