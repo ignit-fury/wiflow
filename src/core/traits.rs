@@ -57,7 +57,7 @@ impl SpeechRecognizer for RouterRecognizer {
         if cfg.stt_provider == "groq" {
             match crate::core::groq_stt::transcribe_cloud(audio, sample_rate, cfg) {
                 Ok(t) => {
-                    tracing::info!("cloud stt (whisper-large-v3) done");
+                    tracing::info!("cloud stt (whisper-large-v3-turbo) done");
                     Ok(Transcript {
                         text: t,
                         warnings: Vec::new(),

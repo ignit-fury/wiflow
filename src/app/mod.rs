@@ -391,7 +391,7 @@ pub fn build_menu(
     );
     let stt_groq = CheckMenuItem::with_id(
         ids.stt_groq.clone(),
-        "Transcription: Groq cloud (whisper-large-v3)",
+        "Transcription: Groq cloud (whisper-large-v3-turbo)",
         true,
         config.stt_provider == "groq",
         None,
@@ -941,7 +941,7 @@ impl DaemonApp {
             self.config.stt_provider = "groq".into();
             self.save();
             self.menu_dirty = true;
-            tracing::info!("stt provider: groq cloud (whisper-large-v3)");
+            tracing::info!("stt provider: groq cloud (whisper-large-v3-turbo)");
             return;
         }
         if *id == ids.key_groq {

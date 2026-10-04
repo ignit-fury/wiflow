@@ -112,7 +112,7 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
             let cfg = crate::core::config::load_config();
             let prompt = crate::core::stt::read_prompt();
             // Same STT provider branch as the daemon: "groq" = cloud
-            // whisper-large-v3 (OPT-IN, tray alert + local fallback on
+            // whisper-large-v3-turbo (OPT-IN, tray alert + local fallback on
             // failure), otherwise local on-device whisper.
             let text = if cfg.stt_provider == "groq" {
                 match crate::core::groq_stt::transcribe_cloud(
@@ -121,7 +121,7 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
                     &cfg,
                 ) {
                     Ok(t) => {
-                        info!("cloud stt (whisper-large-v3) done");
+                        info!("cloud stt (whisper-large-v3-turbo) done");
                         t
                     }
                     Err(e) => {
