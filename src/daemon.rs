@@ -341,10 +341,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
                 Ok(cap) => {
                     *capture = Some(cap);
                     *capture_start = Some(Instant::now());
-                    tracing::info!(
-                        "[session={}] capture started — mic open",
-                        current_session()
-                    );
+                    tracing::info!("[session={}] capture started — mic open", current_session());
 
                     // Emit before any transcription begins.
                     if sender.send_event(DaemonEvent::CaptureStarted).is_err() {
@@ -371,9 +368,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
                     // NEXT press is a fresh cycle (not dead).
                     let _ = ptt.on_cancel();
                     if sender
-                        .send_event(DaemonEvent::Failed(format!(
-                            "capture failed: {e}"
-                        )))
+                        .send_event(DaemonEvent::Failed(format!("capture failed: {e}")))
                         .is_err()
                     {
                         tracing::error!(
@@ -481,12 +476,7 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         match ctl {
             Control::Down => {
                 tracing::info!("[session={}] worker Control::Down", current_session());
-                worker_on_control_down(
-                    &proxy,
-                    &mut ptt,
-                    &mut capture,
-                    &mut capture_start,
-                );
+                worker_on_control_down(&proxy, &mut ptt, &mut capture, &mut capture_start);
             }
             Control::Up => {
                 tracing::info!("[session={}] worker Control::Up", current_session());
