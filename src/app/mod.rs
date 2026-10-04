@@ -933,6 +933,14 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 }
                 self.send_control(Control::Cancel);
             }
+            DaemonEvent::CaptureStarted => {
+                // Task 8 will wire routing. Until then, keep the Phase
+                // machine gated by the orchestrator plan.
+                tracing::debug!(
+                    "[session={}] CaptureStarted ignored (routing not wired yet)",
+                    crate::daemon::current_session()
+                );
+            }
             DaemonEvent::Watchdog { duration_ms } => {
                 if self.ptt.on_watchdog() == Admission::Ignore {
                     return;

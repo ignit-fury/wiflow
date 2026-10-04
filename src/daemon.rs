@@ -59,6 +59,11 @@ pub enum DaemonEvent {
     PttDown,
     PttUp,
     Cancel,
+    /// Worker reports that `AudioCapture::start(...)` succeeded.
+    ///
+    /// Fieldless: ordering is the whole contract (sent immediately after
+    /// capture start-ok, before any transcription).
+    CaptureStarted,
     /// Safety watchdog fired: the recording ran past the max duration
     /// because PttUp never arrived. The worker force-stopped the mic and is
     /// transcribing what it captured; the app must leave Recording.
@@ -311,6 +316,78 @@ fn pipeline_on_worker(
     });
 }
 
+trait DaemonEventSender {
+    fn send_event(&self, event: DaemonEvent) -> Result<(), ()>;
+}
+
+impl DaemonEventSender for EventLoopProxy<DaemonEvent> {
+    fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+        self.send_event(event).map_err(|_| ())
+    }
+}
+
+fn worker_on_control_down<S: DaemonEventSender>(
+    sender: &S,
+    ptt: &mut PushToTalk,
+    capture: &mut Option<crate::core::audio::AudioCapture>,
+    capture_start: &mut Option<Instant>,
+) {
+    let now = now_ms();
+    match ptt.on_key_down(now) {
+        PttEvent::Started => {
+            // Menu-selected mic, re-read per hold (never cached).
+            let mic = crate::core::config::load_config().mic_name;
+            match crate::core::audio::AudioCapture::start(mic) {
+                Ok(cap) => {
+                    *capture = Some(cap);
+                    *capture_start = Some(Instant::now());
+                    tracing::info!(
+                        "[session={}] capture started — mic open",
+                        current_session()
+                    );
+
+                    // Emit before any transcription begins.
+                    if sender.send_event(DaemonEvent::CaptureStarted).is_err() {
+                        tracing::error!(
+                            "[session={}] capture-start notice lost — dropping capture",
+                            current_session()
+                        );
+                        // Mirror capture-failure semantics: clear hold
+                        // bookkeeping so the NEXT press is a fresh cycle.
+                        let _ = ptt.on_cancel();
+                        *capture = None;
+                        *capture_start = None;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[session={}] capture failed: {e} — recording cannot start",
+                        current_session()
+                    );
+                    *capture = None;
+                    *capture_start = None;
+                    // Failed leaves the app's Recording phase and
+                    // this clears the hold bookkeeping, so the
+                    // NEXT press is a fresh cycle (not dead).
+                    let _ = ptt.on_cancel();
+                    if sender
+                        .send_event(DaemonEvent::Failed(format!(
+                            "capture failed: {e}"
+                        )))
+                        .is_err()
+                    {
+                        tracing::error!(
+                            "[session={}] capture-failure notice lost",
+                            current_session()
+                        );
+                    }
+                }
+            }
+        }
+        e => tracing::debug!("ptt down ignored: {e:?}"),
+    }
+}
+
 /// Safety watchdog (PRD §6): the mic is open but the PttUp that should
 /// have stopped it never arrived. Force-stop the capture (mic dies here),
 /// warn loudly, transcribe what was captured, and tell the app so the
@@ -404,44 +481,12 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
         match ctl {
             Control::Down => {
                 tracing::info!("[session={}] worker Control::Down", current_session());
-                match ptt.on_key_down(now_ms()) {
-                    PttEvent::Started => {
-                        // Menu-selected mic, re-read per hold (never cached).
-                        let mic = crate::core::config::load_config().mic_name;
-                        match crate::core::audio::AudioCapture::start(mic) {
-                            Ok(cap) => {
-                                capture = Some(cap);
-                                capture_start = Some(Instant::now());
-                                tracing::info!(
-                                    "[session={}] capture started — mic open",
-                                    current_session()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[session={}] capture failed: {e} — recording cannot start",
-                                    current_session()
-                                );
-                                capture = None;
-                                capture_start = None;
-                                // Failed leaves the app's Recording phase and
-                                // this clears the hold bookkeeping, so the
-                                // NEXT press is a fresh cycle (not dead).
-                                let _ = ptt.on_cancel();
-                                if proxy
-                                    .send_event(DaemonEvent::Failed(format!("capture failed: {e}")))
-                                    .is_err()
-                                {
-                                    tracing::error!(
-                                        "[session={}] capture-failure notice lost",
-                                        current_session()
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    e => tracing::debug!("ptt down ignored: {e:?}"),
-                }
+                worker_on_control_down(
+                    &proxy,
+                    &mut ptt,
+                    &mut capture,
+                    &mut capture_start,
+                );
             }
             Control::Up => {
                 tracing::info!("[session={}] worker Control::Up", current_session());
@@ -537,6 +582,69 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_capture_started_not_emitted_on_capture_failure() {
+        // CI runs without a real mic; still, make the failure deterministic
+        // by pointing the config at a known-missing device.
+        let home = std::env::temp_dir().join(format!(
+            "wiflow-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::env::set_var("HOME", &home);
+
+        let support_dir = crate::core::config::app_support_dir();
+        std::fs::create_dir_all(&support_dir).unwrap();
+        std::fs::write(
+            support_dir.join("config.json"),
+            r#"{"mic_name":"no-such-device-xyz"}"#,
+        )
+        .unwrap();
+
+        let cfg = crate::core::config::load_config();
+        assert_eq!(cfg.mic_name.as_deref(), Some("no-such-device-xyz"));
+
+        struct FakeSender {
+            failed_msg: std::sync::Mutex<Option<String>>,
+            capture_started_seen: std::sync::Mutex<bool>,
+        }
+
+        impl DaemonEventSender for FakeSender {
+            fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+                match event {
+                    DaemonEvent::Failed(msg) => {
+                        *self.failed_msg.lock().unwrap() = Some(msg);
+                    }
+                    DaemonEvent::CaptureStarted => {
+                        *self.capture_started_seen.lock().unwrap() = true;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+
+        let sender = FakeSender {
+            failed_msg: Default::default(),
+            capture_started_seen: Default::default(),
+        };
+
+        let mut ptt = PushToTalk::new(300, 60_000);
+        let mut capture: Option<crate::core::audio::AudioCapture> = None;
+        let mut capture_start: Option<Instant> = None;
+        worker_on_control_down(&sender, &mut ptt, &mut capture, &mut capture_start);
+
+        let failed = sender.failed_msg.lock().unwrap().clone();
+        let started = *sender.capture_started_seen.lock().unwrap();
+        assert!(failed.is_some());
+        let msg = failed.unwrap();
+        assert!(msg.starts_with("capture failed:"), "{msg}");
+        assert!(!started);
+    }
 
     #[test]
     fn test_presets_are_distinct_ids() {
