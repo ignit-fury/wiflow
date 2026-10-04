@@ -174,6 +174,7 @@ impl SettingsWindow {
                 position: None,
             },
         )?;
+        gl.show();
         Ok(Self {
             gl,
             vm: SettingsViewModel::load(),

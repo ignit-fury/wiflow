@@ -99,7 +99,7 @@ impl GlWindow {
             None,
             None,
         );
-        window.set_visible(true);
+        window.set_visible(false);
         Ok(Self {
             window,
             surface,
@@ -112,6 +112,12 @@ impl GlWindow {
 
     pub fn window_id(&self) -> WindowId {
         self.window.id()
+    }
+
+    /// Make visible. Called AFTER any panel configuration (the pill must be
+    /// non-activating before its first show) — creation never shows.
+    pub fn show(&self) {
+        self.window.set_visible(true);
     }
 
     pub fn set_visible(&self, visible: bool) {

@@ -22,7 +22,6 @@ use crate::core::audio::recording_rms;
 const SMOOTH_ALPHA: f32 = 0.35;
 /// Bars of waveform history.
 const BAR_COUNT: usize = 32;
-
 /// Blend one step toward the target. Pure; unit-tested below.
 pub fn smooth_rms(prev: f32, target: f32) -> f32 {
     prev + (target - prev) * SMOOTH_ALPHA
@@ -134,8 +133,8 @@ impl Pill {
                 event_loop,
                 &GlWindowOpts {
                     title: "wiflow",
-                    width: 300.0,
-                    height: 64.0,
+                    width: 320.0,
+                    height: 84.0,
                     decorations: false,
                     always_on_top: true,
                     position: Some((x, y)),
@@ -143,7 +142,7 @@ impl Pill {
             ) {
                 Ok(gl) => {
                     crate::platform::macos::panel::configure_pill_panel(&gl.window);
-                    gl.set_visible(true);
+                    gl.show();
                     self.gl = Some(gl);
                 }
                 Err(e) => {
@@ -153,7 +152,7 @@ impl Pill {
             }
         }
         if let Some(g) = self.gl.as_ref() {
-            g.set_visible(true);
+            crate::platform::macos::panel::order_front_without_activating(&g.window);
         }
         self.state.show_now();
     }
@@ -182,35 +181,42 @@ impl Pill {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(24, 24, 28)))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        // Recording dot.
-                        ui.label(
-                            egui::RichText::new("●")
-                                .color(egui::Color32::from_rgb(255, 70, 70))
-                                .size(18.0),
-                        );
-                        // Waveform bars (oldest → newest).
-                        for v in &bars {
-                            let h = v.clamp(0.0, 1.0) * 28.0 + 3.0;
-                            let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(5.0, 32.0), egui::Sense::hover());
-                            let bar = egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, rect.max.y - h),
-                                egui::pos2(rect.max.x, rect.max.y),
+                    ui.vertical(|ui| {
+                        // Row 1: recording dot + elapsed + hint.
+                        ui.horizontal(|ui| {
+                            let (dot_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                dot_rect.center(),
+                                7.0,
+                                egui::Color32::from_rgb(255, 70, 70),
                             );
-                            ui.painter().rect_filled(
-                                bar,
-                                1.0,
-                                egui::Color32::from_rgb(120, 200, 255),
-                            );
-                        }
-                        ui.vertical(|ui| {
                             ui.label(format!(
                                 "{:02}:{:02}",
                                 elapsed.as_secs() / 60,
                                 elapsed.as_secs() % 60
                             ));
                             ui.small("release to transcribe · esc cancels");
+                        });
+                        // Row 2: waveform bars across the full width.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for v in &bars {
+                                let h = v.clamp(0.0, 1.0) * 26.0 + 3.0;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(6.0, 30.0),
+                                    egui::Sense::hover(),
+                                );
+                                let bar = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x, rect.max.y - h),
+                                    egui::pos2(rect.max.x, rect.max.y),
+                                );
+                                ui.painter().rect_filled(
+                                    bar,
+                                    1.0,
+                                    egui::Color32::from_rgb(120, 200, 255),
+                                );
+                            }
                         });
                     });
                 });
@@ -235,7 +241,7 @@ fn pill_position(event_loop: &ActiveEventLoop) -> (i32, i32) {
             (s.width as i32, p.x)
         })
         .unwrap_or((1440, 0));
-    (x0 + w / 2 - 150, 48)
+    (x0 + w / 2 - 160, 48)
 }
 
 #[cfg(test)]
