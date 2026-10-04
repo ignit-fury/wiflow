@@ -940,13 +940,20 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         // user already re-pressed (Recording), that hold owns the duck
         // and its own Done will restore it.
         let may_restore = self.state != AppState::Recording;
+        let before = self.orchestrator.phase();
         let actions = self.orchestrator.handle(&event);
         if actions.is_empty() {
+            // Empty actions ≠ rejected: pure-transition events (e.g. the
+            // first CaptureStarted) apply a phase change with no side
+            // effects. Only an unchanged phase means the machine ignored it.
+            let after = self.orchestrator.phase();
             tracing::info!(
-                "[session={}] {} produced no actions (phase {:?}) — ignored",
+                "[session={}] {} produced no actions (phase {:?} -> {:?}){}",
                 current_session(),
                 daemon_event_variant_name(&event),
-                self.orchestrator.phase()
+                before,
+                after,
+                if before == after { " — ignored" } else { "" }
             );
         }
         for action in actions {
