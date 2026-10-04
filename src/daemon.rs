@@ -128,7 +128,7 @@ pub fn register_cancel_hotkey(manager: &GlobalHotKeyManager) -> Result<HotKey, S
 /// Commands from the winit thread to the dictation worker.
 /// The winit thread never blocks: it only `send()`s these and renders
 /// `DaemonEvent::Done/Failed` results.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Control {
     Down,
     Up,

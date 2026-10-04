@@ -1,5 +1,8 @@
 pub mod headless;
+pub mod orchestrator;
 pub mod session;
+
+pub use orchestrator::{Action, Orchestrator};
 
 use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -13,7 +16,6 @@ use crate::core::config::{Config, ModelChoice};
 use crate::core::history::HistoryEntry;
 use crate::core::traits::TextInjector;
 use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
-use crate::ptt::{Admission, PttMachine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -461,10 +463,8 @@ struct DaemonApp {
     devices: Vec<String>,
     proxy: EventLoopProxy<DaemonEvent>,
     tx: std::sync::mpsc::Sender<Control>,
-    /// Single authority for PTT lifecycle admission (Phase 4). Every
-    /// PttDown/PttUp/Cancel/Done/Failed passes through it BEFORE any
-    /// Control reaches the worker, so tray and worker cannot diverge.
-    ptt: PttMachine,
+    /// Central lifecycle coordinator — replaces the old inline PttMachine.
+    orchestrator: Orchestrator,
     state: AppState,
     /// Warn override (e.g. inject-fail, cancel): shown instead of the state tooltip.
     note: Option<String>,
@@ -841,6 +841,8 @@ impl DaemonApp {
         }
         if *id == ids.quit {
             tracing::info!("quit via menu");
+            // Orchestrator cleanup before worker teardown.
+            let _ = self.orchestrator.handle_shutdown();
             crate::core::stt::shutdown();
             std::process::exit(0);
         }
@@ -892,109 +894,29 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
-        match event {
-            DaemonEvent::PttDown => {
-                // Phase 4 admission: Idle → Recording only. Duplicates and
-                // presses during Processing/Cancelling are dropped HERE.
-                if self.ptt.on_down() == Admission::Ignore {
-                    tracing::info!(
-                        "[session={}] PttDown IGNORED (phase {:?})",
-                        crate::daemon::current_session(),
-                        self.ptt.phase()
-                    );
-                    return;
+        let actions = self.orchestrator.handle(&event);
+        let mut inject_error = false;
+        for action in actions {
+            match action {
+                Action::SendControl(ctl) => self.send_control(ctl),
+                Action::SetTray(state, note) => {
+                    if !inject_error {
+                        self.set_state(state, note);
+                    }
+                    self.sync_tray();
                 }
-                self.set_state(AppState::Recording, None);
-                self.sync_tray();
-                self.send_control(Control::Down);
-            }
-            DaemonEvent::PttUp => {
-                // Recording → Processing only: a stray release while Idle
-                // never reaches the worker and never fakes a tray reset.
-                if self.ptt.on_up() == Admission::Ignore {
-                    tracing::info!(
-                        "[session={}] PttUp IGNORED (phase {:?})",
-                        crate::daemon::current_session(),
-                        self.ptt.phase()
-                    );
-                    return;
-                }
-                self.set_state(AppState::Transcribing, None);
-                self.sync_tray();
-                self.send_control(Control::Up);
-            }
-            DaemonEvent::Cancel => {
-                if self.ptt.on_cancel() == Admission::Ignore {
-                    tracing::debug!(
-                        "[session={}] Esc IGNORED (phase {:?})",
-                        crate::daemon::current_session(),
-                        self.ptt.phase()
-                    );
-                    return;
-                }
-                self.send_control(Control::Cancel);
-            }
-            DaemonEvent::CaptureStarted => {
-                // Task 8 will wire routing. Until then, keep the Phase
-                // machine gated by the orchestrator plan.
-                tracing::debug!(
-                    "[session={}] CaptureStarted ignored (routing not wired yet)",
-                    crate::daemon::current_session()
-                );
-            }
-            DaemonEvent::Watchdog { duration_ms } => {
-                if self.ptt.on_watchdog() == Admission::Ignore {
-                    return;
-                }
-                tracing::warn!(
-                    "[session={}] watchdog auto-stop: recording force-ended after {duration_ms}ms (PttUp was lost)",
-                    crate::daemon::current_session()
-                );
-                self.set_state(
-                    AppState::Transcribing,
-                    Some(format!(
-                        "auto-stopped after {duration_ms}ms — release key lost"
-                    )),
-                );
-                self.sync_tray();
-            }
-            DaemonEvent::TapIssue(msg) => {
-                self.warn_note(msg);
-            }
-            DaemonEvent::Done {
-                text,
-                duration_ms,
-                rtf,
-            } => {
-                let admission = if text.is_empty() {
-                    self.ptt.on_empty()
-                } else {
-                    self.ptt.on_transcript()
-                };
-                if admission == Admission::Ignore {
-                    tracing::info!("Done ignored (phase {:?})", self.ptt.phase());
-                    return;
-                }
-
-                if text.is_empty() {
-                    tracing::debug!("cycle done, no text (discard/silence)");
-                } else {
-                    tracing::info!("dictated {duration_ms}ms (RTF {rtf:.2}): {text:?}");
-                    // Main-thread-only: enigo HIToolbox TIS calls trap off-main
-                    // (crash report 2026-09-30). The 200ms restore sleep inside
-                    // inject_text briefly blocks this thread — accepted for v1.
+                Action::Notify(msg) => self.warn_note(msg),
+                Action::Inject(text) => {
                     let injector = crate::core::traits::SystemInjector;
                     match injector.inject(&text) {
                         Ok(r) => {
-                            self.ptt.on_inject_ok();
                             tracing::info!(
                                 "injected via {} (clipboard restored: {})",
                                 r.pasted_via,
                                 r.clipboard_restored
-                            )
+                            );
                         }
                         Err(e) => {
-                            self.ptt.on_inject_failed();
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
@@ -1004,30 +926,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                                 Some(format!("injected to clipboard: {e}")),
                             );
                             self.sync_tray();
-                            self.ptt.on_finalized();
-                            return;
+                            inject_error = true;
                         }
                     }
                 }
-
-                self.ptt.on_finalized();
-                self.set_state(AppState::Idle, None);
-                self.sync_tray();
-            }
-            DaemonEvent::Failed(msg) => {
-                if self.ptt.on_failed() == Admission::Ignore {
-                    tracing::info!("Failed ignored (phase {:?}): {msg}", self.ptt.phase());
-                    return;
-                }
-                tracing::warn!("dictation failed: {msg}");
-                self.ptt.on_finalized();
-                self.set_state(AppState::Error, Some(msg));
-                self.sync_tray();
-            }
-            DaemonEvent::CleanupIssue(msg) => {
-                // Alert: rate-limit exhausted / Ollama missing — tray warn-note.
-                tracing::warn!("cleanup issue: {msg}");
-                self.warn_note(msg);
             }
         }
     }
@@ -1035,6 +937,18 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
             self.handle_menu_event(&ev.id);
+        }
+        // Supervision deadline check.
+        for action in self.orchestrator.tick() {
+            match action {
+                Action::SendControl(ctl) => self.send_control(ctl),
+                Action::SetTray(state, note) => {
+                    self.set_state(state, note);
+                    self.sync_tray();
+                }
+                Action::Notify(msg) => self.warn_note(msg),
+                Action::Inject(_) => unreachable!("tick never emits Inject"),
+            }
         }
         if self.menu_dirty {
             self.rebuild_menu();
@@ -1167,7 +1081,12 @@ fn app_main(
         devices,
         proxy,
         tx,
-        ptt: PttMachine::new(),
+        orchestrator: Orchestrator::new(
+            crate::core::traits::RouterRecognizer,
+            crate::core::traits::ChainProvider,
+            crate::core::traits::SystemInjector,
+            crate::core::traits::OsascriptContext,
+        ),
         state: AppState::Idle,
         note: None,
         applied_state: AppState::Idle,

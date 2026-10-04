@@ -123,6 +123,7 @@ impl PttMachine {
     }
 
     /// Injection failed: INJECTING → RESTORING.
+    #[allow(dead_code)]
     pub fn on_inject_failed(&mut self) -> Admission {
         if self.phase == Phase::Injecting {
             self.restoring_error_target = true;
