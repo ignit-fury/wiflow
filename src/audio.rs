@@ -173,6 +173,10 @@ impl AudioCapture {
     }
 
     pub fn stop(mut self) -> CapturedAudio {
+        // Teardown visibility: this is where the mic must die. Log entry
+        // (stream dropped below) and exit (samples flushed) so a wedged
+        // indicator is attributable to the exact lifecycle step.
+        info!("audio stop requested — dropping input stream (mic teardown)");
         drop(self.stream);
         let dropped = self.dropped.load(Ordering::Relaxed);
         if dropped > 0 {
@@ -180,6 +184,10 @@ impl AudioCapture {
         }
         let samples: Vec<f32> = self.consumer.pop_iter().collect();
         let duration_ms = self.started.elapsed().as_millis() as u64;
+        info!(
+            "audio stream dropped — mic released, flushed {} samples over {duration_ms}ms",
+            samples.len()
+        );
         CapturedAudio {
             samples_mono: samples,
             sample_rate: self.sample_rate,

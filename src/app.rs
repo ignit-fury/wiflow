@@ -9,6 +9,7 @@ use winit::{
 use crate::config::{Config, ModelChoice};
 use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
 use crate::history::HistoryEntry;
+use crate::ptt::{Admission, PttMachine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -96,6 +97,7 @@ pub struct MenuIds {
     key_or_clear: MenuId,
     ollama_models: Vec<(String, MenuId)>,
     ollama_refresh: MenuId,
+    show_logs: MenuId,
     quit: MenuId,
 }
 
@@ -146,6 +148,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
             .map(|(i, m)| (m.clone(), MenuId::new(format!("wiflow:ollama:{i}"))))
             .collect(),
         ollama_refresh: MenuId::new("wiflow:ollama:refresh"),
+        show_logs: MenuId::new("wiflow:show:logs"),
         quit: MenuId::new("wiflow:quit"),
     }
 }
@@ -410,6 +413,10 @@ pub fn build_menu(
     // editor — plain text so hand-editing can't corrupt JSON config.
     let edit_vocab = MenuItem::with_id(ids.edit_vocab.clone(), "Edit Vocabulary…", true, None);
 
+    // Lifecycle log (wiflow.log): opens in Console — the diagnosis trail
+    // for PTT issues must be reachable without a terminal.
+    let show_logs = MenuItem::with_id(ids.show_logs.clone(), "Show Logs…", true, None);
+
     let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
 
     menu.append(&status).expect("menu append");
@@ -428,6 +435,7 @@ pub fn build_menu(
         .expect("menu append");
     menu.append(&hist_menu).expect("menu append");
     menu.append(&edit_vocab).expect("menu append");
+    menu.append(&show_logs).expect("menu append");
     menu.append(&perm_menu).expect("menu append");
     menu.append(&PredefinedMenuItem::separator())
         .expect("menu append");
@@ -449,6 +457,10 @@ struct DaemonApp {
     devices: Vec<String>,
     proxy: EventLoopProxy<DaemonEvent>,
     tx: std::sync::mpsc::Sender<Control>,
+    /// Single authority for PTT lifecycle admission (Phase 4). Every
+    /// PttDown/PttUp/Cancel/Done/Failed passes through it BEFORE any
+    /// Control reaches the worker, so tray and worker cannot diverge.
+    ptt: PttMachine,
     state: AppState,
     /// Warn override (e.g. inject-fail, cancel): shown instead of the state tooltip.
     note: Option<String>,
@@ -464,6 +476,20 @@ impl DaemonApp {
         self.note = note;
         // Status item shows the state → menu needs a rebuild.
         self.menu_dirty = true;
+    }
+
+    /// Queue a worker command. A closed channel used to be swallowed by
+    /// `let _ =`, wedging the tray with no trace — now it's a visible error.
+    fn send_control(&mut self, ctl: Control) {
+        if let Err(e) = self.tx.send(ctl) {
+            // SendError carries the undelivered control back (e.0).
+            tracing::error!("worker channel closed, control {:?} dropped", e.0);
+            self.set_state(
+                AppState::Error,
+                Some("dictation worker is not running — restart Wiflow".into()),
+            );
+            self.sync_tray();
+        }
     }
 
     fn current_tooltip(&self) -> String {
@@ -786,6 +812,21 @@ impl DaemonApp {
             tracing::info!("ollama cleanup model: {name} (takes effect next hold)");
             return;
         }
+        if *id == ids.show_logs {
+            let path = crate::logfile::log_path();
+            let opened = std::process::Command::new("open")
+                .args(["-a", "Console"])
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if opened {
+                tracing::info!("log opened in Console ({})", path.display());
+            } else if open::that(&path).is_err() {
+                self.warn_note(format!("cannot open log file ({})", path.display()));
+            }
+            return;
+        }
         if *id == ids.perm_mic {
             crate::config::permissions::open_mic_settings();
             return;
@@ -839,7 +880,9 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             if key.state == ElementState::Pressed
                 && matches!(key.physical_key, PhysicalKey::Code(KeyCode::Escape))
             {
-                let _ = self.proxy.send_event(DaemonEvent::Cancel);
+                if let Err(e) = self.proxy.send_event(DaemonEvent::Cancel) {
+                    tracing::warn!("Esc: event loop closed, cancel lost: {e:?}");
+                }
             }
         }
     }
@@ -847,23 +890,76 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DaemonEvent) {
         match event {
             DaemonEvent::PttDown => {
+                // Phase 4 admission: Idle → Recording only. Duplicates and
+                // presses during Processing/Cancelling are dropped HERE.
+                if self.ptt.on_down() == Admission::Ignore {
+                    tracing::info!(
+                        "[session={}] PttDown IGNORED (phase {:?})",
+                        crate::daemon::current_session(),
+                        self.ptt.phase()
+                    );
+                    return;
+                }
                 self.set_state(AppState::Recording, None);
                 self.sync_tray();
-                let _ = self.tx.send(Control::Down);
+                self.send_control(Control::Down);
             }
             DaemonEvent::PttUp => {
+                // Recording → Processing only: a stray release while Idle
+                // never reaches the worker and never fakes a tray reset.
+                if self.ptt.on_up() == Admission::Ignore {
+                    tracing::info!(
+                        "[session={}] PttUp IGNORED (phase {:?})",
+                        crate::daemon::current_session(),
+                        self.ptt.phase()
+                    );
+                    return;
+                }
                 self.set_state(AppState::Transcribing, None);
                 self.sync_tray();
-                let _ = self.tx.send(Control::Up);
+                self.send_control(Control::Up);
             }
             DaemonEvent::Cancel => {
-                let _ = self.tx.send(Control::Cancel);
+                if self.ptt.on_cancel() == Admission::Ignore {
+                    tracing::debug!(
+                        "[session={}] Esc IGNORED (phase {:?})",
+                        crate::daemon::current_session(),
+                        self.ptt.phase()
+                    );
+                    return;
+                }
+                self.send_control(Control::Cancel);
+            }
+            DaemonEvent::Watchdog { duration_ms } => {
+                if self.ptt.on_watchdog() == Admission::Ignore {
+                    return;
+                }
+                tracing::warn!(
+                    "[session={}] watchdog auto-stop: recording force-ended after {duration_ms}ms (PttUp was lost)",
+                    crate::daemon::current_session()
+                );
+                self.set_state(
+                    AppState::Transcribing,
+                    Some(format!(
+                        "auto-stopped after {duration_ms}ms — release key lost"
+                    )),
+                );
+                self.sync_tray();
+            }
+            DaemonEvent::TapIssue(msg) => {
+                self.warn_note(msg);
             }
             DaemonEvent::Done {
                 text,
                 duration_ms,
                 rtf,
             } => {
+                if self.ptt.on_done() == Admission::Ignore {
+                    // Cannot happen with current rules (Done is accepted
+                    // from every phase) — guard kept for future rules.
+                    tracing::info!("Done ignored (phase {:?})", self.ptt.phase());
+                    return;
+                }
                 if text.is_empty() {
                     tracing::debug!("cycle done, no text (discard/silence)");
                 } else {
@@ -895,6 +991,12 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 self.sync_tray();
             }
             DaemonEvent::Failed(msg) => {
+                // Accepted from every phase (incl. Recording: fatal capture
+                // error must leave Recording, never wedge it).
+                if self.ptt.on_failed() == Admission::Ignore {
+                    tracing::info!("Failed ignored (phase {:?}): {msg}", self.ptt.phase());
+                    return;
+                }
                 tracing::warn!("dictation failed: {msg}");
                 self.set_state(AppState::Error, Some(msg));
                 self.sync_tray();
@@ -1042,6 +1144,7 @@ fn app_main(
         devices,
         proxy,
         tx,
+        ptt: PttMachine::new(),
         state: AppState::Idle,
         note: None,
         applied_state: AppState::Idle,
@@ -1181,6 +1284,7 @@ mod tests {
             ids.key_groq_clear,
             ids.key_or_clear,
             ids.ollama_refresh,
+            ids.show_logs,
             ids.quit,
         ];
         all.extend(ids.mic_items.into_iter().map(|(_, id)| id));

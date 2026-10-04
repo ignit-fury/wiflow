@@ -1,4 +1,4 @@
-use crate::daemon::{DaemonEvent, HotkeyPreset};
+use crate::daemon::{current_session, next_session, DaemonEvent, HotkeyPreset};
 use winit::event_loop::EventLoopProxy;
 
 // CoreGraphics / CoreFoundation FFI — zero new dependencies.
@@ -14,6 +14,7 @@ unsafe extern "C" {
         user_info: *mut std::ffi::c_void,
     ) -> *mut std::ffi::c_void;
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *mut std::ffi::c_void) -> bool;
     fn CFMachPortCreateRunLoopSource(
         alloc: *mut std::ffi::c_void,
         port: *mut std::ffi::c_void,
@@ -29,14 +30,25 @@ unsafe extern "C" {
     fn CFMachPortInvalidate(port: *mut std::ffi::c_void);
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: i32) -> i64;
     fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
+    /// Live modifier state of the WHOLE system (HID+session) — used after a
+    /// tap kill to tell whether the PTT key is still physically held.
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
     static kCFRunLoopDefaultMode: *const std::ffi::c_void;
 }
 
 const K_CG_SESSION_EVENT_TAP: i32 = 1;
 const K_CG_HEAD_INSERT_EVENT_TAP: i32 = 0;
 const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: i32 = 1;
+/// kCGCombinedState (CGEventSourceStateID) — combined HID + session state.
+const K_CG_COMBINED_STATE: i32 = 0;
 /// kCGEventFlagsChanged
 const EVENT_TYPE_FLAGS_CHANGED: u32 = 12;
+/// Out-of-band: macOS disabled the tap because the callback/runloop did not
+/// respond in time. Recoverable — re-enable in place (Apple-recommended).
+const EVENT_TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
+/// Out-of-band: tap killed by a user/system condition (secure input,
+/// permission revoked). Attempt re-enable; surface guidance when it sticks.
+const EVENT_TAP_DISABLED_USER_INPUT: u32 = 0xFFFF_FFFF;
 /// kCGKeyboardEventKeycode field id
 const FIELD_KEYCODE: i32 = 9;
 /// kVK_RightOption
@@ -76,27 +88,111 @@ pub fn modifier_event(keycode: i64, flags: u64, watched: u32) -> Option<bool> {
     }
 }
 
+/// What to do when macOS delivers an out-of-band tap-system event.
+/// Timeout kills self-heal; user-input kills need the re-enable attempt
+/// plus user guidance if the attempt does not stick (pure, tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapSystemAction {
+    /// Re-enable immediately (same port, no events lost beyond the gap).
+    Reenable,
+    /// Not an out-of-band event: normal processing.
+    Ignore,
+}
+
+pub fn tap_system_action(event_type: u32) -> TapSystemAction {
+    match event_type {
+        EVENT_TAP_DISABLED_TIMEOUT | EVENT_TAP_DISABLED_USER_INPUT => TapSystemAction::Reenable,
+        _ => TapSystemAction::Ignore,
+    }
+}
+
+/// After a re-enable: should we synthesize the missing PttUp? True when the
+/// PTT key is NO LONGER held system-wide — i.e. its key-up landed inside the
+/// disabled window and would otherwise wedge Recording forever.
+pub fn recovery_up_needed(held_flags: u64, watched: u32) -> bool {
+    held_flags & flags_mask_for_keycode(watched) == 0
+}
+
 struct TapCtx {
     keycode: u32,
     proxy: EventLoopProxy<DaemonEvent>,
+    /// Set right after CGEventTapCreate; the callback needs the real tap ref
+    /// (NOT the callback proxy) to re-enable itself.
+    tap: std::sync::atomic::AtomicPtr<std::ffi::c_void>,
 }
 
 unsafe extern "C" fn tap_callback(
+    // The callback's CGEventTap ref — NOT used for re-enable; the stored
+    // port ref in TapCtx is authoritative (this arg can be a proxy ref).
     _cg_proxy: *mut std::ffi::c_void,
     event_type: u32,
     event: *mut std::ffi::c_void,
     user_info: *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
+    // Out-of-band tap-system events arrive regardless of the event mask
+    // (CGEventTypes.h: "delivered to the event tap callback to notify it of
+    // unusual conditions that disable the event tap"). Missing these left
+    // the tap dead-but-undetected: no further PttUp ever delivered.
+    if tap_system_action(event_type) == TapSystemAction::Reenable {
+        let ctx = &*(user_info as *const TapCtx);
+        let kind = if event_type == EVENT_TAP_DISABLED_TIMEOUT {
+            "timeout (callback/runloop unresponsive)"
+        } else {
+            "user input (secure input or permission change)"
+        };
+        tracing::warn!(
+            "[session={}] event tap DISABLED by macOS: {kind} — re-enabling",
+            current_session()
+        );
+        let tap = ctx.tap.load(std::sync::atomic::Ordering::Relaxed);
+        if !tap.is_null() {
+            CGEventTapEnable(tap, true);
+            let alive = CGEventTapIsEnabled(tap);
+            tracing::warn!(
+                "[session={}] event tap re-enable attempted (alive={alive})",
+                current_session()
+            );
+            if !alive {
+                let _ = ctx.proxy.send_event(DaemonEvent::TapIssue(
+                    "event tap disabled by macOS and will not re-enable — restart Wiflow or re-grant Input Monitoring"
+                        .into(),
+                ));
+                return event;
+            }
+            // The key-up may have landed inside the disabled window. If the
+            // PTT key is no longer held, synthesize the missing PttUp —
+            // idempotent: the lifecycle machine ignores it when not Recording.
+            if recovery_up_needed(CGEventSourceFlagsState(K_CG_COMBINED_STATE), ctx.keycode) {
+                tracing::warn!(
+                    "[session={}] PTT key not held after tap recovery — sending missed PttUp",
+                    current_session()
+                );
+                let _ = ctx.proxy.send_event(DaemonEvent::PttUp);
+            }
+        }
+        return event;
+    }
     if event_type == EVENT_TYPE_FLAGS_CHANGED {
         let ctx = &*(user_info as *const TapCtx);
         let keycode = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
-        if let Some(down) = modifier_event(keycode, CGEventGetFlags(event), ctx.keycode) {
-            let ev = if down {
-                DaemonEvent::PttDown
+        let flags = CGEventGetFlags(event);
+        if let Some(down) = modifier_event(keycode, flags, ctx.keycode) {
+            let (ev, session) = if down {
+                (DaemonEvent::PttDown, next_session())
             } else {
-                DaemonEvent::PttUp
+                (DaemonEvent::PttUp, current_session())
             };
-            let _ = ctx.proxy.send_event(ev);
+            tracing::info!(
+                "[session={session}] tap flagsChanged keycode={keycode} flags=0x{flags:016x} -> {:?}",
+                if down { "PttDown" } else { "PttUp" }
+            );
+            if let Err(e) = ctx.proxy.send_event(ev) {
+                tracing::warn!("[session={session}] tap failed to queue event to daemon: {e:?}");
+            }
+        } else {
+            tracing::debug!(
+                "tap flagsChanged keycode={keycode} flags=0x{flags:016x} (not the PTT key)"
+            );
         }
     }
     event
@@ -115,6 +211,7 @@ unsafe impl Send for ModifierTap {}
 impl ModifierTap {
     pub fn stop(&mut self) {
         if !self.port.is_null() {
+            tracing::info!("event tap stopping (handle dropped/switched)");
             unsafe { CFMachPortInvalidate(self.port) };
             self.port = std::ptr::null_mut();
         }
@@ -137,7 +234,11 @@ pub fn spawn(
     proxy: EventLoopProxy<DaemonEvent>,
 ) -> Result<ModifierTap, String> {
     let keycode = keycode_for_preset(preset).ok_or("preset is not a bare modifier")?;
-    let ctx = Box::into_raw(Box::new(TapCtx { keycode, proxy }));
+    let ctx = Box::into_raw(Box::new(TapCtx {
+        keycode,
+        proxy,
+        tap: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+    }));
     let mask = 1u64 << 12; // kCGEventFlagsChanged only
     let port = unsafe {
         CGEventTapCreate(
@@ -155,6 +256,12 @@ pub fn spawn(
                 .into(),
         );
     }
+    // Publish the tap ref before any event can reach the callback.
+    unsafe {
+        (&*ctx)
+            .tap
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
     unsafe { CGEventTapEnable(port, true) };
     let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), port, 0) };
     if source.is_null() {
@@ -162,6 +269,7 @@ pub fn spawn(
         return Err("CFMachPortCreateRunLoopSource failed".into());
     }
     let source_for_thread = SendPtr(source);
+    let proxy_for_thread = SendPtr(port);
     std::thread::Builder::new()
         .name("wiflow-tap".into())
         .spawn(move || unsafe {
@@ -170,7 +278,14 @@ pub fn spawn(
                 source_for_thread.get(),
                 kCFRunLoopDefaultMode,
             );
+            tracing::info!("event tap run loop started (preset={preset:?}, keycode={keycode})");
             CFRunLoopRun();
+            // Only reachable when the mach port died (stop/Drop) OR the run
+            // loop failed outright — the latter must be visible in the logs.
+            tracing::warn!(
+                "event tap run loop EXITED — PTT events will not be delivered (preset={preset:?})"
+            );
+            let _ = proxy_for_thread; // port invalidation owns teardown
         })
         .map_err(|e| {
             unsafe { CFMachPortInvalidate(port) };
@@ -212,5 +327,35 @@ mod tests {
         assert_eq!(keycode_for_preset(HotkeyPreset::Fn), Some(63));
         // Combo presets ride global-hotkey, not the tap.
         assert_eq!(keycode_for_preset(HotkeyPreset::CtrlSpace), None);
+    }
+
+    #[test]
+    fn test_tap_system_action() {
+        // Both out-of-band kills re-enable; flagsChanged/anything else is
+        // not a system event.
+        assert_eq!(
+            tap_system_action(EVENT_TAP_DISABLED_TIMEOUT),
+            TapSystemAction::Reenable
+        );
+        assert_eq!(
+            tap_system_action(EVENT_TAP_DISABLED_USER_INPUT),
+            TapSystemAction::Reenable
+        );
+        assert_eq!(
+            tap_system_action(EVENT_TYPE_FLAGS_CHANGED),
+            TapSystemAction::Ignore
+        );
+        assert_eq!(tap_system_action(10), TapSystemAction::Ignore);
+    }
+
+    #[test]
+    fn test_recovery_up_only_when_key_released() {
+        // Key released during the disabled window → missed PttUp must be
+        // synthesized.
+        assert!(recovery_up_needed(0, KEYCODE_FN));
+        // Key still held → normal key-up will arrive after re-enable.
+        assert!(!recovery_up_needed(FUNCTION_FLAGS, KEYCODE_FN));
+        // Other modifiers held are irrelevant.
+        assert!(recovery_up_needed(OPTION_FLAGS, KEYCODE_FN));
     }
 }

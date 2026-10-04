@@ -11,6 +11,8 @@ mod groq_stt;
 mod history;
 mod hotkey;
 mod inject;
+pub mod logfile;
+mod ptt;
 mod stt;
 mod tap;
 mod vad;
@@ -75,7 +77,7 @@ fn now_ms() -> u64 {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    logfile::init();
     let args = Args::parse();
     if args.app {
         app::run(config::load_config());
