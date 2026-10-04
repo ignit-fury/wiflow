@@ -4,7 +4,6 @@ mod daemon;
 pub mod logfile;
 mod platform;
 mod ptt;
-mod duck;
 
 use clap::Parser;
 

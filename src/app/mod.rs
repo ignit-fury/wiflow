@@ -503,7 +503,7 @@ struct DaemonApp {
     menu_dirty: bool,
     /// Shared with the worker (duck at key-down there, restore here after
     /// injection). Same instance — paused-list ownership never splits.
-    duck: crate::duck::AudioDuck<crate::duck::OsBackend>,
+    duck: crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
 }
 
 impl DaemonApp {
@@ -1143,10 +1143,10 @@ fn app_main(
 
     // One shared duck instance: worker ducks at key-down, main thread
     // restores after injection completes.
-    let duck = crate::duck::AudioDuck::new(
-        crate::duck::OsBackend,
+    let duck = crate::platform::macos::duck::AudioDuck::new(
+        crate::platform::macos::duck::OsBackend,
         config.duck_audio,
-        crate::duck::PAUSE_DELAY,
+        crate::platform::macos::duck::PAUSE_DELAY,
     );
     let (tx, rx) = std::sync::mpsc::channel::<Control>();
     let worker_proxy = proxy.clone();

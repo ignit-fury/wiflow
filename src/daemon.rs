@@ -331,7 +331,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
     ptt: &mut PushToTalk,
     capture: &mut Option<crate::core::audio::AudioCapture>,
     capture_start: &mut Option<Instant>,
-    duck: &crate::duck::AudioDuck<crate::duck::OsBackend>,
+    duck: &crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
 ) {
     let now = now_ms();
     match ptt.on_key_down(now) {
@@ -401,7 +401,7 @@ fn watchdog(
     capture_start: &mut Option<Instant>,
     proxy: &EventLoopProxy<DaemonEvent>,
     max_ms: u64,
-    duck: &crate::duck::AudioDuck<crate::duck::OsBackend>,
+    duck: &crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
 ) {
     let duration_ms = capture_start
         .map(|s| s.elapsed().as_millis() as u64)
@@ -449,7 +449,7 @@ fn watchdog(
 pub fn worker_main(
     proxy: EventLoopProxy<DaemonEvent>,
     rx: mpsc::Receiver<Control>,
-    duck: crate::duck::AudioDuck<crate::duck::OsBackend>,
+    duck: crate::platform::macos::duck::AudioDuck<crate::platform::macos::duck::OsBackend>,
 ) {
     let mut ptt = PushToTalk::new(300, 60_000);
     let mut capture: Option<crate::core::audio::AudioCapture> = None;
@@ -644,10 +644,10 @@ mod tests {
         let mut ptt = PushToTalk::new(300, 60_000);
         let mut capture: Option<crate::core::audio::AudioCapture> = None;
         let mut capture_start: Option<Instant> = None;
-        let duck = crate::duck::AudioDuck::new(
-            crate::duck::OsBackend,
+        let duck = crate::platform::macos::duck::AudioDuck::new(
+            crate::platform::macos::duck::OsBackend,
             false, // duck_audio is false in the test config; irrelevant for this test
-            crate::duck::PAUSE_DELAY,
+            crate::platform::macos::duck::PAUSE_DELAY,
         );
         worker_on_control_down(&sender, &mut ptt, &mut capture, &mut capture_start, &duck);
 
