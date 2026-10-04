@@ -71,3 +71,4 @@ that only a physical Fn run with instrumentation can pin down.
      death releases the device — not a leak).
    - Default config (60s watchdog) sanity cycle: clean, no watchdog.
 8. **`cargo test`: 129 passed, 0 failed, 1 ignored; `cargo build`: 0 warnings.**
+ 9. **S2 live regression (2026-10-04 04:55, HEAD a48c5bb)** — full suite **197 passed, 0 failed, 1 ignored**; matrix A(200ms)/B(1s)/C(5s)/D(10s)/H(20×1s) **all 24 cycles complete, mic released every time, tray Idle**; 8-phase sequence confirmed (IDLE→STARTING→LISTENING→PROCESSING→INJECTING/RESTORING→IDLE); 23 `capture started` ↔ 23 `mic released` ↔ 23 `session ended` (0 orphaned); config restored byte-identical (`diff` clean).
