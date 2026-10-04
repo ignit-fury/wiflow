@@ -11,12 +11,11 @@ use std::time::{Duration, Instant};
 
 use crate::app::session::{begin_session, Session};
 use crate::app::AppState;
-use crate::core::traits::{
-    ChainProvider, InjectReport, MediaController, OsascriptContext, RouterRecognizer,
-    SystemInjector,
-};
+use crate::core::traits::{ChainProvider, InjectReport, MediaController, RouterRecognizer};
 use crate::daemon::{Control, DaemonEvent};
+use crate::platform::macos::context::OsascriptContext;
 use crate::platform::macos::duck::OsBackend;
+use crate::platform::macos::inject::SystemInjector;
 use crate::platform::macos::media::CoreAudioDuck;
 use crate::ptt::{Admission, Phase, PttMachine};
 

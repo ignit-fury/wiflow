@@ -1154,7 +1154,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 Action::ShowPill => self.pill.show(event_loop),
                 Action::HidePill => self.pill.hide(),
                 Action::Inject(text) => {
-                    let injector = crate::core::traits::SystemInjector;
+                    let injector = crate::platform::macos::inject::SystemInjector;
                     let result = match injector.inject(&text) {
                         Ok(r) => {
                             tracing::info!(
@@ -1453,8 +1453,8 @@ fn app_main(
         orchestrator: Orchestrator::new(
             crate::core::traits::RouterRecognizer,
             crate::core::traits::ChainProvider,
-            crate::core::traits::SystemInjector,
-            crate::core::traits::OsascriptContext,
+            crate::platform::macos::inject::SystemInjector,
+            crate::platform::macos::context::OsascriptContext,
             media,
         ),
         state: AppState::Idle,

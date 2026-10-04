@@ -137,32 +137,17 @@ pub trait TextInjector {
     fn leave_on_clipboard(&self, text: &str);
 }
 
-/// Production: clipboard save → set → Cmd+V → restore (enigo).
-pub struct SystemInjector;
-
-impl TextInjector for SystemInjector {
-    fn inject(&self, text: &str) -> Result<InjectReport, String> {
-        crate::platform::macos::inject::inject_text(text)
-    }
-    fn leave_on_clipboard(&self, text: &str) {
-        crate::platform::macos::inject::leave_on_clipboard(text)
-    }
-}
+// Production impls live in `platform::macos` (H25: core never imports
+// platform implementation modules). `RouterRecognizer`/`ChainProvider`
+// are pure core logic and stay here; `SystemInjector` lives in
+// `platform::macos::inject`, `OsascriptContext` in
+// `platform::macos::context`.
 
 // ── ContextProvider ─────────────────────────────────────────────────────────
 
 /// Focused (frontmost) application name.
 pub trait ContextProvider {
     fn focused_app(&self) -> Option<String>;
-}
-
-/// Production: osascript System Events query.
-pub struct OsascriptContext;
-
-impl ContextProvider for OsascriptContext {
-    fn focused_app(&self) -> Option<String> {
-        crate::platform::macos::context::focused_app_name()
-    }
 }
 
 // ── MediaController ─────────────────────────────────────────────────────────
@@ -407,23 +392,6 @@ mod tests {
             "LLM route must return non-empty text"
         );
     }
-
-    #[test]
-    fn test_system_injector_rejects_empty() {
-        let injector = SystemInjector;
-        assert!(injector.inject("").is_err());
-        assert!(injector.inject("   ").is_err());
-    }
-
-    #[test]
-    fn test_osascript_context_returns_app_or_none() {
-        let ctx = OsascriptContext;
-        // In CI/headless this may return None; on a desktop it returns Some.
-        // Either is valid — the contract is Option<String>.
-        let _ = ctx.focused_app();
-    }
-
-    // ── End-to-end fake pipeline (S2/S4 seam demo) ──────────────────────
 
     #[test]
     fn test_fake_pipeline_text_flows_through() {

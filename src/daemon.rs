@@ -249,7 +249,7 @@ fn pipeline_on_worker(
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
     // Cleanup via trait (route decision + context gate + chain).
     let cleanup_provider = crate::core::traits::ChainProvider;
-    let context_provider = crate::core::traits::OsascriptContext;
+    let context_provider = crate::platform::macos::context::OsascriptContext;
     // Context gate: transcript must carry value AND app must be
     // context-sensitive — otherwise the ~200ms osascript query and the
     // model call are skipped.
