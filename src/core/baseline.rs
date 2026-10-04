@@ -75,9 +75,9 @@ pub fn deterministic_clean(input: &str) -> String {
     if input.is_empty() {
         return String::new();
     }
-    let stripped = crate::stt::strip_hallucination_tokens(input);
-    let processed = crate::stt::post_process(&stripped);
-    crate::stt::plus_to_symbol(&processed)
+    let stripped = crate::core::stt::strip_hallucination_tokens(input);
+    let processed = crate::core::stt::post_process(&stripped);
+    crate::core::stt::plus_to_symbol(&processed)
 }
 
 /// Current effective routing rule: an LLM call happens iff cleanup is enabled

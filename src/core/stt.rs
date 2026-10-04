@@ -114,7 +114,7 @@ pub fn transcribe_shared(
 /// Read the initial-prompt vocabulary (prompt.txt); missing file → empty.
 /// Null bytes stripped (set_initial_prompt panics on them).
 pub fn read_prompt() -> String {
-    std::fs::read_to_string(crate::config::prompt_path())
+    std::fs::read_to_string(crate::core::config::prompt_path())
         .unwrap_or_default()
         .chars()
         .filter(|c| *c != '\0')
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn test_read_prompt_missing_is_empty() {
         // Default machine state: prompt.txt not yet created → empty prompt.
-        let p = crate::config::prompt_path();
+        let p = crate::core::config::prompt_path();
         let existed = p.exists();
         if existed {
             let saved = std::fs::read_to_string(&p).unwrap();
@@ -598,12 +598,12 @@ mod tests {
         // Whitespace runs still collapse (math stage splits on them).
         assert_eq!(post_process("hello   world"), "Hello   world");
         assert_eq!(
-            crate::baseline::deterministic_clean("hello   world"),
+            crate::core::baseline::deterministic_clean("hello   world"),
             "Hello world"
         );
         // Multibyte text through the byte-walk strip + stream post-process.
         assert_eq!(
-            crate::baseline::deterministic_clean("café [MUSIC] naïve"),
+            crate::core::baseline::deterministic_clean("café [MUSIC] naïve"),
             "Café naïve"
         );
         assert_eq!(post_process("über alles"), "Über alles");

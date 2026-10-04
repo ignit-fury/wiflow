@@ -53,9 +53,9 @@ pub fn parse_transcript(body: &str) -> Option<String> {
 pub fn transcribe_cloud(
     samples: &[f32],
     rate: u32,
-    cfg: &crate::config::Config,
+    cfg: &crate::core::config::Config,
 ) -> Result<String, String> {
-    let key = crate::cleanup::groq_key().ok_or("no Groq key (set GROQ_API_KEY)")?;
+    let key = crate::core::cleanup::groq_key().ok_or("no Groq key (set GROQ_API_KEY)")?;
     let wav = encode_wav16(samples, rate);
     let boundary = "wiflow-audio-boundary-7f3a";
     let body = build_multipart(

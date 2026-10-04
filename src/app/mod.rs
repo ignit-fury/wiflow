@@ -6,9 +6,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::config::{Config, ModelChoice};
+use crate::core::config::{Config, ModelChoice};
+use crate::core::history::HistoryEntry;
 use crate::daemon::{preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
-use crate::history::HistoryEntry;
 use crate::ptt::{Admission, PttMachine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,8 +336,8 @@ pub fn build_menu(
     // entry via native secure dialog (tray app has no windows). Model list
     // is the live Ollama inventory passed in by the caller.
     let ai_menu = Submenu::new("AI Keys && Models", true);
-    let groq_set = crate::cleanup::groq_key().is_some();
-    let or_set = crate::cleanup::openrouter_key().is_some();
+    let groq_set = crate::core::cleanup::groq_key().is_some();
+    let or_set = crate::core::cleanup::openrouter_key().is_some();
     let key_groq = MenuItem::with_id(
         ids.key_groq.clone(),
         format!(
@@ -451,7 +451,7 @@ struct DaemonApp {
     // None when the PTT rides the CGEventTap (bare modifier presets).
     hotkey: Option<global_hotkey::hotkey::HotKey>,
     // Live tap handle for bare-modifier presets; Drop stops listening.
-    tap: Option<crate::tap::ModifierTap>,
+    tap: Option<crate::platform::macos::tap::ModifierTap>,
     preset: HotkeyPreset,
     config: Config,
     devices: Vec<String>,
@@ -517,10 +517,10 @@ impl DaemonApp {
     }
 
     fn rebuild_menu(&mut self) {
-        let history = crate::history::load_history();
+        let history = crate::core::history::load_history();
         // Live Ollama inventory (≤500ms, empty when down). Only fetched on
         // rebuilds, never per event-loop tick.
-        let models = crate::cleanup::list_ollama_models();
+        let models = crate::core::cleanup::list_ollama_models();
         let (menu, ids) = build_menu(
             &self.config,
             &self.devices,
@@ -534,7 +534,7 @@ impl DaemonApp {
     }
 
     fn save(&mut self) {
-        if let Err(e) = crate::config::save_config(&self.config) {
+        if let Err(e) = crate::core::config::save_config(&self.config) {
             tracing::warn!("save config failed: {e}");
         }
     }
@@ -558,7 +558,7 @@ impl DaemonApp {
             if let Some(old) = self.hotkey.take() {
                 let _ = self.hotkey_manager.unregister(old);
             }
-            match crate::tap::spawn(want, self.proxy.clone()) {
+            match crate::platform::macos::tap::spawn(want, self.proxy.clone()) {
                 Ok(t) => {
                     self.tap = Some(t);
                     self.preset = want;
@@ -592,7 +592,7 @@ impl DaemonApp {
                 Err(e) => {
                     // Rollback: restore the old mechanism.
                     if Self::old_is_bare_preset(old_preset) {
-                        match crate::tap::spawn(old_preset, self.proxy.clone()) {
+                        match crate::platform::macos::tap::spawn(old_preset, self.proxy.clone()) {
                             Ok(t) => self.tap = Some(t),
                             Err(e2) => tracing::warn!("tap restore failed: {e2:?}"),
                         }
@@ -655,7 +655,7 @@ impl DaemonApp {
             let enable = !self.config.launch_at_login;
             let exe = std::env::current_exe()
                 .unwrap_or_else(|_| std::path::PathBuf::from("wiflow-dictation"));
-            match crate::config::set_launch_at_login(enable, &exe, true) {
+            match crate::core::config::set_launch_at_login(enable, &exe, true) {
                 Ok(()) => {
                     self.config.launch_at_login = enable;
                     self.save();
@@ -668,7 +668,7 @@ impl DaemonApp {
         }
         if *id == ids.edit_vocab {
             // Ensure prompt.txt exists (empty), then open in default editor.
-            let path = crate::config::prompt_path();
+            let path = crate::core::config::prompt_path();
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -755,8 +755,8 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_groq {
-            match crate::cleanup::prompt_for_key("Wiflow", "Paste your Groq API key:") {
-                Some(v) => match crate::cleanup::save_key("groq_api_key", &v) {
+            match crate::core::cleanup::prompt_for_key("Wiflow", "Paste your Groq API key:") {
+                Some(v) => match crate::core::cleanup::save_key("groq_api_key", &v) {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("groq api key saved");
@@ -768,8 +768,8 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_openrouter {
-            match crate::cleanup::prompt_for_key("Wiflow", "Paste your OpenRouter API key:") {
-                Some(v) => match crate::cleanup::save_key("openrouter_api_key", &v) {
+            match crate::core::cleanup::prompt_for_key("Wiflow", "Paste your OpenRouter API key:") {
+                Some(v) => match crate::core::cleanup::save_key("openrouter_api_key", &v) {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("openrouter api key saved");
@@ -781,7 +781,7 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_groq_clear {
-            match crate::cleanup::clear_key("groq_api_key") {
+            match crate::core::cleanup::clear_key("groq_api_key") {
                 Ok(()) => {
                     self.menu_dirty = true;
                     tracing::info!("groq api key cleared");
@@ -791,7 +791,7 @@ impl DaemonApp {
             return;
         }
         if *id == ids.key_or_clear {
-            match crate::cleanup::clear_key("openrouter_api_key") {
+            match crate::core::cleanup::clear_key("openrouter_api_key") {
                 Ok(()) => {
                     self.menu_dirty = true;
                     tracing::info!("openrouter api key cleared");
@@ -828,16 +828,16 @@ impl DaemonApp {
             return;
         }
         if *id == ids.perm_mic {
-            crate::config::permissions::open_mic_settings();
+            crate::core::config::permissions::open_mic_settings();
             return;
         }
         if *id == ids.perm_a11y {
-            crate::config::permissions::open_accessibility_settings();
+            crate::core::config::permissions::open_accessibility_settings();
             return;
         }
         if *id == ids.quit {
             tracing::info!("quit via menu");
-            crate::stt::shutdown();
+            crate::core::stt::shutdown();
             std::process::exit(0);
         }
         if let Some((dev, _)) = ids.mic_items.iter().find(|(_, mid)| mid == id) {
@@ -848,7 +848,7 @@ impl DaemonApp {
             return;
         }
         if let Some((text, _)) = ids.history_items.iter().find(|(_, hid)| hid == id) {
-            crate::inject::leave_on_clipboard(text);
+            crate::platform::macos::inject::leave_on_clipboard(text);
             self.note = Some("history copied to clipboard".to_string());
             tracing::info!("history entry copied to clipboard");
             return;
@@ -967,7 +967,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                     // Main-thread-only: enigo HIToolbox TIS calls trap off-main
                     // (crash report 2026-09-30). The 200ms restore sleep inside
                     // inject_text briefly blocks this thread — accepted for v1.
-                    match crate::inject::inject_text(&text) {
+                    match crate::platform::macos::inject::inject_text(&text) {
                         Ok(r) => tracing::info!(
                             "injected via {} (clipboard restored: {})",
                             r.pasted_via,
@@ -977,7 +977,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                             tracing::warn!(
                                 "inject failed ({e}) — text left on clipboard, press Cmd+V"
                             );
-                            crate::inject::leave_on_clipboard(&text);
+                            crate::platform::macos::inject::leave_on_clipboard(&text);
                             self.set_state(
                                 AppState::Error,
                                 Some(format!("injected to clipboard: {e}")),
@@ -1025,9 +1025,9 @@ fn app_main(
     proxy: winit::event_loop::EventLoopProxy<DaemonEvent>,
     mut config: Config,
 ) -> ! {
-    let devices = crate::audio::list_devices();
-    let history = crate::history::load_history();
-    let models = crate::cleanup::list_ollama_models();
+    let devices = crate::core::audio::list_devices();
+    let history = crate::core::history::load_history();
+    let models = crate::core::cleanup::list_ollama_models();
     let (menu, ids) = build_menu(
         &config,
         &devices,
@@ -1054,7 +1054,7 @@ fn app_main(
     let (manager, ptt_hotkey, won, tap) = if is_bare {
         // Bare-modifier presets ride a listen-only CGEventTap (raw
         // flagsChanged) — RegisterEventHotKey cannot see them.
-        match crate::tap::spawn(config.hotkey_preset, proxy.clone()) {
+        match crate::platform::macos::tap::spawn(config.hotkey_preset, proxy.clone()) {
             Ok(t) => {
                 let manager = global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
                     eprintln!("hotkey manager: {e:?}");
@@ -1104,7 +1104,7 @@ fn app_main(
     };
     // Persist the actual winner so tooltip + next launch agree.
     config.hotkey_preset = won;
-    if let Err(e) = crate::config::save_config(&config) {
+    if let Err(e) = crate::core::config::save_config(&config) {
         tracing::warn!("save config failed: {e}");
     }
     crate::daemon::spawn_hotkey_bridge(proxy.clone(), esc_hotkey.id());
@@ -1120,7 +1120,7 @@ fn app_main(
             if !check_enabled {
                 return;
             }
-            match crate::cleanup::check_ollama_ready(&check_model) {
+            match crate::core::cleanup::check_ollama_ready(&check_model) {
                 Ok(()) => tracing::info!("ollama cleanup ready ({check_model})"),
                 Err(e) => {
                     tracing::warn!("ollama check: {e}");

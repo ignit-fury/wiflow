@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
-use crate::hotkey::{PttEvent, PushToTalk};
+use crate::core::hotkey::{PttEvent, PushToTalk};
 
 /// Monotonic PTT session counter: every PttDown starts a new session and
 /// all lifecycle log lines between that Down and its Up carry the same id,
@@ -190,32 +190,17 @@ pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
     });
 }
 
-/// Frontmost app name via System Events (osascript subprocess, ~200ms).
-/// None when the query fails or returns empty.
-pub fn focused_app_name() -> Option<String> {
-    let out = std::process::Command::new("osascript")
-        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
-        .output()
-        .ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
 /// Model-switch-failure semantics (via `stt::transcribe_shared`): a failed
 /// new-model load returns Err and keeps the previously loaded model cached,
 /// so the caller only needs to warn and can retry with a fixed path.
 fn pipeline_on_worker(
-    capture: crate::audio::AudioCapture,
+    capture: crate::core::audio::AudioCapture,
     duration_ms: u64,
     proxy: &EventLoopProxy<DaemonEvent>,
 ) {
     let out = capture.stop();
-    let mut vad = crate::vad::Vad::new();
-    let kept = crate::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
+    let mut vad = crate::core::vad::Vad::new();
+    let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
     tracing::info!(
         "captured {} vad-ready samples ({} raw @ {}Hz)",
         kept.len(),
@@ -240,14 +225,18 @@ fn pipeline_on_worker(
     };
     // Hoisted ABOVE transcribe: one config read per cycle, reused for the
     // initial prompt, STT language/provider, and the cleanup context below.
-    let cfg = crate::config::load_config();
-    let prompt = crate::stt::read_prompt();
+    let cfg = crate::core::config::load_config();
+    let prompt = crate::core::stt::read_prompt();
     let t0 = std::time::Instant::now();
     // STT provider branch: "groq" = cloud whisper-large-v3 (OPT-IN), any
     // other value = local on-device whisper. Cloud failure → tray alert +
     // local fallback (never lose the transcript to a network error).
     let text = if cfg.stt_provider == "groq" {
-        match crate::groq_stt::transcribe_cloud(&kept, crate::vad::VAD_SAMPLE_RATE, &cfg) {
+        match crate::core::groq_stt::transcribe_cloud(
+            &kept,
+            crate::core::vad::VAD_SAMPLE_RATE,
+            &cfg,
+        ) {
             Ok(t) => {
                 tracing::info!("cloud stt (whisper-large-v3) done");
                 t
@@ -256,8 +245,12 @@ fn pipeline_on_worker(
                 let _ = proxy.send_event(DaemonEvent::CleanupIssue(format!(
                     "Groq STT failed: {e} — using local whisper"
                 )));
-                match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language)
-                {
+                match crate::core::stt::transcribe_shared(
+                    &model_path,
+                    &kept,
+                    &prompt,
+                    &cfg.stt_language,
+                ) {
                     Ok(t) => t,
                     Err(e2) => {
                         let _ = proxy
@@ -268,7 +261,7 @@ fn pipeline_on_worker(
             }
         }
     } else {
-        match crate::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
+        match crate::core::stt::transcribe_shared(&model_path, &kept, &prompt, &cfg.stt_language) {
             Ok(t) => t,
             Err(e) => {
                 let _ = proxy.send_event(DaemonEvent::Failed(format!("transcribe failed: {e}")));
@@ -277,26 +270,26 @@ fn pipeline_on_worker(
         }
     };
     let ms = t0.elapsed().as_millis();
-    let kept_ms = kept.len() as f64 / crate::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
+    let kept_ms = kept.len() as f64 / crate::core::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
     // Fast routing: deterministic-clean transcripts inject immediately (no
     // context call, no provider calls, no issues). Complex ones take the
     // existing LLM chain below (Groq → OpenRouter → Ollama local, $0).
     // Issues (rate limits, missing model) surface as tray alerts.
-    let route = crate::analyze::decide_route(&text, &cfg);
+    let route = crate::core::analyze::decide_route(&text, &cfg);
     let route_name = match &route {
-        crate::analyze::CleanupRoute::Direct(_) => "deterministic",
-        crate::analyze::CleanupRoute::Llm(_) => "llm",
+        crate::core::analyze::CleanupRoute::Direct(_) => "deterministic",
+        crate::core::analyze::CleanupRoute::Llm(_) => "llm",
     };
     tracing::info!(
         "cleanup route={route_name} reason={} score={}",
-        crate::analyze::route_reason(&cfg, &route),
-        crate::analyze::route_score(&route),
+        crate::core::analyze::route_reason(&cfg, &route),
+        crate::core::analyze::route_score(&route),
     );
     let (cleaned, issues) = match route {
-        crate::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
-        crate::analyze::CleanupRoute::Llm(a) => {
+        crate::core::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
+        crate::core::analyze::CleanupRoute::Llm(a) => {
             // Context synthesis runs first (focused app → 2-sentence hint);
             // a context failure yields "" and the chain proceeds without.
             // Gated deterministically: transcript must carry context-valuable
@@ -304,36 +297,36 @@ fn pipeline_on_worker(
             // the ~200ms osascript query and the model call are skipped.
             // Cheap transcript check first (skips the ~200ms osascript query
             // when context could never pay off), then the full gate.
-            let key_present = crate::cleanup::groq_key().is_some();
+            let key_present = crate::core::cleanup::groq_key().is_some();
             let ctx =
                 if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
-                    let app = focused_app_name();
-                    if crate::analyze::context_allowed(
+                    let app = crate::platform::macos::context::focused_app_name();
+                    if crate::core::analyze::context_allowed(
                         app.as_deref(),
                         &a,
                         cfg.cleanup_enabled,
                         cfg.context_enabled,
                         key_present,
                     ) {
-                        crate::cleanup::synthesize_context(app.as_deref(), &cfg)
+                        crate::core::cleanup::synthesize_context(app.as_deref(), &cfg)
                     } else {
                         String::new()
                     }
                 } else {
                     String::new()
                 };
-            let input = crate::cleanup::format_cleanup_input(
+            let input = crate::core::cleanup::format_cleanup_input(
                 if ctx.is_empty() { None } else { Some(&ctx) },
                 &text,
             );
-            let outcome = crate::cleanup::clean_chain(&input, &cfg);
+            let outcome = crate::core::cleanup::clean_chain(&input, &cfg);
             (outcome.text, outcome.issues)
         }
     };
     for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
-    if crate::cleanup::is_filler_result(&cleaned) {
+    if crate::core::cleanup::is_filler_result(&cleaned) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
         let _ = proxy.send_event(DaemonEvent::Done {
@@ -353,7 +346,7 @@ fn pipeline_on_worker(
         return;
     }
     // History BEFORE inject: a paste failure must not lose the transcript.
-    if let Err(e) = crate::history::push_history(crate::history::HistoryEntry {
+    if let Err(e) = crate::core::history::push_history(crate::core::history::HistoryEntry {
         text: text.clone(),
         at_ms: now_ms(),
         duration_ms,
@@ -374,10 +367,12 @@ fn pipeline_on_worker(
 /// Model variant follows the live menu config (read per cycle, never cached):
 /// SmallEn downloads small.en on first use, BaseEn uses base.en.
 fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
-    match crate::config::load_config().model {
-        crate::config::ModelChoice::TinyEn => crate::stt::ensure_model_variant("tiny"),
-        crate::config::ModelChoice::SmallEn => crate::stt::ensure_model_variant("small"),
-        crate::config::ModelChoice::BaseEn => crate::stt::ensure_model_variant("base"),
+    match crate::core::config::load_config().model {
+        crate::core::config::ModelChoice::TinyEn => crate::core::stt::ensure_model_variant("tiny"),
+        crate::core::config::ModelChoice::SmallEn => {
+            crate::core::stt::ensure_model_variant("small")
+        }
+        crate::core::config::ModelChoice::BaseEn => crate::core::stt::ensure_model_variant("base"),
     }
 }
 /// Safety watchdog (PRD §6): the mic is open but the PttUp that should
@@ -387,7 +382,7 @@ fn ensure_model_for_config() -> Result<std::path::PathBuf, String> {
 /// means the PttUp path broke somewhere above, and the WARN line says so.
 fn watchdog(
     ptt: &mut PushToTalk,
-    capture: &mut Option<crate::audio::AudioCapture>,
+    capture: &mut Option<crate::core::audio::AudioCapture>,
     capture_start: &mut Option<Instant>,
     proxy: &EventLoopProxy<DaemonEvent>,
     max_ms: u64,
@@ -435,7 +430,7 @@ fn watchdog(
 /// can never leave the microphone running indefinitely.
 pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Control>) {
     let mut ptt = PushToTalk::new(300, 60_000);
-    let mut capture: Option<crate::audio::AudioCapture> = None;
+    let mut capture: Option<crate::core::audio::AudioCapture> = None;
     let mut capture_start: Option<Instant> = None;
     let max_ms: u64 = std::env::var("WIFLOW_MAX_RECORDING_MS")
         .ok()
@@ -476,8 +471,8 @@ pub fn worker_main(proxy: EventLoopProxy<DaemonEvent>, rx: mpsc::Receiver<Contro
                 match ptt.on_key_down(now_ms()) {
                     PttEvent::Started => {
                         // Menu-selected mic, re-read per hold (never cached).
-                        let mic = crate::config::load_config().mic_name;
-                        match crate::audio::AudioCapture::start(mic) {
+                        let mic = crate::core::config::load_config().mic_name;
+                        match crate::core::audio::AudioCapture::start(mic) {
                             Ok(cap) => {
                                 capture = Some(cap);
                                 capture_start = Some(Instant::now());
