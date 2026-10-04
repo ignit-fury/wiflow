@@ -15,7 +15,9 @@ use winit::{
 use crate::core::config::{Config, ModelChoice};
 use crate::core::history::HistoryEntry;
 use crate::core::traits::TextInjector;
-use crate::daemon::{current_session, preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset};
+use crate::daemon::{
+    current_session, preset_hint, preset_hotkey, Control, DaemonEvent, HotkeyPreset,
+};
 
 fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
     match ev {
