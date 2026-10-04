@@ -74,6 +74,19 @@ struct Inner {
     hold_id: u64,
 }
 
+/// Copyable live view of duck bookkeeping, read by the `MediaController`
+/// wrapper. All fields are flags/ids — no audio, no samples.
+/// Consumed by `platform::macos::media` (Task 11/12 seam).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuckSnapshot {
+    pub active: bool,
+    pub volumes_saved: bool,
+    pub paused: usize,
+    pub saved_device: Option<u32>,
+    pub hold_id: u64,
+}
+
 /// Owns duck state across holds. Idempotent on both ends; stale delayed
 /// pauses are invalidated by `hold_id`, so rapid start/stop cycles cannot
 /// corrupt volume or leave apps paused.
@@ -249,6 +262,36 @@ impl<B: MediaBackend> AudioDuck<B> {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Live view of duck bookkeeping for the `MediaController` wrapper
+    /// (`platform::macos::media`): explicit, copyable, no samples involved.
+    /// Wired in Task 12; unused until then.
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> DuckSnapshot {
+        let inner = self.lock();
+        DuckSnapshot {
+            active: inner.active,
+            volumes_saved: !inner.saved_volumes.is_empty(),
+            paused: inner.paused.len(),
+            saved_device: inner.saved_device,
+            hold_id: inner.hold_id,
+        }
+    }
+
+    /// Pre-duck truth for session snapshots: is anything worth pausing
+    /// playing right now? Read-only; never mutates hold state.
+    /// Wired in Task 12; unused until then.
+    #[allow(dead_code)]
+    pub fn any_playing(&self) -> bool {
+        PLAYERS.iter().any(|app| self.backend.is_playing(*app))
+    }
+
+    /// Live output-device id for session snapshots. Read-only.
+    /// Wired in Task 12; unused until then.
+    #[allow(dead_code)]
+    pub fn current_device(&self) -> Option<u32> {
+        self.backend.output_device_id()
     }
 
     /// Test probe: is a hold currently ducked?

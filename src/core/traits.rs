@@ -165,6 +165,18 @@ impl ContextProvider for OsascriptContext {
     }
 }
 
+// ── MediaController ─────────────────────────────────────────────────────────
+
+/// Competing-audio prioritization while the mic is hot: immediate volume
+/// duck, then (after the gate) optional player pause — all owned here, never
+/// in the orchestrator (H11). Implemented in `platform::macos::media`.
+/// Wired in Task 12; unused until then.
+#[allow(dead_code)]
+pub trait MediaController {
+    fn duck(&mut self);
+    fn restore(&mut self);
+}
+
 // ── Tests (fakes are the seams S2/S4 build on) ─────────────────────────────
 
 #[cfg(test)]
