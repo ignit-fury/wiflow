@@ -61,9 +61,14 @@ pub enum DaemonEvent {
     Cancel,
     /// Worker reports that `AudioCapture::start(...)` succeeded.
     ///
-    /// Fieldless: ordering is the whole contract (sent immediately after
-    /// capture start-ok, before any transcription).
-    CaptureStarted,
+    /// Carries the pre-duck media truth (probed worker-side, off the event
+    /// loop — R17): the orchestrator fills the frozen session snapshot from
+    /// these fields without blocking on OS queries. Ordering is still the
+    /// core contract (sent immediately after capture start-ok).
+    CaptureStarted {
+        output_device: Option<String>,
+        was_playing: bool,
+    },
     /// Safety watchdog fired: the recording ran past the max duration
     /// because PttUp never arrived. The worker force-stopped the mic and is
     /// transcribing what it captured; the app must leave Recording.
@@ -350,8 +355,21 @@ fn worker_on_control_down<S: DaemonEventSender>(
                     duck.restore();
                     duck.duck();
 
+                    // Pre-duck media truth for the session snapshot, probed
+                    // here on the worker (never on the event loop — R17).
+                    // Cost when nothing plays: one CoreAudio query + two
+                    // pgrep calls (~ms). Duck state is unaffected by probing.
+                    let probe_device = duck.current_device().map(|d| d.to_string());
+                    let probe_playing = duck.any_playing();
+
                     // Emit before any transcription begins.
-                    if sender.send_event(DaemonEvent::CaptureStarted).is_err() {
+                    if sender
+                        .send_event(DaemonEvent::CaptureStarted {
+                            output_device: probe_device,
+                            was_playing: probe_playing,
+                        })
+                        .is_err()
+                    {
                         tracing::error!(
                             "[session={}] capture-start notice lost — dropping capture",
                             current_session()
@@ -641,7 +659,7 @@ mod tests {
                     DaemonEvent::Failed(msg) => {
                         *self.failed_msg.lock().unwrap() = Some(msg);
                     }
-                    DaemonEvent::CaptureStarted => {
+                    DaemonEvent::CaptureStarted { .. } => {
                         *self.capture_started_seen.lock().unwrap() = true;
                     }
                     _ => {}

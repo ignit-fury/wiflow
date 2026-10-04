@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use crate::core::traits::{MediaController, MediaProbe};
+use crate::core::traits::MediaController;
 
 #[cfg(test)]
 use super::duck::PlayerApp;
@@ -85,6 +85,19 @@ impl<B: MediaBackend> CoreAudioDuck<B> {
         self.apply_snapshot(snap);
     }
 
+    /// Pre-duck truth for the state view. Private: only `duck()` needs it
+    /// (the orchestrator fills session snapshots from worker-sent event
+    /// fields — R17). Disabled controllers probe NOTHING.
+    fn probe_pre_state(&self) -> (Option<String>, bool) {
+        if !self.enabled {
+            return (None, false);
+        }
+        (
+            self.inner.current_device().map(|d| d.to_string()),
+            self.inner.any_playing(),
+        )
+    }
+
     fn apply_snapshot(&mut self, snap: DuckSnapshot) {
         self.state.ducked_by_wiflow = snap.active && snap.volumes_saved;
         self.state.paused_by_wiflow = snap.active && snap.paused > 0;
@@ -100,9 +113,9 @@ impl<B: MediaBackend> MediaController for CoreAudioDuck<B> {
     fn duck(&mut self) {
         // Snapshot pre-duck truth first: the session record must describe
         // what WE found, not what a concurrent change left behind.
-        let probe = self.pre_duck_probe();
-        self.state.was_playing_before = probe.was_playing;
-        self.state.output_device = probe.output_device;
+        let (device, playing) = self.probe_pre_state();
+        self.state.was_playing_before = playing;
+        self.state.output_device = device;
         self.inner.duck();
         self.refresh();
     }
@@ -117,19 +130,6 @@ impl<B: MediaBackend> MediaController for CoreAudioDuck<B> {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.inner.set_enabled(enabled);
-    }
-
-    fn pre_duck_probe(&self) -> MediaProbe {
-        if !self.enabled {
-            return MediaProbe {
-                output_device: None,
-                was_playing: false,
-            };
-        }
-        MediaProbe {
-            output_device: self.inner.current_device().map(|d| d.to_string()),
-            was_playing: self.inner.any_playing(),
-        }
     }
 }
 
@@ -437,33 +437,20 @@ mod tests {
     }
 
     #[test]
-    fn pre_duck_probe_does_not_mutate() {
-        let fake = Fake::playing_music();
-        let probe_handle = fake.clone();
-        let d = ducked(fake);
-        let p1 = d.pre_duck_probe();
-        let p2 = d.pre_duck_probe();
-        assert_eq!(p1, p2, "probe is read-only");
-        assert_eq!(p1.output_device.as_deref(), Some("7"));
-        assert!(p1.was_playing);
-        assert_eq!(probe_handle.write_count(), 0, "no writes from probing");
-    }
-
-    #[test]
-    fn disabled_probe_returns_default_without_touching_backend() {
-        // The per-session toggle (H24): disabled controllers must not issue
-        // ANY backend call — hermetic tests, no per-press osascript cost.
-        // A read counter would be ideal; behaviorally, a disabled probe on
-        // a device-present, playing backend still reports { None, false }.
+    fn disabled_duck_leaves_view_default() {
+        // Disabled controllers probe nothing and dip nothing: the state
+        // view stays at default through duck + restore.
         let fake = Fake::playing_music();
         let probe_handle = fake.clone();
         let mut d = ducked(fake);
         d.set_enabled(false);
-        let p = d.pre_duck_probe();
-        assert_eq!(p.output_device, None);
-        assert!(!p.was_playing);
         d.duck();
+        d.refresh();
+        assert!(!d.state().was_playing_before);
+        assert_eq!(d.state().output_device, None);
         assert_eq!(probe_handle.write_count(), 0, "disabled: never dips");
+        d.restore();
+        d.refresh();
         assert!(!d.state().restoration_required);
     }
 }

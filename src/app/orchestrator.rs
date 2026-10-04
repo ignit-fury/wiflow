@@ -103,7 +103,10 @@ impl<M: MediaController> Orchestrator<M> {
             DaemonEvent::PttDown => self.handle_ptt_down(),
             DaemonEvent::PttUp => self.handle_ptt_up(),
             DaemonEvent::Cancel => self.handle_cancel(),
-            DaemonEvent::CaptureStarted => self.handle_capture_started(),
+            DaemonEvent::CaptureStarted {
+                output_device,
+                was_playing,
+            } => self.handle_capture_started(output_device.clone(), *was_playing),
             DaemonEvent::Watchdog { duration_ms } => self.handle_watchdog(*duration_ms),
             DaemonEvent::TapIssue(msg) => self.handle_tap_issue(msg),
             DaemonEvent::Done {
@@ -245,15 +248,11 @@ impl<M: MediaController> Orchestrator<M> {
             // Freeze settings + context at STARTING time (H6/H24).
             let config = crate::core::config::load_config();
             let mut session = begin_session(&config, OsascriptContext);
-            // Media, per session snapshot (H24): toggle + pre-duck probe.
-            // The probe runs BEFORE Control::Down reaches the worker, so it
-            // records true pre-duck truth.
+            // Apply the session's toggle now (flag flip only — zero backend
+            // touch). The media probe runs at LISTENING (R16, below), not
+            // here: osascript-backed queries must never gate Control::Down.
             self.media.set_enabled(session.settings.duck_audio);
-            let probe = self.media.pre_duck_probe();
-            session.media = crate::app::session::MediaSnapshot {
-                output_device: probe.output_device,
-                was_playing: probe.was_playing,
-            };
+            session.media = crate::app::session::MediaSnapshot::default();
             self.session = Some(session);
             vec![
                 Action::SetTray(AppState::Recording, None),
@@ -286,10 +285,23 @@ impl<M: MediaController> Orchestrator<M> {
         }
     }
 
-    fn handle_capture_started(&mut self) -> Vec<Action> {
+    fn handle_capture_started(
+        &mut self,
+        output_device: Option<String>,
+        was_playing: bool,
+    ) -> Vec<Action> {
         if self.machine.on_capture_started() == Admission::Accept {
             // Entered LISTENING → arm supervision deadline.
             self.supervision_at = Some(Instant::now());
+            // Fill the frozen media snapshot from the worker-probed fields
+            // (R17): pre-duck, pre-pause truth without blocking the event
+            // loop on OS queries.
+            if let Some(session) = self.session.as_mut() {
+                session.media = crate::app::session::MediaSnapshot {
+                    output_device,
+                    was_playing,
+                };
+            }
             // Own the MediaController boundary (H11): duck on LISTENING
             // entry. The worker already ducked at capture-Ok on the shared
             // machine, so this is normally a no-op there — but it records
@@ -406,7 +418,12 @@ mod tests {
     }
 
     fn evt_capture_started() -> DaemonEvent {
-        DaemonEvent::CaptureStarted
+        // Fixed dummy media truth; snapshot tests build the event literally
+        // for real values. See `session_media_snapshot_filled_at_listening`.
+        DaemonEvent::CaptureStarted {
+            output_device: None,
+            was_playing: false,
+        }
     }
 
     fn evt_watchdog(ms: u64) -> DaemonEvent {
@@ -819,28 +836,31 @@ mod tests {
     }
 
     #[test]
-    fn session_media_snapshot_filled_at_starting() {
-        // H6: STARTING probes device + playing into the frozen snapshot.
-        let (mut orch, _probe) = orch_with_fake(|f| {
-            f.set_device(Some(7));
-        });
-        // NOTE: playing knob lives on the fake; the default fake plays
-        // nothing, so this run asserts the device half. The playing half
-        // is pinned by `playing_snapshot_records_was_playing` below.
+    fn session_media_snapshot_filled_at_listening() {
+        // H6/R17: LISTENING fills the frozen snapshot from worker-probed
+        // event fields (pre-duck, pre-pause truth, no main-thread queries).
+        let (mut orch, _probe) = orch_with_fake(|_| {});
         orch.handle(&evt_ptt_down());
-        let s = orch.session.as_ref().expect("session at STARTING");
+        assert!(orch.session.as_ref().unwrap().media.output_device.is_none());
+        orch.handle(&DaemonEvent::CaptureStarted {
+            output_device: Some("7".into()),
+            was_playing: false,
+        });
+        let s = orch.session.as_ref().expect("session at LISTENING");
         assert_eq!(s.media.output_device.as_deref(), Some("7"));
         assert!(!s.media.was_playing);
     }
 
     #[test]
     fn playing_snapshot_records_was_playing() {
-        let (mut orch, _probe) = orch_with_fake(|f| {
-            f.set_playing(PlayerApp::Music);
-        });
+        let (mut orch, _probe) = orch_with_fake(|_| {});
         orch.handle(&evt_ptt_down());
-        let s = orch.session.as_ref().expect("session at STARTING");
-        assert!(s.media.was_playing, "Music playing at STARTING");
+        orch.handle(&DaemonEvent::CaptureStarted {
+            output_device: Some("7".into()),
+            was_playing: true,
+        });
+        let s = orch.session.as_ref().expect("session at LISTENING");
+        assert!(s.media.was_playing, "worker-reported playing at LISTENING");
     }
 
     #[test]

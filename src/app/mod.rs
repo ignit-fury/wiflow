@@ -24,7 +24,7 @@ fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
         DaemonEvent::PttDown => "PttDown",
         DaemonEvent::PttUp => "PttUp",
         DaemonEvent::Cancel => "Cancel",
-        DaemonEvent::CaptureStarted => "CaptureStarted",
+        DaemonEvent::CaptureStarted { .. } => "CaptureStarted",
         DaemonEvent::Watchdog { .. } => "Watchdog",
         DaemonEvent::TapIssue { .. } => "TapIssue",
         DaemonEvent::Done { .. } => "Done",

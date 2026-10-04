@@ -625,6 +625,16 @@ fn default_output_device() -> Option<u32> {
     (status == 0 && id != 0).then_some(id)
 }
 
+/// Process-existence check without Apple Events: instant (~ms), never
+/// launches the target, false on any error (safe direction: skip pausing).
+fn process_running(name: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Real macOS backend.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsBackend;
@@ -746,16 +756,11 @@ impl MediaBackend for OsBackend {
 
     fn is_playing(&self, app: PlayerApp) -> bool {
         let name = app.process_name();
-        // Existence check first: querying a non-running app would LAUNCH it.
-        let running = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!("tell application \"System Events\" to get exists process \"{name}\""),
-            ])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("true"))
-            .unwrap_or(false);
-        if !running {
+        // Existence check first via pgrep (instant, launch-free): querying a
+        // non-running app via Apple Events would LAUNCH it, and osascript
+        // round-trips cost seconds cold — untenable on the dictation path
+        // (R17: the worker probes pre-duck truth at capture-Ok).
+        if !process_running(name) {
             return false;
         }
         std::process::Command::new("osascript")

@@ -176,18 +176,6 @@ pub trait MediaController {
     /// Per-session toggle from the snapshot (H24). Disabled controllers
     /// must not touch the backend at all.
     fn set_enabled(&mut self, enabled: bool);
-    /// Pre-duck probe for STARTING snapshots (H6): device + playing as
-    /// found, before this session ducks. Query only, never mutates.
-    fn pre_duck_probe(&self) -> MediaProbe;
-}
-
-/// Pre-duck media truth for session snapshots. Core-owned so the
-/// orchestrator can fill `Session.media` without importing platform types
-/// (H25); platform produces it, App records it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaProbe {
-    pub output_device: Option<String>,
-    pub was_playing: bool,
 }
 
 // ── Tests (fakes are the seams S2/S4 build on) ─────────────────────────────
