@@ -392,21 +392,8 @@ fn detect_reasons(raw_input: &str, text: &str) -> CleanupReasons {
     if lower.contains("you know") {
         r.filler = true;
     }
-    if [
-        "no actually",
-        "i mean",
-        "i meant",
-        "sorry",
-        "scratch that",
-        "no perdón",
-        "de fapt",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
-    {
-        r.self_correction = true;
-    }
-    // Whole-word match so "no waiting" or "make it actually work" don't fire.
+    // Whole words with punctuation dropped: Whisper often writes
+    // "Thursday. No, actually Wednesday", and "no waiting" must not fire.
     let padded = format!(
         " {} ",
         lower
@@ -416,6 +403,13 @@ fn detect_reasons(raw_input: &str, text: &str) -> CleanupReasons {
             .join(" ")
     );
     if [
+        " no actually ",
+        " i mean ",
+        " i meant ",
+        " sorry ",
+        " scratch that ",
+        " no perdón ",
+        " de fapt ",
         " no wait ",
         " wait no ",
         " or rather ",
@@ -423,8 +417,12 @@ fn detect_reasons(raw_input: &str, text: &str) -> CleanupReasons {
         " actually make that ",
     ]
     .iter()
-    .any(|p| padded.contains(p))
-    {
+    .any(|p| {
+        // "Sorry, …" and "I mean, …" usually open a sentence rather than
+        // correct one; at the very start there is nothing to replace.
+        let opener = matches!(*p, " sorry " | " i mean " | " i meant ");
+        padded.match_indices(p).any(|(i, _)| i > 0 || !opener)
+    }) {
         r.self_correction = true;
     }
     // Trailing filler / dangling correction.
@@ -520,6 +518,17 @@ mod tests {
                 vec!["self_correction"],
             ),
             ("there is no waiting list today", vec![]),
+            // Whisper punctuation between the marker words (live, 2026-10-30).
+            (
+                "Let's meet Thursday. No, actually Wednesday after lunch.",
+                vec!["self_correction"],
+            ),
+            ("Use Redis, I mean, Memcached.", vec!["self_correction"]),
+            (
+                "The limit is ten. Scratch that. Twelve.",
+                vec!["self_correction"],
+            ),
+            ("We're late, sorry, Friday works", vec!["self_correction"]),
         ];
         for (input, want) in cases {
             let a = analyzed(input);
@@ -538,14 +547,16 @@ mod tests {
     fn test_false_positive_guards() {
         // Ordinary words that merely resemble signals stay deterministic.
         for input in [
-            "I like pie",                   // "like" is not filler here
-            "the cost plus tax",            // prose, not math
-            "Meet me at 3:30 PM",           // single acronym + time
-            "the trial period ended",       // "period" is prose
-            "café naïve déjà vu",           // non-ASCII preserved, no route
-            "an API for масштаб",           // single acronym, mixed-language
-            "one more thing",               // small number, no route
-            "write a poem, comma optional", // hmm — "comma" is NOT a signal
+            "I like pie",                      // "like" is not filler here
+            "the cost plus tax",               // prose, not math
+            "Meet me at 3:30 PM",              // single acronym + time
+            "the trial period ended",          // "period" is prose
+            "café naïve déjà vu",              // non-ASCII preserved, no route
+            "an API for масштаб",              // single acronym, mixed-language
+            "one more thing",                  // small number, no route
+            "write a poem, comma optional",    // hmm — "comma" is NOT a signal
+            "Sorry, I'm late for the meeting", // opens with the marker
+            "I mean it, this has to ship today",
         ] {
             let a = analyzed(input);
             assert!(!a.needs_llm, "{input:?} → {a:?}");

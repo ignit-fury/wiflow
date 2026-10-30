@@ -432,9 +432,21 @@ pub fn candidate_preserves_input(source: &str, candidate: &str) -> bool {
     if candidate.trim() == "EMPTY" || candidate.trim().is_empty() {
         return source.trim().is_empty();
     }
+    let source_words = canonical_words(source);
+    let last_correction = last_correction(&source_words);
     let mut required = std::collections::HashMap::new();
     for range in protected_ranges(source) {
-        *required.entry(&source[range]).or_insert(0usize) += 1;
+        let span = &source[range];
+        // "10 scratch that 12": the replaced number may go. Numbers in the
+        // replacement are still checked below.
+        if last_correction.is_some()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_digit() || ",.:%$".contains(c))
+        {
+            continue;
+        }
+        *required.entry(span).or_insert(0usize) += 1;
     }
     if required
         .into_iter()
@@ -442,7 +454,6 @@ pub fn candidate_preserves_input(source: &str, candidate: &str) -> bool {
     {
         return false;
     }
-    let source_words = canonical_words(source);
     let candidate_words = canonical_words(candidate);
     let mut allowed_numbers = std::collections::HashMap::new();
     for value in numeric_literals(source)
@@ -559,31 +570,6 @@ pub fn candidate_preserves_input(source: &str, candidate: &str) -> bool {
     let number_word =
         |word: &str| cardinal(word).is_some() || matches!(word, "hundred" | "thousand" | "million");
     let content = |word: &str| !function_word(word) && !number_word(word);
-    let mut last_correction = None;
-    for (i, words) in source_words.windows(2).enumerate() {
-        if matches!(
-            (words[0].as_str(), words[1].as_str()),
-            ("no", "actually")
-                | ("i", "mean")
-                | ("i", "meant")
-                | ("scratch", "that")
-                | ("no", "wait")
-                | ("wait", "no")
-                | ("or", "rather")
-        ) {
-            last_correction = Some(i + 2);
-        } else if words[0] == "actually" && words[1] == "make" {
-            // "actually make it Thursday": the replacement starts after "it".
-            let skip = source_words
-                .get(i + 2)
-                .is_some_and(|w| w == "it" || w == "that");
-            last_correction = Some(i + 2 + usize::from(skip));
-        }
-    }
-    if let Some(i) = source_words.iter().rposition(|word| word == "sorry") {
-        last_correction =
-            Some(last_correction.map_or(i + 1, |previous: usize| previous.max(i + 1)));
-    }
     // Require the final replacement phrase in full, including the end of a
     // long dictation; a token cap must not quietly truncate the tail.
     let retain_from = last_correction.unwrap_or(0);
@@ -600,11 +586,28 @@ pub fn candidate_preserves_input(source: &str, candidate: &str) -> bool {
     if last_correction.is_some() {
         let mut kept = spoken_numbers(&candidate_words);
         kept.extend(numeric_literals(candidate));
-        if spoken_numbers(&source_words[retain_from.min(source_words.len())..])
+        let tail = &source_words[retain_from.min(source_words.len())..];
+        if spoken_numbers(tail)
             .iter()
             .any(|value| !kept.contains(value))
         {
             return false;
+        }
+        // Digits too: "42, no actually 43 files" must keep 43. Words skip
+        // digits, so locate the marker in the raw text.
+        let ranges = word_ranges(source);
+        let raw: Vec<String> = ranges
+            .iter()
+            .map(|r| source[r.clone()].to_lowercase())
+            .collect();
+        if let Some(end) = self::last_correction(&raw).map(|i| ranges[i - 1].end) {
+            let kept = numeric_literals(candidate);
+            if numeric_literals(&source[end..])
+                .iter()
+                .any(|n| !kept.contains(n))
+            {
+                return false;
+            }
         }
     }
     // These repetitions have valid grammar; punctuation cleanup must not erase them.
@@ -637,6 +640,43 @@ pub fn candidate_preserves_input(source: &str, candidate: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Word index where the final replacement starts, after the last spoken
+/// self-correction marker ("no actually", "scratch that", trailing "sorry").
+fn last_correction(words: &[String]) -> Option<usize> {
+    let mut last_correction = None;
+    for (i, pair) in words.windows(2).enumerate() {
+        // A marker that opens the dictation has nothing to replace
+        // ("Sorry, I'm late", "I mean it").
+        if i > 0
+            && matches!(
+                (pair[0].as_str(), pair[1].as_str()),
+                ("no", "actually")
+                    | ("i", "mean")
+                    | ("i", "meant")
+                    | ("scratch", "that")
+                    | ("no", "wait")
+                    | ("wait", "no")
+                    | ("or", "rather")
+            )
+        {
+            last_correction = Some(i + 2);
+        } else if i > 0 && pair[0] == "actually" && pair[1] == "make" {
+            // "actually make it Thursday": the replacement starts after "it".
+            let skip = words.get(i + 2).is_some_and(|w| w == "it" || w == "that");
+            last_correction = Some(i + 2 + usize::from(skip));
+        }
+    }
+    if let Some(i) = words
+        .iter()
+        .rposition(|word| word == "sorry")
+        .filter(|&i| i > 0)
+    {
+        last_correction =
+            Some(last_correction.map_or(i + 1, |previous: usize| previous.max(i + 1)));
+    }
+    last_correction
 }
 
 fn canonical_words(text: &str) -> Vec<String> {
@@ -956,6 +996,14 @@ mod tests {
                 "Let's meet Thursday no actually Wednesday",
                 "Let's meet Wednesday.",
             ),
+            (
+                "Let's meet Thursday. No, actually Wednesday after lunch.",
+                "Let's meet Wednesday after lunch.",
+            ),
+            (
+                "The limit is 10. Scratch that, 12 users.",
+                "The limit is 12 users.",
+            ),
             ("We was ready", "We were ready."),
             ("I do not want to deploy", "I don't want to deploy."),
             ("Call me at twenty percent", "Call me at 20%."),
@@ -1017,6 +1065,14 @@ mod tests {
                 "Let's use Postgres no wait MySQL for the new service",
                 "Let's use Postgres for the new service.",
             ),
+            // A marker that opens the dictation is not a correction.
+            ("Sorry, I'm late for the meeting.", "I'm late for the meeting."),
+            (
+                "I mean it, this has to ship today.",
+                "This has to ship today.",
+            ),
+            // The replacement number must still survive.
+            ("The limit is 10. Scratch that, 12 users.", "The limit is 10 users."),
             // llama3.2:3b outputs seen in testing (2026-10-30).
             ("there is no waiting list today so just come in", "come in"),
             (

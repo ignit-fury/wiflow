@@ -47,8 +47,30 @@ exists).
 4b. "Postgres no wait MySQL" is still wrong with llama3.2:3b.
 
 Checks:
-- [ ] At least one real failing clip reproduces the drop in a test
-- [ ] Fix makes those clips transcribe fully; short-clip speed stays close to today
+- [ ] At least one real failing clip reproduces the drop in a test: not
+  yet. None of the 14 clips saved since clip saving was turned on lose
+  words (a 16 s one came out complete; "Let's optimize the" is 2.5 s of
+  speech followed by silence). The original failures came before saving.
+- [x] Likely-cause fix shipped: Whisper timestamps back on. With them off,
+  whisper.cpp skips the rest of the window once the decoder ends a segment,
+  so speech after a pause can be lost; this matches the old failures, where
+  13 s of audio reached Whisper and 2 words came back. On the 14 clips: same
+  words, and "scratched at 12" became the spoken "scratch that 12". Cost:
+  +10–25 ms on most clips, ~+250 ms on the 3 clips with a pause.
+- [ ] Confirm with real use: watch the log's "N words from X s of audio" for
+  long holds with few words, and keep clip saving on until then.
+
+4c. Found in Phase 3: punctuated correction markers ("Thursday. No, actually
+Wednesday") were not detected.
+
+- [x] Router and safety check match markers on words with punctuation
+  removed. A marker that opens the dictation ("Sorry, I'm late", "I mean
+  it") is not a correction, so it stays in the text.
+- [x] The replaced number may be dropped ("10. Scratch that, 12 users"), but
+  digits after the marker must survive.
+- [x] Live with llama3.2:3b, 7 punctuated sentences: 7 right (5 corrected,
+  2 left alone), 210–310 ms each, no tray warnings (before: 4 right, and
+  "Sorry" was deleted).
 - [x] "A no wait B" gives the right text: three new prompt examples; llama3.2:3b now gets 7 of 7 correction sentences right (was 4 of 7) and 2 of 3 unseen ones ("docs folder I mean the src folder" still wrong; the guard rejects it). Guard tests added for the 3b hallucinations seen
 - [x] Debug clip saving stays opt-in, documented
 

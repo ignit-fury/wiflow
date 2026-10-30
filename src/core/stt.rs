@@ -118,8 +118,12 @@ impl Stt {
         // Use Whisper's standard multi-segment output for holds up to 60s.
         // Collect every returned segment below, including later audio chunks.
         params.set_single_segment(false);
-        // Skip timestamp token computation — wiflow never uses timestamps.
-        params.set_no_timestamps(true);
+        // Keep timestamps on even though the text ignores them: without
+        // them, whisper.cpp skips the rest of the 30 s window once the decoder
+        // ends a segment, so speech after a pause can be lost. Costs 10–25 ms,
+        // ~250 ms on clips with pauses (14 real clips, same words; "scratched
+        // at" became the spoken "scratch that").
+        params.set_no_timestamps(false);
         // Encode only as much of the 30 s window as the clip needs.
         params.set_audio_ctx(audio_ctx_for(samples_16k.len()));
         if !initial_prompt.is_empty() {
