@@ -31,6 +31,10 @@ pub fn inject_text(text: &str) -> Result<InjectReport, String> {
     if text.trim().is_empty() {
         return Err("refusing to inject empty text".into());
     }
+    if super::secure::password_field_focused() {
+        // The caller's failure path copies the text and warns instead.
+        return Err("password field focused, text copied instead of typed".into());
+    }
     let mut cb = Clipboard::new().map_err(|e| format!("clipboard open: {e:?}"))?;
     let saved = cb.get_text().unwrap_or_default();
     cb.set_text(text)
