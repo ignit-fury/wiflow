@@ -167,3 +167,9 @@ remains open. Recording, model selection, and injection code are unchanged.
 Validation: 269 default tests passed, 4 optional tests ignored; both new
 acoustic tests passed separately with SmallEn and the saved prompt. Clippy
 all targets with warnings denied, formatting, and diff checks passed.
+
+- 2026-10-30 — Default Ollama cleanup model is now `llama3.2:3b` (was
+  `llama3.2:1b`). On six self-correction sentences through the app's cleanup
+  path, 3B got 5 right and 1B got 1; warm 3B takes ~230–400 ms. Ollama context
+  is capped at 4,096 tokens (2.6 GB resident instead of 9.9 GB). Existing
+  installs keep their saved `cleanup_model`. Details: docs/perf-accuracy-plan.md.

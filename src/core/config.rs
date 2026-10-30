@@ -70,7 +70,7 @@ fn default_true() -> bool {
     true
 }
 fn default_ollama_model() -> String {
-    "llama3.2:1b".into()
+    "llama3.2:3b".into()
 }
 fn default_groq_model() -> String {
     "openai/gpt-oss-20b".into()
@@ -101,7 +101,7 @@ impl Default for Config {
             model: ModelChoice::default(),
             launch_at_login: false,
             cleanup_enabled: true,
-            cleanup_model: "llama3.2:1b".into(),
+            cleanup_model: "llama3.2:3b".into(),
             cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),

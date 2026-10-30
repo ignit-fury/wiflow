@@ -51,7 +51,7 @@ OUT (v1):
 - Optional fallback (behind setting, off by default):
   - Groq `whisper-large-v3-turbo` (~$0.111/hr audio, generous free tier) for low-end Macs.
   - OpenRouter `:free` LLM models for punctuation cleanup only, never for STT.
-  - Local Ollama (`llama3.2:1b`) as free offline cleanup alternative.
+  - Local Ollama (`llama3.2:3b`) as free offline cleanup alternative.
 - No API key shipped. User brings own key if they enable cloud.
 
 ## 8. Open Questions (locked unless reopened)

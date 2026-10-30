@@ -1324,7 +1324,7 @@ mod tests {
     #[test]
     fn test_check_ollama_ready_live() {
         // Live: Ollama may or may not be running (CI skips honestly).
-        match check_ollama_ready("llama3.2:1b") {
+        match check_ollama_ready("llama3.2:3b") {
             Ok(()) => {} // running + model installed
             Err(e) => eprintln!("skipped (ollama not ready here): {e}"),
         }

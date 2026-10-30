@@ -49,7 +49,7 @@
   model; fully offline after model download; $0 marginal cost.
 - **Cost strategy**: default 100% local; cloud strictly opt-in — Groq
   `whisper-large-v3` STT (~$0.111/hr, generous free tier), OpenRouter `:free`
-  LLMs for cleanup only, Ollama (`llama3.2:1b`) as free local cleanup.
+  LLMs for cleanup only, Ollama (`llama3.2:3b`) as free local cleanup.
   User brings own key; keys never shipped in repo.
 
 ---
