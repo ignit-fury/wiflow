@@ -423,6 +423,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
             // Menu-selected mic + duck toggle, re-read per hold.
             let live = crate::core::config::load_config();
             duck.set_enabled(live.duck_audio);
+            crate::core::cleanup::wake_ollama_if_idle(&live);
             let mic = live.mic_name;
             match crate::core::audio::AudioCapture::start(mic) {
                 Ok(cap) => {

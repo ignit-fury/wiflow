@@ -68,8 +68,13 @@ Checks:
 - Phase 3 done. What the timing line found on its first live run:
   1. The first cleanup after ~1 h idle took 1.21 s inside Ollama (its own
      log), near the 1.5 s timeout, though the model stays loaded. Back-to-back
-     calls take 210–300 ms. Not fixed. Idea: on key press, if Ollama has been
-     idle for over 5 min, send a tiny warm-up request while the user speaks.
+     calls take 210–300 ms. Fixed: on key press, if the app has not used
+     Ollama for over 5 min, it sends a one-token warm-up request in the
+     background, which finishes while the user speaks.
+     Live: right after startup, no wake-up (as intended). After 6 min idle,
+     the key press woke Ollama in 1.1 s, still inside the 1.6 s hold, so
+     the cleanup after it would hit a warm model. Ollama goes slow within
+     about 6 minutes, so the 5-minute threshold may be a little long.
   2. Whisper wrote "Thursday. No, actually Wednesday" and the router called
      it already clean, so the correction was pasted as spoken. Punctuation
      between the marker words breaks detection. Goes into Phase 4.
