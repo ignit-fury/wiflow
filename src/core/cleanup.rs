@@ -69,9 +69,14 @@ fn tags_contain(tags: &serde_json::Value, model: &str) -> bool {
     })
 }
 
+/// The model the app last asked Ollama to keep resident (startup, switch or
+/// timeout warm-up), so a switch knows which pinned model to free.
+static WARMED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// Load `model` into Ollama memory, keep it resident, and prime the prompt
 /// cache. Blocking; cold loads take seconds.
 pub fn warm_ollama(model: &str) -> Result<(), String> {
+    model.clone_into(&mut WARMED.lock().unwrap_or_else(|e| e.into_inner()));
     http()
         .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
         .timeout(Duration::from_secs(60))
@@ -93,12 +98,12 @@ pub fn warm_ollama(model: &str) -> Result<(), String> {
 /// After a settings save: load the Ollama model in the background when it
 /// changed, so the first cleanup after a switch is not a cold-load timeout.
 pub fn warm_ollama_on_change(cfg: &crate::core::config::Config) {
-    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = WARMED.lock().unwrap_or_else(|e| e.into_inner());
     if !should_warm_on_change(&last, cfg) {
         return;
     }
     let previous = std::mem::replace(&mut *last, cfg.cleanup_model.clone());
+    drop(last); // warm_ollama below takes the lock again
     let model = cfg.cleanup_model.clone();
     std::thread::spawn(move || {
         // keep_alive -1 pins models, so free the one switched away from.

@@ -23,7 +23,8 @@ cleanup is cold (~3.4 s), times out, and falls back to the uncleaned text.
 Checks:
 - [x] Saving a new Ollama model (or switching provider to Ollama) calls `warm_ollama` in the background, and unloads the previous model
 - [x] Unit test covers the "should warm" decision
-- [x] Live: 3b to 1b loaded in under 8 s; 1b to 3b unloaded 1b (`ollama ps`). Tray click not yet tried by hand
+- [x] Live through the tray menu (fresh app start, 1b selected): picking 3b freed 1b and loaded 3b in 3 s; the next cleanup call took 242 ms (model load 1 ms), under the 1.5 s timeout
+- [x] Fixed in re-check: the first switch after launch did not free the startup model (the app did not record which model it loaded at startup)
 
 ## Phase 3 — Per-stage timing line
 
@@ -63,7 +64,7 @@ Checks:
 ## Progress
 
 - Phase 1 done (CI green on PR 3).
-- Phase 2 done; tray switch by hand still to try.
+- Phase 2 done, verified live through the tray menu.
 - Phase 3 done except one live dictation.
 - Phase 4b done. 4a waiting for real failing clips. The STT log line now
   shows word count and audio seconds, so drops are visible.
