@@ -67,9 +67,20 @@ Whisper `small.en` on Metal, release build, warm runs (macOS `say` fixtures):
 On top of that, each dictation no longer hashes the model (~285 ms), and the
 focused-app lookup (~200 ms) now runs during STT instead of after it.
 
-Possible next step (not in this plan): set Whisper `audio_ctx` from clip
-length. The encoder always processes a 30 s window, which is most of the
-fixed cost on short clips, but shrinking it can cost accuracy.
+Whisper `audio_ctx` (Phase 7): the encoder used to process a full 30 s window
+for every clip. It now encodes clip length + 128 frames, at least 10 s.
+On six `say` clips (0.7–9.4 s), small.en on Metal:
+
+| Clip | Full 30 s | Fit, 10 s floor (shipped) |
+|------|-----------|---------------------------|
+| 0.7 s | 206 ms | 79 ms |
+| 1.6 s | 228 ms | 115 ms |
+| 3.1 s | 300 ms | 158 ms |
+| 6.3 s | 416 ms | 276 ms |
+| 9.4 s | 454 ms | 345 ms |
+
+Same words on every clip; very short clips can lose their final punctuation.
+A tight fit with no floor garbled "Ship it" into "Sh-it" and was rejected.
 
 Live app, 6–10 s dictations: 375–387 ms to transcribe (before: 570–700 ms).
 Key press to recorder start: 21 ms (before: median 184 ms).
@@ -95,6 +106,11 @@ Self-correction fixes (Phase 6):
 check now rejected the wrong ones instead of pasting them), 5 right after.
 The remaining miss ("Postgres no wait MySQL") is rejected and pasted as
 dictated. About 400 ms per cleanup with the longer instructions.
+
+Manual checks (2026-10-30): multi-channel capture verified through BlackHole
+2ch and 16ch (correct sample counts, correct transcripts); paste verified in
+TextEdit and Script Editor with the clipboard restored. Permission-denied
+path not tested (needs permissions revoked by hand).
 
 ## Validation
 
