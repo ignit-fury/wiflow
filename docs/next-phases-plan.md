@@ -31,8 +31,8 @@ Checks:
 One log line per dictation: capture, VAD, STT, cleanup, paste and total ms.
 
 Checks:
-- [ ] Line appears once per dictation with all stages (unit test passes; needs one live dictation)
-- [x] Skipped stages (no cleanup, no speech) still log a line (logged on drop, every return path)
+- [x] Line appears once per dictation with all stages: 7 of 7 real dictations since the change, plus a live run through AI cleanup (BlackHole input, pasted into TextEdit): `stt=259ms context=61ms cleanup=1218ms worker_total=1541ms`, paste 223 ms
+- [x] Skipped stages (no cleanup, no speech) still log a line: seen live on an empty 1.2 s hold
 - [x] No transcript text in the line (privacy)
 
 ## Phase 4 — Accuracy: long dictations and "no wait"
@@ -65,7 +65,16 @@ Checks:
 
 - Phase 1 done (CI green on PR 3).
 - Phase 2 done, verified live through the tray menu.
-- Phase 3 done except one live dictation.
+- Phase 3 done. What the timing line found on its first live run:
+  1. The first cleanup after ~1 h idle took 1.21 s inside Ollama (its own
+     log), near the 1.5 s timeout, though the model stays loaded. Back-to-back
+     calls take 210–300 ms. Not fixed. Idea: on key press, if Ollama has been
+     idle for over 5 min, send a tiny warm-up request while the user speaks.
+  2. Whisper wrote "Thursday. No, actually Wednesday" and the router called
+     it already clean, so the correction was pasted as spoken. Punctuation
+     between the marker words breaks detection. Goes into Phase 4.
+  3. Paste always takes ~200 ms: a deliberate wait after Cmd+V, before the
+     old clipboard is put back. The text is already in place; left as is.
 - Phase 4b done. 4a waiting for real failing clips. The STT log line now
   shows word count and audio seconds, so drops are visible.
 - Phase 5 done with option B (owner's choice). Options were:
