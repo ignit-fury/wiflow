@@ -6,11 +6,7 @@ pub use orchestrator::{Action, Orchestrator};
 
 use muda::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
-use winit::{
-    event::{DeviceEvent, ElementState},
-    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
-    keyboard::{KeyCode, PhysicalKey},
-};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 
 use crate::core::config::{Config, ModelChoice};
 use crate::core::history::HistoryEntry;
@@ -696,7 +692,7 @@ impl DaemonApp {
 
     /// 1 s mic probe for the settings window's Test-record button. Runs in
     /// an App-owned thread (never on the event loop, never in the window);
-    /// the result is polled per frame via `test_record_status` (H20).
+    /// completion wakes the settings window to display the result (H20).
     /// Amplitude only — no audio stored, no STT.
     fn run_test_record(&mut self) {
         use std::sync::atomic::Ordering;
@@ -706,6 +702,7 @@ impl DaemonApp {
         let out = self.test_record_result.clone();
         let running = self.test_record_running.clone();
         let mic = self.config.mic_name.clone();
+        let redraw = self.settings_window.as_ref().map(|w| w.redraw_handle());
         std::thread::spawn(move || {
             let line = (|| {
                 let cap = crate::core::audio::AudioCapture::start(mic)
@@ -721,6 +718,9 @@ impl DaemonApp {
             })();
             *out.lock().unwrap() = Some(line.unwrap_or_else(|e| e));
             running.store(false, Ordering::SeqCst);
+            if let Some(window) = redraw {
+                window.request_redraw();
+            }
         });
     }
 
@@ -1108,24 +1108,6 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         }
     }
 
-    fn device_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        _device_id: winit::event::DeviceId,
-        event: DeviceEvent,
-    ) {
-        // Esc cancels an in-flight recording (routed via user_event).
-        if let DeviceEvent::Key(key) = event {
-            if key.state == ElementState::Pressed
-                && matches!(key.physical_key, PhysicalKey::Code(KeyCode::Escape))
-            {
-                if let Err(e) = self.proxy.send_event(DaemonEvent::Cancel) {
-                    tracing::warn!("Esc: event loop closed, cancel lost: {e:?}");
-                }
-            }
-        }
-    }
-
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DaemonEvent) {
         let before = self.orchestrator.phase();
         let actions = self.orchestrator.handle(&event);
@@ -1262,6 +1244,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             self.rebuild_menu();
         }
         self.sync_tray();
+        let mut wake_at = self
+            .settings_window
+            .as_mut()
+            .and_then(|window| window.repaint_deadline(std::time::Instant::now()));
         // Transcribing spinner: animate the tray icon on a 250 ms cadence
         // while the worker transcribes (main thread would otherwise sit
         // idle with a static icon). Any other state → plain Wait: no wakeups,
@@ -1271,12 +1257,13 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             if let Err(e) = self.tray.set_icon(Some(spinner_frame(self.spinner_tick))) {
                 tracing::warn!("tray spinner failed: {e:?}");
             }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                std::time::Instant::now() + std::time::Duration::from_millis(250),
-            ));
-        } else {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            let spinner_at = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            wake_at = Some(wake_at.map_or(spinner_at, |repaint_at| repaint_at.min(spinner_at)));
         }
+        event_loop.set_control_flow(match wake_at {
+            Some(deadline) => winit::event_loop::ControlFlow::WaitUntil(deadline),
+            None => winit::event_loop::ControlFlow::Wait,
+        });
     }
 }
 
@@ -1328,8 +1315,7 @@ fn app_main(
     let mut startup_note: Option<String> = None;
     let new_manager_for_degraded_start = || {
         global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {
-            // Without ANY hotkey manager even Esc is impossible — nothing
-            // works, so exiting here is honest (not silent: stderr).
+            // The push-to-talk bridge requires a hotkey manager.
             eprintln!("hotkey manager: {e:?}");
             std::process::exit(1);
         })
@@ -1385,26 +1371,12 @@ fn app_main(
             "CGEventTap"
         }
     );
-    // Esc cancel: winit device_event never delivers Key events to a
-    // zero-window tray app on macOS (proven Task 3), so Esc rides the
-    // same global-hotkey bridge as PTT. Registration failure degrades
-    // to "cancel disabled" — the app stays usable.
-    let esc_hotkey = match crate::daemon::register_cancel_hotkey(&manager) {
-        Ok(hk) => {
-            tracing::info!("esc cancel hotkey registered (id {})", hk.id());
-            hk
-        }
-        Err(e) => {
-            tracing::warn!("esc cancel hotkey NOT registered ({e}) — cancel disabled");
-            global_hotkey::hotkey::HotKey::new(None, global_hotkey::hotkey::Code::Escape)
-        }
-    };
     // Persist the actual winner so tooltip + next launch agree.
     config.hotkey_preset = won;
     if let Err(e) = crate::core::config::save_config(&config) {
         tracing::warn!("save config failed: {e}");
     }
-    crate::daemon::spawn_hotkey_bridge(proxy.clone(), esc_hotkey.id());
+    crate::daemon::spawn_hotkey_bridge(proxy.clone());
 
     // Background startup check: when cleanup is enabled, verify Ollama is
     // running + the model is pulled; alert the user when not (off the UI
@@ -1413,11 +1385,16 @@ fn app_main(
         let check_proxy = proxy.clone();
         let check_model = config.cleanup_model.clone();
         let check_enabled = config.cleanup_enabled;
+        let warm = config.cleanup_provider == "ollama";
         std::thread::spawn(move || {
             if !check_enabled {
                 return;
             }
             match crate::core::cleanup::check_ollama_ready(&check_model) {
+                Ok(()) if warm => match crate::core::cleanup::warm_ollama(&check_model) {
+                    Ok(()) => tracing::info!("ollama cleanup ready and loaded ({check_model})"),
+                    Err(e) => tracing::warn!("{e}"),
+                },
                 Ok(()) => tracing::info!("ollama cleanup ready ({check_model})"),
                 Err(e) => {
                     tracing::warn!("ollama check: {e}");
@@ -1427,7 +1404,21 @@ fn app_main(
         });
     }
 
-    // One shared duck instance: worker ducks at capture-Ok on the same
+    // Warm the local Whisper model so the first dictation skips model load
+    // and Metal setup. Groq-only setups load it lazily on fallback instead.
+    if config.stt_provider != "groq" {
+        let warm_cfg = config.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            match crate::core::traits::local_model_path(&warm_cfg).and_then(|path| {
+                crate::core::stt::transcribe_shared(&path, &[], "", &warm_cfg.stt_language)
+            }) {
+                Ok(_) => tracing::info!("whisper warm in {}ms", t0.elapsed().as_millis()),
+                Err(e) => tracing::warn!("whisper warm-up failed: {e}"),
+            }
+        });
+    }
+
     // One shared duck instance: the worker ducks at capture-Ok on the same
     // Arc state the orchestrator records and restores (Task 12 wiring).
     let media = crate::platform::macos::media::CoreAudioDuck::new(

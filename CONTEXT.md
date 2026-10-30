@@ -1,6 +1,10 @@
-# CONTEXT.md — Complete Project Context (Wiflow)
+# CONTEXT.md — Historical Project Context (Wiflow)
 
-> Single-file reference containing the whole context of this project: what it
+> Historical snapshot from 2026-10-03. For current setup and status, read
+> `README.md`, `architecture.md`, and `task.md`. Paths and counts below
+> describe that earlier snapshot.
+>
+> Single-file reference containing the context of this project: what it
 > is, every architectural piece, every file, the full development history,
 > every change made in the latest session, current git state, and open items.
 > Companion deep-dives: `memory.md` (decisions/incidents), `task.md` (phase
@@ -45,7 +49,7 @@
   model; fully offline after model download; $0 marginal cost.
 - **Cost strategy**: default 100% local; cloud strictly opt-in — Groq
   `whisper-large-v3` STT (~$0.111/hr, generous free tier), OpenRouter `:free`
-  LLMs for cleanup only, Ollama (`llama3.2:1b`) as free local cleanup.
+  LLMs for cleanup only, Ollama (`llama3.2:3b`) as free local cleanup.
   User brings own key; keys never shipped in repo.
 
 ---

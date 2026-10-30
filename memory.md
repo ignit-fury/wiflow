@@ -92,3 +92,84 @@ Why: the 2026-10-03 "Complete Architecture" diagram superseded piecemeal growth;
 - Live-caught defects: HidePill-vs-unreachable panic killing the event loop on first real injection (fixed same day); two dropped duck-restore sites in cherry-pick resolution (empty/Failed paths leaked duck — fixed, volume-measured); focus steal via winit makeKeyAndOrderFront (fixed with orderFront:); muted-output duck stand-down verified correct.
 - Known limitations (documented, not hidden): stereo-interleaved-as-mono capture defeats VAD on stereo loopbacks (audio-layer, pre-existing); ggml_abort-class Metal failures uncatchable; session ids increment 2x/press (cosmetic); machine transition logs lack session ids; Music pause path unit-only (no library); Groq turbo id pinned but no live cycle without key.
 - Execution note: subagent funds exhausted mid-S3 → native inline with same briefs/gates; independent per-task reviews suspended (evidence packages in `.superpowers/sdd/` for deferred final review). Always verify branch pointer (detached-HEAD incident, no loss).
+
+## Reliability follow-up (2026-10-06)
+
+User authorized the review suggestions after initially requesting no edits.
+- API keys: extracted resolution with explicit environment value + file path. Tests use temporary keys and do not overwrite real keys.json or mutate process-wide environment variables. Production precedence remains nonempty env value → file.
+- Model integrity: ring 0.17 (already a transitive dependency) supplies streaming SHA-256. tiny/base/small URLs pin Hugging Face revision 5359861c739e955e79d9a303bcbc70fb988958b1; checksum values come from that revision's LFS metadata. Managed models undergo verification before use. Download to resumable .bin.part, reject invalid content, rename only after verification. Offline tests cover same-size corruption, interruption/resumption, existing valid files, recovery of completed partials, and replacement safety.
+- Long audio: use standard multi-segment output and collect all segments. Bundled whisper.cpp advances through 30-second chunks even with single_segment; no evidence established the old option as a truncation bug. A generated 60-second base.en CPU regression recognizes morning/afternoon/evening speech at 2/33/51 seconds. This establishes an acoustic regression baseline, not live mic/watchdog acceptance.
+- Docs: added README and docs/manual-validation.md, reproducible scripts/generate-long-audio.py, current CLI guidance; reconciled delivered UI/MSRV/model-integrity task checkboxes and marked CONTEXT.md as historical.
+- Gates: cargo fmt --check, cargo clippy --offline --all-targets -- -D warnings, git diff --check clean; normal suite 251 passed, 0 failed, 2 ignored. Opt-in long-audio regression passed against the installed checksum-verified base.en model.
+- Pending: real dictated speech into focused apps; secure-field fallback; live 60-second capture/watchdog; permissions recovery; Music pause/resume; cloud provider acceptance. See docs/manual-validation.md. No commits or release packaging performed.
+
+## Esc unassigned (2026-10-06, user decision)
+
+User: "i dont whant this to use esc key for anything". Supersedes the
+original Esc-cancels-dictation rule and historical acceptance notes.
+Removed global Esc registration, Esc forwarding in the hotkey bridge,
+and the winit device-event fallback. The settings window ignores Esc
+keyboard events; its recorder button stops recording a new hotkey.
+Internal cancellation remains available for lifecycle cleanup/tests,
+with no keyboard binding. Restart the rebuilt app to release the old
+global Esc registration.
+
+## Settings repaint and GL resize (2026-10-06)
+
+User requested fixes for continuous settings redraws and missing GL resize.
+Removed both sources of continuous repaint: the unconditional redraw at
+the end of SettingsWindow::paint, and forwarding egui-winit's repaint=true
+for RedrawRequested into another redraw request. Egui viewport repaint
+delays now feed an optional deadline combined with the tray spinner's
+wakeup; idle output has no deadline. The mic probe wakes the settings
+window once on completion rather than depending on polling frames.
+The GL host uses each window's context, resizes only when physical size
+changes, skips rendering at zero size, and logs swap failures. Settings
+App-owned history/launch changes request repaint. Fixed a leftover pill
+hint that still advertised Esc cancellation after the user's removal.
+Headless regression tests cover idle egui settling, delayed repaints
+(egui adjusts the delay by predicted frame time), and RedrawRequested
+feedback suppression. Live GUI resize/minimize/HiDPI and CPU checks
+remain pending; see docs/manual-validation.md.
+# Correction implementation (2026-10-06)
+
+User authorized sentence/word correction optimization while preserving
+flows. Shared correction stage owns cleanup for raw local and cloud STT;
+optional `corrections.json` dictionary applies once before routing. No
+dictionary is installed automatically. Protected content and conservative
+AI output validation fall back to the deterministic baseline. Cleanup
+providers share a two-second budget; context timeout is unchanged. Prompt
+files and recording/injection lifecycle are unchanged. See
+`docs/corrections.md` for configuration and limitations.
+
+Validation: 269 tests passed, 2 ignored; offline Clippy all targets with
+warnings denied, formatting, and diff checks passed. Debug deterministic
+correction benchmark averaged 41 microseconds for 1000 corpus iterations.
+Optional long-audio rerun could not load its removed temporary WAV;
+live recording/paste and audio regressions still require manual fixtures.
+# Recognition vocabulary investigation (2026-10-20)
+
+User reported saying “postfix calculation” and receiving “To fix the
+calculation”. Recent history contains that output; recent log routes were
+deterministic, so AI replacement is not supported as the cause of this
+example. Saved settings select local SmallEn and local Ollama cleanup;
+there was no prompt.txt or corrections.json. Do not loosen AI content
+guards or install a forced replacement between these valid phrases.
+
+With installed SmallEn on CPU, an Indian-English Rishi TTS fixture produced
+“post fix calculation.” without hints and “Postfix calculation.” with the
+confirmed vocabulary. A Samantha contrast fixture retained “I need to fix
+the calculation.” with the same hint. Added “Postfix calculation.” to the
+local app-support prompt.txt with authorized filesystem escalation. This
+is a recognition hint, not an accuracy guarantee for the user's voice.
+Added optional acoustic regression and contrast tests; live voice validation
+remains open. Recording, model selection, and injection code are unchanged.
+Validation: 269 default tests passed, 4 optional tests ignored; both new
+acoustic tests passed separately with SmallEn and the saved prompt. Clippy
+all targets with warnings denied, formatting, and diff checks passed.
+
+- 2026-10-30 — Default Ollama cleanup model is now `llama3.2:3b` (was
+  `llama3.2:1b`). On six self-correction sentences through the app's cleanup
+  path, 3B got 5 right and 1B got 1; warm 3B takes ~230–400 ms. Ollama context
+  is capped at 4,096 tokens (2.6 GB resident instead of 9.9 GB). Existing
+  installs keep their saved `cleanup_model`. Details: docs/perf-accuracy-plan.md.

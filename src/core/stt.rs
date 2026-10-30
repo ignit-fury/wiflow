@@ -77,6 +77,8 @@ impl Stt {
         // Explicit GPU flag (was hardcoded `true`): Metal with the `metal`
         // feature, CPU otherwise (default would also be true via _gpu).
         ctx_params.use_gpu(gpu);
+        // Fused attention kernels: faster encoder/decoder; wiflow never uses DTW.
+        ctx_params.flash_attn(true);
         let ctx = WhisperContext::new_with_params(path, ctx_params)
             .map_err(|e| format!("load model {}: {e:?}", path.display()))?;
         // Create the backend state once — allocates kv-cache, compute
@@ -105,12 +107,21 @@ impl Stt {
         if samples_16k.is_empty() {
             return Ok(String::new());
         }
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Beam search (whisper.cpp CLI default) over greedy: fewer dropped or
+        // misheard words; cost measured in docs/perf-accuracy-plan.md.
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
         params.set_n_threads(num_threads());
         params.set_print_progress(false);
-        params.set_single_segment(true);
+        // Use Whisper's standard multi-segment output for holds up to 60s.
+        // Collect every returned segment below, including later audio chunks.
+        params.set_single_segment(false);
         // Skip timestamp token computation — wiflow never uses timestamps.
         params.set_no_timestamps(true);
+        // Encode only as much of the 30 s window as the clip needs.
+        params.set_audio_ctx(audio_ctx_for(samples_16k.len()));
         if !initial_prompt.is_empty() {
             params.set_initial_prompt(initial_prompt);
         }
@@ -130,13 +141,18 @@ impl Stt {
                 );
             }
         }
-        // Cleanup pipeline: hallucination tokens → capitalization/i-fix →
-        // spoken math ("A plus B" → "A+B"). Empty after token strip → Ok("")
-        // (callers treat empty as no-text, nothing injected).
-        let stripped = strip_hallucination_tokens(&text);
-        let processed = post_process(&stripped);
-        Ok(plus_to_symbol(&processed))
+        // Keep recognition output intact. The shared correction/router stage
+        // handles both local and cloud transcripts, with technical-span guards.
+        Ok(text.trim().to_string())
     }
+}
+
+/// Encoder frames for a clip: 50 per second plus a 128-frame margin, at
+/// least 500 (10 s) and at most the full 30 s window (1500). Measured on
+/// small.en: 35–60% faster than 1500 on 1–9 s clips with the same words; a
+/// tight fit with no floor garbled short clips ("Ship it" -> "Sh-it").
+fn audio_ctx_for(samples_16k: usize) -> i32 {
+    ((samples_16k / 320) as i32 + 128).clamp(500, 1500)
 }
 
 static STT: OnceLock<Mutex<Option<(PathBuf, Stt)>>> = OnceLock::new();
@@ -190,10 +206,15 @@ pub fn shutdown() {
 }
 
 pub const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin";
 /// Verified 2026-09-30 via HEAD (HTTP 200, content-length).
 pub const MODEL_SIZE: u64 = 147_964_211;
 pub const MODEL_NAME: &str = "ggml-base.en.bin";
+// Hugging Face LFS SHA-256 values at revision
+// 5359861c739e955e79d9a303bcbc70fb988958b1 (verified 2026-10-06).
+const MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+const SMALL_MODEL_SHA256: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
+const TINY_MODEL_SHA256: &str = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
 
 pub fn models_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -205,26 +226,60 @@ pub fn model_path() -> PathBuf {
 }
 
 pub fn verify_model(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.len() == MODEL_SIZE)
-        .unwrap_or(false)
+    verify_model_file(path, MODEL_SIZE, MODEL_SHA256)
+}
+
+fn verify_model_file(path: &Path, size: u64, sha256: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() == size)
+    {
+        return false;
+    }
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => context.update(&buffer[..n]),
+            Err(_) => return false,
+        }
+    }
+    let actual: String = context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    actual == sha256
+}
+
+fn model_sha256(variant: &str) -> &'static str {
+    match variant {
+        "small" => SMALL_MODEL_SHA256,
+        "tiny" => TINY_MODEL_SHA256,
+        _ => MODEL_SHA256,
+    }
 }
 
 /// Download base.en on first use (curl ships with macOS — no HTTP dep).
-/// Skips download when a size-verified model already exists.
+/// Skips download when a size- and SHA-256-verified model already exists.
 pub fn ensure_model() -> Result<PathBuf, String> {
     ensure_model_variant("base")
 }
 
 pub const SMALL_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin";
-/// Size-gated like base.en; verified 2026-09-30 via HEAD (HTTP 200).
-/// Never downloaded by tests — size-gate assertions only.
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en.bin";
+/// Size and SHA-256 verified like base.en. Never downloaded by unit tests.
 pub const SMALL_MODEL_SIZE: u64 = 487_614_201;
 pub const SMALL_MODEL_NAME: &str = "ggml-small.en.bin";
 
 pub const TINY_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin";
 /// Verified 2026-10-01 via HEAD (HTTP 200, content-length 77,704,715).
 pub const TINY_MODEL_SIZE: u64 = 77_704_715;
 pub const TINY_MODEL_NAME: &str = "ggml-tiny.en.bin";
@@ -248,30 +303,63 @@ pub fn model_path_for(variant: &str) -> (PathBuf, &'static str, u64) {
     }
 }
 
+/// Models whose SHA-256 already passed in this process. Hashing small.en
+/// costs ~285 ms, so later calls only re-check the file size.
+static VERIFIED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 pub fn ensure_model_variant(variant: &str) -> Result<PathBuf, String> {
     let (path, url, size) = model_path_for(variant);
-    if std::fs::metadata(&path)
-        .map(|m| m.len() == size)
-        .unwrap_or(false)
-    {
+    let mut verified = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    if verified.contains(&path) && std::fs::metadata(&path).is_ok_and(|m| m.len() == size) {
+        return Ok(path);
+    }
+    let path = ensure_model_at(path, size, model_sha256(variant), |partial| {
+        let status = std::process::Command::new("curl")
+            .args(["-fSL", "-C", "-", "-o"])
+            .arg(partial)
+            .arg(url)
+            .status()
+            .map_err(|e| format!("spawn curl: {e:?}"))?;
+        if !status.success() {
+            return Err(format!("download failed: {status}"));
+        }
+        Ok(())
+    })?;
+    verified.push(path.clone());
+    Ok(path)
+}
+
+fn ensure_model_at(
+    path: PathBuf,
+    size: u64,
+    checksum: &str,
+    download: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    if verify_model_file(&path, size, checksum) {
         return Ok(path);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir models: {e:?}"))?;
     }
-    let status = std::process::Command::new("curl")
-        .args(["-fSL", "-C", "-", "-o"])
-        .arg(&path)
-        .arg(url)
-        .status()
-        .map_err(|e| format!("spawn curl: {e:?}"))?;
-    if !status.success()
-        || !std::fs::metadata(&path)
-            .map(|m| m.len() == size)
-            .unwrap_or(false)
-    {
-        return Err(format!("download failed: {status}"));
+    // Keep resumable downloads separate from the active model. Discard a
+    // complete but invalid partial file so curl doesn't resume past EOF.
+    let partial = path.with_extension("bin.part");
+    if std::fs::metadata(&partial).is_ok_and(|m| m.len() >= size) {
+        if verify_model_file(&partial, size, checksum) {
+            std::fs::rename(&partial, &path).map_err(|e| format!("install model: {e}"))?;
+            return Ok(path);
+        }
+        std::fs::remove_file(&partial).map_err(|e| format!("remove invalid partial: {e}"))?;
     }
+    download(&partial)?;
+    if !verify_model_file(&partial, size, checksum) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!(
+            "model verification failed (size or SHA-256): {}",
+            path.display()
+        ));
+    }
+    std::fs::rename(&partial, &path).map_err(|e| format!("install model: {e}"))?;
     Ok(path)
 }
 
@@ -503,6 +591,13 @@ mod tests {
     }
 
     #[test]
+    fn audio_ctx_fits_clip_within_bounds() {
+        assert_eq!(audio_ctx_for(16_000), 500); // 1 s -> 10 s floor
+        assert_eq!(audio_ctx_for(16_000 * 20), 1128); // 20 s + margin
+        assert_eq!(audio_ctx_for(16_000 * 60), 1500); // capped at 30 s
+    }
+
+    #[test]
     fn backend_selection_policy() {
         assert_eq!(backend_for(true), Backend::Metal);
         assert_eq!(backend_for(false), Backend::Cpu);
@@ -531,14 +626,74 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_model_size_gate() {
-        let p = std::env::temp_dir().join("wiflow_verify_test.bin");
-        let f = std::fs::File::create(&p).unwrap();
-        f.set_len(MODEL_SIZE).unwrap(); // sparse — instant, no disk use
-        drop(f);
-        assert!(verify_model(&p));
-        std::fs::remove_file(&p).unwrap();
+    fn test_verify_model_rejects_same_size_corruption() {
+        let p = std::env::temp_dir().join(format!("wiflow-verify-{}.bin", std::process::id()));
+        let checksum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::write(&p, b"abc").unwrap();
+        assert!(verify_model_file(&p, 3, checksum));
+        assert!(!verify_model_file(&p, 4, checksum));
+        std::fs::write(&p, b"abd").unwrap();
+        assert!(!verify_model_file(&p, 3, checksum));
         assert!(!verify_model(&p));
+        std::fs::remove_file(&p).unwrap();
+        assert!(!verify_model_file(&p, 3, checksum));
+    }
+
+    #[test]
+    fn test_model_install_verifies_before_replacing_and_resumes_partial() {
+        let dir = std::env::temp_dir().join(format!("wiflow-install-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        let partial = path.with_extension("bin.part");
+        let checksum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::write(&path, b"old").unwrap();
+        assert!(ensure_model_at(path.clone(), 3, checksum, |p| {
+            std::fs::write(p, b"abd").unwrap();
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!partial.exists());
+
+        // Interrupted downloads stay resumable, while the active file stays intact.
+        assert!(ensure_model_at(path.clone(), 3, checksum, |p| {
+            std::fs::write(p, b"ab").unwrap();
+            Err("interrupted".into())
+        })
+        .is_err());
+        ensure_model_at(path.clone(), 3, checksum, |p| {
+            assert_eq!(std::fs::read(p).unwrap(), b"ab");
+            std::fs::write(p, b"abc").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert!(!partial.exists());
+        ensure_model_at(path.clone(), 3, checksum, |_| {
+            panic!("valid model must not download")
+        })
+        .unwrap();
+
+        // Recover a completed download left behind before its atomic rename.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(&partial, b"abc").unwrap();
+        ensure_model_at(path.clone(), 3, checksum, |_| {
+            panic!("completed partial must not download")
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+
+        // A same-sized corrupt partial must not be resumed past EOF.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(&partial, b"bad").unwrap();
+        ensure_model_at(path.clone(), 3, checksum, |p| {
+            assert!(!p.exists());
+            std::fs::write(p, b"abc").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -768,6 +923,119 @@ mod tests {
         assert_eq!(plus_to_symbol("1.0 plus 2.0"), "1.0 plus 2.0");
         assert_eq!(plus_to_symbol("hello"), "hello");
         assert_eq!(plus_to_symbol(""), "");
+    }
+
+    /// Opt-in acoustic regression; see docs/manual-validation.md for fixture generation.
+    #[test]
+    #[ignore = "requires a local model and a spoken technical-term fixture"]
+    fn test_transcribe_postfix_calculation() {
+        let wav = std::env::var("WIFLOW_SHORT_AUDIO_WAV").expect("set WIFLOW_SHORT_AUDIO_WAV");
+        let mut reader = hound::WavReader::open(wav).expect("open fixture");
+        let spec = reader.spec();
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (1, 16_000, 16)
+        );
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        assert!(
+            samples.iter().any(|s| s.abs() > 0.01),
+            "fixture contains no speech energy"
+        );
+        let path = std::env::var_os("WIFLOW_TEST_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(model_path);
+        let prompt = std::env::var("WIFLOW_TEST_PROMPT").unwrap_or_else(|_| read_prompt());
+        let mut stt = Stt::load_with_gpu(&path, false).expect("load model");
+        let text = stt.transcribe(&samples, &prompt, "en").expect("transcribe");
+        eprintln!("TECHNICAL TERM transcript={text:?}");
+        assert!(
+            text.to_lowercase().contains("postfix calculation"),
+            "misheard technical term: {text:?}"
+        );
+        // Exercise the same VAD and correction boundaries as a live hold.
+        let mut vad = crate::core::vad::Vad::new();
+        let kept = crate::core::vad::transcribe_ready(&samples, 16_000, &mut vad);
+        assert!(!kept.is_empty(), "VAD discarded the technical phrase");
+        let recognized = stt
+            .transcribe(&kept, &prompt, "en")
+            .expect("transcribe trimmed speech");
+        let route = crate::core::analyze::decide_route(
+            &recognized,
+            &crate::core::config::Config::default(),
+        );
+        let crate::core::analyze::CleanupRoute::Direct(analysis) = route else {
+            panic!("technical phrase must not need AI rewriting");
+        };
+        assert_eq!(
+            analysis.text.trim_end_matches('.').to_lowercase(),
+            "postfix calculation"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local model and a spoken ordinary-language contrast fixture"]
+    fn test_vocabulary_hint_does_not_replace_to_fix_calculation() {
+        let wav = std::env::var("WIFLOW_LITERAL_AUDIO_WAV").expect("set WIFLOW_LITERAL_AUDIO_WAV");
+        let mut reader = hound::WavReader::open(wav).expect("open fixture");
+        let spec = reader.spec();
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (1, 16_000, 16)
+        );
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        assert!(
+            samples.iter().any(|s| s.abs() > 0.01),
+            "fixture contains no speech energy"
+        );
+        let path = std::env::var_os("WIFLOW_TEST_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(model_path);
+        let prompt = std::env::var("WIFLOW_TEST_PROMPT").unwrap_or_else(|_| read_prompt());
+        let mut stt = Stt::load_with_gpu(&path, false).expect("load model");
+        let text = stt.transcribe(&samples, &prompt, "en").expect("transcribe");
+        eprintln!("ORDINARY SPEECH transcript={text:?}");
+        assert!(
+            text.to_lowercase().contains("to fix the calculation"),
+            "hint replaced ordinary words: {text:?}"
+        );
+        assert!(!text.to_lowercase().contains("postfix"));
+    }
+
+    /// Opt-in acoustic regression; see docs/manual-validation.md for fixture generation.
+    #[test]
+    #[ignore = "requires a local model and a 60-second speech fixture"]
+    fn test_transcribe_long_recording_keeps_late_speech() {
+        let wav = std::env::var("WIFLOW_LONG_AUDIO_WAV").expect("set WIFLOW_LONG_AUDIO_WAV");
+        let mut reader = hound::WavReader::open(wav).expect("open fixture");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        assert!((59 * 16_000..=60 * 16_000).contains(&samples.len()));
+        let path = std::env::var_os("WIFLOW_TEST_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(model_path);
+        assert!(verify_model(&path), "requires the pinned base.en model");
+        // CPU keeps this fixture check independent of GPU and live mic permissions.
+        let mut stt = Stt::load_with_gpu(&path, false).expect("load model");
+        let text = stt
+            .transcribe(&samples, "", "en")
+            .expect("transcribe")
+            .to_lowercase();
+        for marker in ["morning", "afternoon", "evening"] {
+            assert!(text.contains(marker), "missing {marker}: {text}");
+        }
     }
 
     #[test]

@@ -37,6 +37,15 @@ pub trait SpeechRecognizer {
     ) -> Result<Transcript, String>;
 }
 
+/// Verified local Whisper model for the configured size (downloads if missing).
+pub fn local_model_path(cfg: &Config) -> Result<std::path::PathBuf, String> {
+    crate::core::stt::ensure_model_variant(match cfg.model {
+        ModelChoice::TinyEn => "tiny",
+        ModelChoice::SmallEn => "small",
+        ModelChoice::BaseEn => "base",
+    })
+}
+
 /// Production: Groq cloud (opt-in) → local whisper fallback.
 pub struct RouterRecognizer;
 
@@ -47,12 +56,12 @@ impl SpeechRecognizer for RouterRecognizer {
         sample_rate: u32,
         cfg: &Config,
     ) -> Result<Transcript, String> {
-        let model_path = match cfg.model {
-            ModelChoice::TinyEn => crate::core::stt::ensure_model_variant("tiny"),
-            ModelChoice::SmallEn => crate::core::stt::ensure_model_variant("small"),
-            ModelChoice::BaseEn => crate::core::stt::ensure_model_variant("base"),
-        }?;
-        let prompt = crate::core::stt::read_prompt();
+        // Resolved lazily: Groq STT never needs the local model unless it fails.
+        let local = || -> Result<String, String> {
+            let model_path = local_model_path(cfg)?;
+            let prompt = crate::core::stt::read_prompt();
+            crate::core::stt::transcribe_shared(&model_path, audio, &prompt, &cfg.stt_language)
+        };
 
         if cfg.stt_provider == "groq" {
             match crate::core::groq_stt::transcribe_cloud(audio, sample_rate, cfg) {
@@ -67,12 +76,7 @@ impl SpeechRecognizer for RouterRecognizer {
                     let msg = format!("Groq STT failed: {e} — using local whisper");
                     tracing::warn!("{msg}");
                     // Local fallback: warning surfaces at call site.
-                    let text = crate::core::stt::transcribe_shared(
-                        &model_path,
-                        audio,
-                        &prompt,
-                        &cfg.stt_language,
-                    )?;
+                    let text = local()?;
                     Ok(Transcript {
                         text,
                         warnings: vec![msg],
@@ -80,12 +84,7 @@ impl SpeechRecognizer for RouterRecognizer {
                 }
             }
         } else {
-            let text = crate::core::stt::transcribe_shared(
-                &model_path,
-                audio,
-                &prompt,
-                &cfg.stt_language,
-            )?;
+            let text = local()?;
             Ok(Transcript {
                 text,
                 warnings: Vec::new(),
@@ -99,6 +98,21 @@ impl SpeechRecognizer for RouterRecognizer {
 /// Cleanup chain: route → (context + LLM / deterministic) → outcome.
 pub trait CleanupProvider {
     fn clean(&self, text: &str, ctx: Option<&str>, cfg: &Config) -> CleanupOutcome;
+
+    /// Reuse analysis prepared before context acquisition. Fakes can use the
+    /// default; production overrides it to avoid a second correction pass.
+    fn clean_prepared(
+        &self,
+        route: crate::core::analyze::CleanupRoute,
+        ctx: Option<&str>,
+        cfg: &Config,
+    ) -> CleanupOutcome {
+        let text = match route {
+            crate::core::analyze::CleanupRoute::Direct(a)
+            | crate::core::analyze::CleanupRoute::Llm(a) => a.text,
+        };
+        self.clean(&text, ctx, cfg)
+    }
 }
 
 /// Production: analyse → deterministic-clean or full LLM chain.
@@ -106,7 +120,32 @@ pub struct ChainProvider;
 
 impl CleanupProvider for ChainProvider {
     fn clean(&self, text: &str, ctx: Option<&str>, cfg: &Config) -> CleanupOutcome {
-        let route = crate::core::analyze::decide_route(text, cfg);
+        self.clean_route(self.prepare_route(text, cfg), ctx, cfg)
+    }
+    fn clean_prepared(
+        &self,
+        route: crate::core::analyze::CleanupRoute,
+        ctx: Option<&str>,
+        cfg: &Config,
+    ) -> CleanupOutcome {
+        self.clean_route(route, ctx, cfg)
+    }
+}
+
+impl ChainProvider {
+    /// Apply user-confirmed replacements once, then decide whether AI adds value.
+    pub fn prepare_route(&self, text: &str, cfg: &Config) -> crate::core::analyze::CleanupRoute {
+        let corrected = crate::core::correction::apply_saved_corrections(text, cfg);
+        crate::core::analyze::decide_route(&corrected, cfg)
+    }
+
+    /// Reuse the route chosen before context acquisition; no second analysis or dictionary pass.
+    pub fn clean_route(
+        &self,
+        route: crate::core::analyze::CleanupRoute,
+        ctx: Option<&str>,
+        cfg: &Config,
+    ) -> CleanupOutcome {
         let route_name = match &route {
             crate::core::analyze::CleanupRoute::Direct(_) => "deterministic",
             crate::core::analyze::CleanupRoute::Llm(_) => "llm",
@@ -121,11 +160,31 @@ impl CleanupProvider for ChainProvider {
                 text: a.text,
                 issues: Vec::new(),
             },
-            crate::core::analyze::CleanupRoute::Llm(_) => {
-                let input = crate::core::cleanup::format_cleanup_input(ctx, text);
-                crate::core::cleanup::clean_chain(&input, cfg)
+            crate::core::analyze::CleanupRoute::Llm(a) => {
+                let input = crate::core::cleanup::format_cleanup_input(ctx, &a.text);
+                let outcome = crate::core::cleanup::clean_chain(&input, cfg);
+                Self::finish_ai_cleanup(&a.text, &input, outcome)
             }
         }
+    }
+
+    fn finish_ai_cleanup(
+        baseline: &str,
+        formatted_input: &str,
+        mut outcome: CleanupOutcome,
+    ) -> CleanupOutcome {
+        if outcome.text == formatted_input {
+            // The provider chain returned its input on failure. Never paste
+            // the context header, and keep deterministic corrections intact.
+            outcome.text = baseline.to_string();
+        } else if !crate::core::correction::candidate_preserves_input(baseline, &outcome.text) {
+            outcome.text = baseline.to_string();
+            outcome.issues.push(
+                "AI cleanup changed protected content or discarded text — kept local corrections"
+                    .into(),
+            );
+        }
+        outcome
     }
 }
 
@@ -169,6 +228,54 @@ pub trait MediaController {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn correction_fallback_never_injects_context_or_loses_baseline() {
+        let baseline = "Send 42 files, no actually 43 files.";
+        let formatted =
+            crate::core::cleanup::format_cleanup_input(Some("Writing an email"), baseline);
+        let outcome = ChainProvider::finish_ai_cleanup(
+            baseline,
+            &formatted,
+            CleanupOutcome {
+                text: formatted.clone(),
+                issues: vec!["timeout".into()],
+            },
+        );
+        assert_eq!(outcome.text, baseline);
+        assert_eq!(outcome.issues, ["timeout"]);
+        for candidate in ["Send 44 files.", "EMPTY", "Send files."] {
+            let outcome = ChainProvider::finish_ai_cleanup(
+                baseline,
+                &formatted,
+                CleanupOutcome {
+                    text: candidate.into(),
+                    issues: Vec::new(),
+                },
+            );
+            assert_eq!(outcome.text, baseline);
+            assert_eq!(outcome.issues.len(), 1);
+        }
+    }
+
+    #[test]
+    fn valid_sentence_correction_reaches_injection_fallback() {
+        let baseline = "Thursday no actually Wednesday";
+        let outcome = ChainProvider::finish_ai_cleanup(
+            baseline,
+            baseline,
+            CleanupOutcome {
+                text: "Wednesday.".into(),
+                issues: Vec::new(),
+            },
+        );
+        assert_eq!(outcome.text, "Wednesday.");
+        assert!(outcome.issues.is_empty());
+        let injector = FakeInjectorFail::new();
+        assert!(injector.inject(&outcome.text).is_err());
+        injector.leave_on_clipboard(&outcome.text);
+        assert_eq!(*injector.left_text.borrow(), "Wednesday.");
+    }
 
     // ── Fakes ───────────────────────────────────────────────────────────
 

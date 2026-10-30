@@ -58,6 +58,8 @@ pub fn preset_hotkey(preset: HotkeyPreset) -> HotKey {
 pub enum DaemonEvent {
     PttDown,
     PttUp,
+    /// Internal cancellation seam; no keyboard shortcut is bound to it.
+    #[allow(dead_code)]
     Cancel,
     /// Worker reports that `AudioCapture::start(...)` succeeded.
     ///
@@ -119,17 +121,6 @@ pub fn register_ptt_hotkey(
     Err("no push-to-talk hotkey registered".into())
 }
 
-/// Register Esc as a second global hotkey on the SAME manager as PTT.
-/// winit `device_event` never delivers Key events to a zero-window tray app
-/// on macOS (proven Task 3), so Esc must arrive through the hotkey bridge.
-pub fn register_cancel_hotkey(manager: &GlobalHotKeyManager) -> Result<HotKey, String> {
-    let hk = HotKey::new(None, Code::Escape);
-    manager
-        .register(hk)
-        .map_err(|e| format!("esc hotkey register failed: {e:?}"))?;
-    Ok(hk)
-}
-
 /// Commands from the winit thread to the dictation worker.
 /// The winit thread never blocks: it only `send()`s these and renders
 /// `DaemonEvent::Done/Failed` results.
@@ -152,36 +143,16 @@ fn now_ms() -> u64 {
 /// Runs on its own thread; `receiver().recv()` blocks here, never on winit.
 /// Forwards ANY known PTT preset id (not just the startup winner) so a
 /// menu-driven hotkey switch needs no bridge restart and loses no events.
-/// The Esc id (second hotkey on the same manager) forwards as Cancel on
-/// Pressed only — the release is meaningless for a cancel.
-pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
-    let ids = [
-        preset_hotkey(HotkeyPreset::RightOption).id(),
-        preset_hotkey(HotkeyPreset::Fn).id(),
-        preset_hotkey(HotkeyPreset::CtrlSpace).id(),
-    ];
+pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>) {
     std::thread::spawn(move || {
         while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
-            let out = if ev.id == esc_id {
-                match ev.state {
-                    HotKeyState::Pressed => Some(DaemonEvent::Cancel),
-                    HotKeyState::Released => None,
-                }
-            } else if ids.contains(&ev.id) {
-                Some(match ev.state {
-                    HotKeyState::Pressed => DaemonEvent::PttDown,
-                    HotKeyState::Released => DaemonEvent::PttUp,
-                })
-            } else {
-                None
-            };
+            let out = ptt_hotkey_event(ev.id, ev.state);
             if let Some(out) = out {
                 // Session-tagged so combo-preset cycles are traceable in the
                 // log file the same way tap-preset cycles are.
                 let name = match &out {
                     DaemonEvent::PttDown => "PttDown",
                     DaemonEvent::PttUp => "PttUp",
-                    DaemonEvent::Cancel => "Cancel",
                     _ => "other",
                 };
                 let session = match out {
@@ -199,6 +170,40 @@ pub fn spawn_hotkey_bridge(proxy: EventLoopProxy<DaemonEvent>, esc_id: u32) {
         }
         tracing::warn!("hotkey bridge receiver closed — global hotkey events stop here");
     });
+}
+
+/// Only the supported push-to-talk bindings can enter the app event loop.
+fn ptt_hotkey_event(id: u32, state: HotKeyState) -> Option<DaemonEvent> {
+    let ids = [
+        preset_hotkey(HotkeyPreset::RightOption).id(),
+        preset_hotkey(HotkeyPreset::Fn).id(),
+        preset_hotkey(HotkeyPreset::CtrlSpace).id(),
+    ];
+    ids.contains(&id).then_some(match state {
+        HotKeyState::Pressed => DaemonEvent::PttDown,
+        HotKeyState::Released => DaemonEvent::PttUp,
+    })
+}
+
+#[cfg(test)]
+mod hotkey_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn escape_never_becomes_a_dictation_event() {
+        let escape = HotKey::new(None, Code::Escape).id();
+        assert!(ptt_hotkey_event(escape, HotKeyState::Pressed).is_none());
+        assert!(ptt_hotkey_event(escape, HotKeyState::Released).is_none());
+        let ptt = preset_hotkey(HotkeyPreset::CtrlSpace).id();
+        assert!(matches!(
+            ptt_hotkey_event(ptt, HotKeyState::Pressed),
+            Some(DaemonEvent::PttDown)
+        ));
+        assert!(matches!(
+            ptt_hotkey_event(ptt, HotKeyState::Released),
+            Some(DaemonEvent::PttUp)
+        ));
+    }
 }
 
 /// Model-switch-failure semantics (via `stt::transcribe_shared`): a failed
@@ -228,6 +233,12 @@ fn pipeline_on_worker(
         return;
     }
     let cfg = crate::core::config::load_config();
+    // Context needs the focused app (~200 ms osascript); read it while STT
+    // runs instead of after. Same gate as the context step below.
+    let key_present = crate::core::cleanup::groq_key().is_some();
+    let mut app_probe = (cfg.cleanup_enabled && cfg.context_enabled && key_present).then(|| {
+        std::thread::spawn(|| crate::platform::macos::context::OsascriptContext.focused_app())
+    });
     let t0 = std::time::Instant::now();
     // STT via trait (groq→local fallback, same logic).
     let recognizer = crate::core::traits::RouterRecognizer;
@@ -249,16 +260,14 @@ fn pipeline_on_worker(
     tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
     // Cleanup via trait (route decision + context gate + chain).
     let cleanup_provider = crate::core::traits::ChainProvider;
-    let context_provider = crate::platform::macos::context::OsascriptContext;
     // Context gate: transcript must carry value AND app must be
     // context-sensitive — otherwise the ~200ms osascript query and the
     // model call are skipped.
-    let route = crate::core::analyze::decide_route(&text, &cfg);
+    let route = cleanup_provider.prepare_route(&text, &cfg);
     let ctx = match &route {
         crate::core::analyze::CleanupRoute::Llm(a) => {
-            let key_present = crate::core::cleanup::groq_key().is_some();
             if a.wants_context() && cfg.cleanup_enabled && cfg.context_enabled && key_present {
-                let app = context_provider.focused_app();
+                let app = app_probe.take().and_then(|h| h.join().ok().flatten());
                 if crate::core::analyze::context_allowed(
                     app.as_deref(),
                     a,
@@ -276,8 +285,11 @@ fn pipeline_on_worker(
         }
         _ => String::new(),
     };
-    let outcome =
-        cleanup_provider.clean(&text, if ctx.is_empty() { None } else { Some(&ctx) }, &cfg);
+    let outcome = cleanup_provider.clean_prepared(
+        route,
+        if ctx.is_empty() { None } else { Some(&ctx) },
+        &cfg,
+    );
     let cleaned = outcome.text;
     let issues = outcome.issues;
     for issue in &issues {
@@ -599,11 +611,11 @@ pub fn worker_main(
                         capture_start = None;
                         duck.restore();
                         tracing::info!(
-                            "[session={}] dictation cancelled (Esc) — mic released",
+                            "[session={}] dictation cancelled — mic released",
                             current_session()
                         );
                         if proxy
-                            .send_event(DaemonEvent::Failed("cancelled (Esc)".into()))
+                            .send_event(DaemonEvent::Failed("cancelled".into()))
                             .is_err()
                         {
                             tracing::error!("[session={}] cancel notice lost", current_session());

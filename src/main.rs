@@ -58,7 +58,5 @@ fn main() {
         return;
     }
 
-    println!(
-        "Phase 5: tray + global-hotkey wiring lands here. Use --simulate-hold-ms 1500 for now."
-    );
+    println!("Launch Wiflow with --app. Use --help for device and headless recording options.");
 }

@@ -4,6 +4,7 @@ pub mod audio;
 pub mod baseline;
 pub mod cleanup;
 pub mod config;
+pub mod correction;
 pub mod groq_stt;
 pub mod history;
 pub mod hotkey;

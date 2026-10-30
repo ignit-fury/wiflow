@@ -90,14 +90,18 @@ never discard). Context: unavailable → proceed without. Media: unavailable
 ## 7. Testing
 
 `cargo fmt --check` · `cargo clippy --all-targets -- -D warnings` ·
-`cargo test` (250 green) before every commit. Headless suites: 8-phase
+`cargo test` before every commit. The normal suite skips the real-model
+acoustic checks; `docs/manual-validation.md` describes the opt-in 60-second
+regression and pending live acceptance checks. Headless suites: 8-phase
 machine (admission + recovery + R18), orchestrator (routing, finalize from
 every phase, idempotency, supervision, shutdown, universal-restore rows
 with fake media backend), media lifecycle (11 scenarios: pause/race/
 device/epoch/failure), session isolation, traits, UI view-models.
 Live per phase: poster_kb cycles (incl. 300 ms short-hold R18 proof),
 Music-less volume duck/restore exactness (0.6→0.12→0.6, same device),
-focus-steal checks (Terminal keeps focus), Esc/watchdog cancels, shutdown.
+focus-steal checks (Terminal keeps focus), watchdog stops, shutdown.
+Esc is unassigned as of the user decision on 2026-10-06; cancellation
+remains an internal lifecycle mechanism.
 
 ## 8. Intentional deviations (H31 — deliberate, not unfinished)
 
@@ -142,3 +146,38 @@ docs (this file) ✅.
 - Manual matrix (run per audio/inject change): 2 apps + permission-denied
   path (rules.md); password-field behavior unchanged (inject via clipboard
   + Cmd+V, same as before).
+
+## 11. Model integrity (2026-10-06)
+
+Managed tiny.en, base.en, and small.en models use size and SHA-256 checks
+from upstream Hugging Face LFS metadata at revision
+`5359861c739e955e79d9a303bcbc70fb988958b1`. Downloads target resumable
+`.bin.part` files; only verified files replace the active model via rename.
+Existing managed models undergo hashing before use. Custom `--model`
+paths remain user-controlled and receive a warning when they differ from
+the pinned base.en model. Whisper uses standard multi-segment output;
+transcription collects all segments across the recording.
+
+Checksum source: [upstream model metadata](https://huggingface.co/api/models/ggerganov/whisper.cpp/revision/5359861c739e955e79d9a303bcbc70fb988958b1?blobs=true).
+
+## 12. Settings rendering (2026-10-06)
+
+Settings redraws on input, OS exposure/resize, and egui's requested
+repaint deadlines. RedrawRequested is serviced once rather than queued
+again. The shared event loop waits until the earliest settings repaint
+or tray-spinner deadline; idle settings introduces no periodic wakeup.
+The background mic probe requests one redraw after publishing its result.
+
+The GL host selects each window's context before rendering and resizes
+the surface when its physical dimensions change. Zero-sized windows skip
+rendering until a subsequent size/exposure event. Both Settings and the
+recording pill use this host; the pill keeps its existing animation loop.
+# Shared correction stage
+
+STT returns a raw transcript. `ChainProvider::prepare_route` applies the
+optional language-scoped dictionary once, then deterministic cleanup and
+route analysis. Both daemon and headless callers pass that prepared route
+through `CleanupProvider::clean_prepared`. AI receives the deterministic
+baseline; output validation restores that baseline on unsafe edits or
+provider failure. The cleanup chain shares a two-second request budget;
+context synthesis retains its separate timeout. See `docs/corrections.md`.

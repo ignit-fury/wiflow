@@ -196,7 +196,7 @@ impl Pill {
                                 elapsed.as_secs() / 60,
                                 elapsed.as_secs() % 60
                             ));
-                            ui.small("release to transcribe · esc cancels");
+                            ui.small("release to transcribe");
                         });
                         // Row 2: waveform bars across the full width.
                         ui.horizontal(|ui| {

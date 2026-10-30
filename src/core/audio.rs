@@ -31,6 +31,29 @@ fn acc_block(sum_sq: &mut f64, s: f32) {
     *sum_sq += s as f64 * s as f64;
 }
 
+/// Downmix one interleaved capture block to mono and push it. Multi-channel
+/// devices deliver interleaved frames; pushing them raw stored stereo as
+/// double-length "mono" (half-speed audio for Whisper).
+fn push_frames<T: Copy>(
+    data: &[T],
+    channels: usize,
+    to_f32: fn(T) -> f32,
+    producer: &mut HeapProd<f32>,
+    dropped: &AtomicUsize,
+) {
+    let mut sum_sq = 0.0f64;
+    let mut n = 0;
+    for frame in data.chunks(channels.max(1)) {
+        let s = frame.iter().map(|&x| to_f32(x)).sum::<f32>() / frame.len() as f32;
+        if producer.try_push(s).is_err() {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        acc_block(&mut sum_sq, s);
+        n += 1;
+    }
+    publish_block_rms(sum_sq, n);
+}
+
 /// Publish the RMS of a just-pushed block of `n` samples.
 fn publish_block_rms(sum_sq: f64, n: usize) {
     if n > 0 {
@@ -127,9 +150,10 @@ impl AudioCapture {
             .supported_input_configs()
             .map_err(|e| AudioError(e.to_string()))?
             .collect();
+        // Closest rate first, then fewest channels (mono needs no downmix).
         supported.sort_by_key(|c| {
             let r = c.min_sample_rate().0 as i32 - 16000;
-            r.abs()
+            (r.abs(), c.channels())
         });
         let cfg = supported
             .into_iter()
@@ -141,6 +165,7 @@ impl AudioCapture {
         // Clamp to 16kHz: 192kHz devices blew the 70s ringbuf to ~53MB (Phase 1 review).
         let sample_rate = 16_000.clamp(min_rate, max_rate);
         let config = cfg.with_sample_rate(cpal::SampleRate(sample_rate)).config();
+        let channels = config.channels as usize;
         // Split halves: producer owns the write side, so the realtime callback
         // never locks. Capacity 70s exceeds the 60s PTT auto-stop, therefore
         // drop-newest on full is unreachable in practice (and preferable to
@@ -154,14 +179,7 @@ impl AudioCapture {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    let mut sum_sq = 0.0f64;
-                    for &s in data {
-                        if producer.try_push(s).is_err() {
-                            dropped_cb.fetch_add(1, Ordering::Relaxed);
-                        }
-                        acc_block(&mut sum_sq, s);
-                    }
-                    publish_block_rms(sum_sq, data.len());
+                    push_frames(data, channels, |s| s, &mut producer, &dropped_cb)
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -169,15 +187,7 @@ impl AudioCapture {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
-                    let mut sum_sq = 0.0f64;
-                    for &s in data {
-                        let f = i16_to_f32(s);
-                        if producer.try_push(f).is_err() {
-                            dropped_cb.fetch_add(1, Ordering::Relaxed);
-                        }
-                        acc_block(&mut sum_sq, f);
-                    }
-                    publish_block_rms(sum_sq, data.len());
+                    push_frames(data, channels, i16_to_f32, &mut producer, &dropped_cb)
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -185,15 +195,7 @@ impl AudioCapture {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
-                    let mut sum_sq = 0.0f64;
-                    for &s in data {
-                        let f = u16_to_f32(s);
-                        if producer.try_push(f).is_err() {
-                            dropped_cb.fetch_add(1, Ordering::Relaxed);
-                        }
-                        acc_block(&mut sum_sq, f);
-                    }
-                    publish_block_rms(sum_sq, data.len());
+                    push_frames(data, channels, u16_to_f32, &mut producer, &dropped_cb)
                 },
                 |err| warn!("audio stream error: {err}"),
                 None,
@@ -202,7 +204,7 @@ impl AudioCapture {
         }
         .map_err(|e| AudioError(e.to_string()))?;
         stream.play().map_err(|e| AudioError(e.to_string()))?;
-        info!("capture started @ {sample_rate}Hz");
+        info!("capture started @ {sample_rate}Hz, {channels} ch");
         store_recording_rms(0.0); // fresh amplitude baseline per hold
         Ok(Self {
             stream,
@@ -289,6 +291,21 @@ mod tests {
         assert_eq!(f32_to_i16(-1.0), -32767);
         assert_eq!(f32_to_i16(2.0), 32767);
         assert_eq!(f32_to_i16(-2.0), -32767);
+    }
+
+    #[test]
+    fn push_frames_downmixes_interleaved_stereo() {
+        let (mut prod, mut cons) = HeapRb::<f32>::new(8).split();
+        let dropped = AtomicUsize::new(0);
+        push_frames(
+            &[1.0f32, 0.0, 0.5, 0.5, -1.0, 1.0],
+            2,
+            |s| s,
+            &mut prod,
+            &dropped,
+        );
+        assert_eq!(cons.pop_iter().collect::<Vec<_>>(), vec![0.5, 0.5, 0.0]);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
