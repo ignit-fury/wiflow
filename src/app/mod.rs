@@ -56,16 +56,21 @@ impl AppState {
             AppState::Error => "Error",
         }
     }
+
+    /// Status dot color (tray icon + main window).
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            AppState::Idle => (140, 140, 140),
+            AppState::Recording => (230, 40, 40),
+            AppState::Transcribing => (60, 180, 255),
+            AppState::Error => (230, 150, 0),
+        }
+    }
 }
 
 /// 32x32 status icon: dark square, center dot colored by state.
 pub fn icon_rgba(state: AppState) -> Vec<u8> {
-    let dot: (u8, u8, u8) = match state {
-        AppState::Idle => (140, 140, 140),
-        AppState::Recording => (230, 40, 40),
-        AppState::Transcribing => (60, 180, 255),
-        AppState::Error => (230, 150, 0),
-    };
+    let dot = state.rgb();
     let mut px = Vec::with_capacity(32 * 32 * 4);
     for y in 0..32i32 {
         for x in 0..32i32 {
@@ -481,7 +486,8 @@ pub fn build_menu(
     // for PTT issues must be reachable without a terminal.
     let show_logs = MenuItem::with_id(ids.show_logs.clone(), "Show Logs…", true, None);
 
-    let settings_window = MenuItem::with_id(ids.settings_window.clone(), "Settings…", true, None);
+    let settings_window =
+        MenuItem::with_id(ids.settings_window.clone(), "Open Wiflow…", true, None);
 
     let quit = MenuItem::with_id(ids.quit.clone(), "Quit Wiflow", true, None);
 
@@ -537,7 +543,7 @@ struct DaemonApp {
     /// Live settings window (S4, pure Rust): created on demand from the
     /// tray menu on the existing event loop; closed via its X button.
     settings_window: Option<crate::ui::settings::SettingsWindow>,
-    /// Set by the tray "Settings…" item; consumed in `about_to_wait` (which
+    /// Set by the tray "Open Wiflow…" item (or a Finder launch); consumed in `about_to_wait` (which
     /// has the `ActiveEventLoop` needed to create the window).
     open_settings_requested: bool,
     /// Mic-probe result for the settings window's Test-record button:
@@ -587,6 +593,10 @@ impl DaemonApp {
         if self.state != self.applied_state {
             if let Err(e) = self.tray.set_icon(Some(make_icon(self.state))) {
                 tracing::warn!("tray set_icon failed: {e:?}");
+            }
+            // New dictation lands in history on the way back to Idle.
+            if let Some(w) = self.settings_window.as_mut() {
+                w.set_history(crate::core::history::load_history());
             }
             self.applied_state = self.state;
         }
@@ -648,13 +658,23 @@ impl DaemonApp {
     fn execute_settings_intent(&mut self, intent: crate::ui::settings::SettingsIntent) {
         use crate::ui::settings::SettingsIntent as I;
         match intent {
-            I::Save(cfg) => {
+            I::Save(mut cfg) => {
+                // Hotkey + launch-at-login apply live through their own
+                // paths; a stale staged copy must never undo them.
+                cfg.hotkey_preset = self.preset;
+                cfg.launch_at_login = self.config.launch_at_login;
                 self.config = cfg;
                 self.save();
                 self.menu_dirty = true;
                 tracing::info!("settings saved (apply to the next hold)");
             }
-            I::SwitchHotkey(want) => self.switch_hotkey(want),
+            I::SwitchHotkey(want) => {
+                self.switch_hotkey(want);
+                // Show what actually took (a failed switch rolls back).
+                if let Some(w) = self.settings_window.as_mut() {
+                    w.set_hotkey(self.preset);
+                }
+            }
             I::CopyHistory(text) => match arboard::Clipboard::new() {
                 Ok(mut cb) => match cb.set_text(text) {
                     Ok(()) => tracing::info!("history entry copied"),
@@ -725,9 +745,22 @@ impl DaemonApp {
         });
     }
 
-    /// Latest mic-probe result for the settings window to render (if any).
-    fn test_record_status(&self) -> Option<String> {
-        self.test_record_result.lock().unwrap().clone()
+    /// Everything live the main window shows (H20: App-owned state).
+    fn live_status(&self) -> crate::ui::settings::LiveStatus {
+        let tooltip = self.current_tooltip();
+        let line = tooltip.strip_prefix("Wiflow — ").unwrap_or(&tooltip);
+        let mut chars = line.chars();
+        let headline = chars
+            .next()
+            .map(|c| c.to_uppercase().chain(chars).collect())
+            .unwrap_or_default();
+        let (r, g, b) = self.state.rgb();
+        crate::ui::settings::LiveStatus {
+            headline,
+            color: [r, g, b],
+            test_status: self.test_record_result.lock().unwrap().clone(),
+            accessibility_ok: crate::platform::macos::accessibility_trusted(),
+        }
     }
 
     /// Note only when it won't clobber the recording indicator.
@@ -1081,11 +1114,11 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 self.execute_settings_intent(intent);
             }
             if matches!(event, winit::event::WindowEvent::RedrawRequested) {
-                let status = self.test_record_status();
+                let live = self.live_status();
                 let intents = self
                     .settings_window
                     .as_mut()
-                    .map(|w| w.paint(status.as_deref()))
+                    .map(|w| w.paint(&live))
                     .unwrap_or_default();
                 for intent in intents {
                     self.execute_settings_intent(intent);
@@ -1098,7 +1131,8 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 .unwrap_or(false);
             if closed {
                 self.settings_window = None;
-                tracing::info!("settings window closed");
+                crate::platform::macos::panel::set_dock_visible(false);
+                tracing::info!("main window closed");
             }
             return;
         }
@@ -1214,18 +1248,26 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
             self.handle_menu_event(&ev.id);
         }
-        // Open the settings window on demand (needs the ActiveEventLoop).
+        // Open the main window on demand (needs the ActiveEventLoop).
         if self.open_settings_requested {
             self.open_settings_requested = false;
-            if self.settings_window.is_none() {
+            if let Some(w) = self.settings_window.as_ref() {
+                crate::platform::macos::panel::set_dock_visible(true);
+                w.focus();
+            } else {
                 let history = crate::core::history::load_history();
                 let mics = crate::core::audio::list_devices();
-                match crate::ui::settings::SettingsWindow::open(event_loop, history, mics) {
+                let models = crate::core::cleanup::list_ollama_models();
+                crate::platform::macos::panel::set_dock_visible(true);
+                match crate::ui::settings::SettingsWindow::open(event_loop, history, mics, models) {
                     Ok(w) => {
                         self.settings_window = Some(w);
-                        tracing::info!("settings window opened");
+                        tracing::info!("main window opened");
                     }
-                    Err(e) => self.warn_note(format!("settings window failed: {e}")),
+                    Err(e) => {
+                        crate::platform::macos::panel::set_dock_visible(false);
+                        self.warn_note(format!("main window failed: {e}"));
+                    }
                 }
             }
         }
@@ -1276,7 +1318,7 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
 /// guidance, never faked.
 pub fn hotkey_failure_note(prefer: HotkeyPreset) -> String {
     format!(
-        "push-to-talk ({}) couldn't be registered — pick another hotkey in the tray menu or Settings window (it takes effect immediately); if all fail, check System Settings → Keyboard for conflicts",
+        "push-to-talk ({}) couldn't be registered — pick another hotkey in the tray menu or the Wiflow window (it takes effect immediately); if all fail, check System Settings → Keyboard for conflicts",
         crate::daemon::preset_hint(prefer)
     )
 }
@@ -1285,6 +1327,7 @@ fn app_main(
     event_loop: EventLoop<DaemonEvent>,
     proxy: winit::event_loop::EventLoopProxy<DaemonEvent>,
     mut config: Config,
+    open_window: bool,
 ) -> ! {
     let devices = crate::core::audio::list_devices();
     let history = crate::core::history::load_history();
@@ -1458,7 +1501,7 @@ fn app_main(
         menu_ids: ids,
         menu_dirty: false,
         settings_window: None,
-        open_settings_requested: false,
+        open_settings_requested: open_window,
         test_record_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
         test_record_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pill: crate::ui::pill::Pill::new(),
@@ -1476,12 +1519,14 @@ fn app_main(
     std::process::exit(0);
 }
 
-pub fn run(initial: Config) -> ! {
+/// `open_window`: show the main window at start (Finder/Dock launch);
+/// `--app` (login item, scripts) starts in the menu bar only.
+pub fn run(initial: Config, open_window: bool) -> ! {
     let event_loop = EventLoop::<DaemonEvent>::with_user_event()
         .build()
         .expect("winit event loop");
     let proxy = event_loop.create_proxy();
-    app_main(event_loop, proxy, initial)
+    app_main(event_loop, proxy, initial, open_window)
 }
 
 #[cfg(test)]

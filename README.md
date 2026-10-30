@@ -14,10 +14,13 @@ Use macOS 13+ on Apple Silicon, Rust 1.81 or newer, and Xcode Command Line
 Tools (`xcode-select --install`). From the project directory:
 
 ```sh
-cargo run --release -- --app
+cargo run --release
 ```
 
-Open Settings from the menu bar. Grant Microphone permission and the
+This opens the Wiflow window (Home, History, Settings, Permissions) and a
+menu-bar icon. Closing the window keeps Wiflow running in the menu bar; reopen
+it with **Open Wiflow…**. Use `--app` to start in the menu bar only (the login
+item does this). Grant Microphone permission and the
 Accessibility/Input Monitoring permissions requested for your hotkey and
 paste injection in System Settings → Privacy & Security. After granting
 permissions, restart Wiflow if macOS still blocks recording or hotkeys.
