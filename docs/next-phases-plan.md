@@ -48,7 +48,7 @@ exists).
 Checks:
 - [ ] At least one real failing clip reproduces the drop in a test
 - [ ] Fix makes those clips transcribe fully; short-clip speed stays close to today
-- [x] "A no wait B" gives the right text: three new prompt examples; llama3.2:3b now gets 7 of 7 correction sentences and 2 new unseen ones right (was 4 of 7). Guard tests added for the 3b hallucinations seen
+- [x] "A no wait B" gives the right text: three new prompt examples; llama3.2:3b now gets 7 of 7 correction sentences right (was 4 of 7) and 2 of 3 unseen ones ("docs folder I mean the src folder" still wrong; the guard rejects it). Guard tests added for the 3b hallucinations seen
 - [x] Debug clip saving stays opt-in, documented
 
 ## Phase 5 — Bluetooth mic cold start
@@ -57,8 +57,8 @@ Keeping the mic open between holds conflicts with rules.md §5. Needs a
 decision from the owner; options and trade-offs written up here.
 
 Checks:
-- [ ] Decision recorded in memory.md
-- [ ] If a code change is chosen, it keeps the recording indicator rule
+- [x] Decision recorded in memory.md (option B)
+- [x] If a code change is chosen, it keeps the recording indicator rule: the pill stays visible, only its dot and hint change; unit test added. Built-in mic quiet room measured at RMS 0.004, so it never sticks on "connecting". Not tried with a Bluetooth mic
 
 ## Progress
 
@@ -67,7 +67,7 @@ Checks:
 - Phase 3 done except one live dictation.
 - Phase 4b done. 4a waiting for real failing clips. The STT log line now
   shows word count and audio seconds, so drops are visible.
-- Phase 5 waiting for the owner's decision. Options:
+- Phase 5 done with option B (owner's choice). Options were:
   A. Leave as is (current mic is the built-in one; no Bluetooth in recent logs).
   B. Show "connecting" in the pill until the first non-silent audio arrives,
      so the user knows when to start speaking. Fits rules.md §5.
