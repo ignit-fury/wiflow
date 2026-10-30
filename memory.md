@@ -173,3 +173,10 @@ all targets with warnings denied, formatting, and diff checks passed.
   path, 3B got 5 right and 1B got 1; warm 3B takes ~230–400 ms. Ollama context
   is capped at 4,096 tokens (2.6 GB resident instead of 9.9 GB). Existing
   installs keep their saved `cleanup_model`. Details: docs/perf-accuracy-plan.md.
+
+- 2026-10-30 — Bluetooth mic cold start (user decision: option B). The mic is
+  still opened only while the key is held (rules.md §5 unchanged). The pill
+  shows an amber dot and "connecting mic, wait…" until the first non-silent
+  audio block (RMS above 1e-5; Bluetooth delivers exact zeros while it
+  switches profiles, the built-in mic's quiet room is ~0.004). Rejected:
+  keeping the mic open between holds. Details: docs/next-phases-plan.md.

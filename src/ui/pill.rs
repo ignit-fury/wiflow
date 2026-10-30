@@ -22,6 +22,9 @@ use crate::core::audio::recording_rms;
 const SMOOTH_ALPHA: f32 = 0.35;
 /// Bars of waveform history.
 const BAR_COUNT: usize = 32;
+/// Above digital silence. Bluetooth mics deliver exact zeros while they
+/// switch profiles; a built-in mic's room noise is ~1e-4 or more.
+const LIVE_RMS: f32 = 1e-5;
 /// Blend one step toward the target. Pure; unit-tested below.
 pub fn smooth_rms(prev: f32, target: f32) -> f32 {
     prev + (target - prev) * SMOOTH_ALPHA
@@ -36,6 +39,8 @@ pub struct PillState {
     shown_at: Option<Instant>,
     smoothed: f32,
     history: VecDeque<f32>,
+    /// A non-silent sample arrived since `show_now` (false = "connecting").
+    heard: bool,
 }
 
 impl PillState {
@@ -45,6 +50,7 @@ impl PillState {
             shown_at: None,
             smoothed: 0.0,
             history: VecDeque::with_capacity(BAR_COUNT),
+            heard: false,
         }
     }
 
@@ -54,6 +60,7 @@ impl PillState {
         self.shown_at = Some(Instant::now());
         self.smoothed = 0.0;
         self.history.clear();
+        self.heard = false;
     }
 
     pub fn hide(&mut self) {
@@ -71,11 +78,17 @@ impl PillState {
             return;
         }
         let rms = rms.clamp(0.0, 1.0);
+        self.heard |= rms > LIVE_RMS;
         self.smoothed = smooth_rms(self.smoothed, rms);
         if self.history.len() >= BAR_COUNT {
             self.history.pop_front();
         }
         self.history.push_back(self.smoothed);
+    }
+
+    /// True until the mic delivers real audio (Bluetooth cold start).
+    pub fn connecting(&self) -> bool {
+        self.visible && !self.heard
     }
 
     /// Bar heights for rendering (oldest → newest).
@@ -177,6 +190,7 @@ impl Pill {
         self.state.push_sample(recording_rms());
         let elapsed = self.state.elapsed();
         let bars = self.state.bars();
+        let connecting = self.state.connecting();
         g.paint(|ctx| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(24, 24, 28)))
@@ -186,17 +200,23 @@ impl Pill {
                         ui.horizontal(|ui| {
                             let (dot_rect, _) = ui
                                 .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                            ui.painter().circle_filled(
-                                dot_rect.center(),
-                                7.0,
-                                egui::Color32::from_rgb(255, 70, 70),
-                            );
+                            // Amber until audio flows, then red.
+                            let dot = if connecting {
+                                egui::Color32::from_rgb(255, 180, 60)
+                            } else {
+                                egui::Color32::from_rgb(255, 70, 70)
+                            };
+                            ui.painter().circle_filled(dot_rect.center(), 7.0, dot);
                             ui.label(format!(
                                 "{:02}:{:02}",
                                 elapsed.as_secs() / 60,
                                 elapsed.as_secs() % 60
                             ));
-                            ui.small("release to transcribe");
+                            ui.small(if connecting {
+                                "connecting mic, wait…"
+                            } else {
+                                "release to transcribe"
+                            });
                         });
                         // Row 2: waveform bars across the full width.
                         ui.horizontal(|ui| {
@@ -272,6 +292,22 @@ mod tests {
         // Step response is bounded (no overshoot past the target).
         assert!(smooth_rms(0.0, 1.0) <= 1.0);
         assert!(smooth_rms(1.0, 0.0) >= 0.0);
+    }
+
+    #[test]
+    fn connecting_until_first_non_silent_sample() {
+        let mut p = PillState::new();
+        assert!(!p.connecting(), "hidden pill is never connecting");
+        p.show_now();
+        assert!(p.connecting());
+        p.push_sample(0.0); // Bluetooth profile switch: digital silence
+        assert!(p.connecting());
+        p.push_sample(2e-4); // room noise
+        assert!(!p.connecting());
+        p.push_sample(0.0);
+        assert!(!p.connecting(), "stays live once heard");
+        p.show_now();
+        assert!(p.connecting(), "reset on every hold");
     }
 
     #[test]

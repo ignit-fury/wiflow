@@ -69,9 +69,15 @@ fn tags_contain(tags: &serde_json::Value, model: &str) -> bool {
     })
 }
 
+/// The model the app last asked Ollama to keep resident (startup, switch or
+/// timeout warm-up), so a switch knows which pinned model to free.
+static WARMED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// Load `model` into Ollama memory, keep it resident, and prime the prompt
 /// cache. Blocking; cold loads take seconds.
 pub fn warm_ollama(model: &str) -> Result<(), String> {
+    model.clone_into(&mut WARMED.lock().unwrap_or_else(|e| e.into_inner()));
+    mark_ollama_used();
     http()
         .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
         .timeout(Duration::from_secs(60))
@@ -88,6 +94,88 @@ pub fn warm_ollama(model: &str) -> Result<(), String> {
         }))
         .map(|_| ())
         .map_err(|e| format!("ollama warm-up: {e}"))
+}
+
+/// Wall-clock ms of the last request sent to Ollama (0 = none yet).
+static OLLAMA_USED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The first cleanup after ~1 h idle took 1.21 s inside Ollama (its log),
+/// against 0.2–0.3 s back to back, even with the model pinned.
+const OLLAMA_IDLE_MS: u64 = 5 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn mark_ollama_used() {
+    OLLAMA_USED_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// On key press: if Ollama cleanup is on and Ollama has been idle a while,
+/// wake the model in the background so it is fast by the time the user
+/// stops speaking.
+pub fn wake_ollama_if_idle(cfg: &crate::core::config::Config) {
+    let last = OLLAMA_USED_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if cfg.cleanup_enabled
+        && cfg.cleanup_provider == "ollama"
+        && !cfg.cleanup_model.is_empty()
+        && idle_long(last, now_ms())
+    {
+        let model = cfg.cleanup_model.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            match warm_ollama(&model) {
+                Ok(()) => tracing::info!(
+                    "ollama woken after idle in {}ms ({model})",
+                    t0.elapsed().as_millis()
+                ),
+                Err(e) => tracing::warn!("{e}"),
+            }
+        });
+    }
+}
+
+fn idle_long(last_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) > OLLAMA_IDLE_MS
+}
+
+/// After a settings save: load the Ollama model in the background when it
+/// changed, so the first cleanup after a switch is not a cold-load timeout.
+pub fn warm_ollama_on_change(cfg: &crate::core::config::Config) {
+    let mut last = WARMED.lock().unwrap_or_else(|e| e.into_inner());
+    if !should_warm_on_change(&last, cfg) {
+        return;
+    }
+    let previous = std::mem::replace(&mut *last, cfg.cleanup_model.clone());
+    drop(last); // warm_ollama below takes the lock again
+    let model = cfg.cleanup_model.clone();
+    std::thread::spawn(move || {
+        // keep_alive -1 pins models, so free the one switched away from.
+        if !previous.is_empty() {
+            let _ = unload_ollama(&previous);
+        }
+        match warm_ollama(&model) {
+            Ok(()) => tracing::info!("ollama model loaded after switch ({model})"),
+            Err(e) => tracing::warn!("{e}"),
+        }
+    });
+}
+
+fn unload_ollama(model: &str) -> Result<(), String> {
+    http()
+        .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
+        .timeout(Duration::from_secs(5))
+        .send_json(json!({"model": model, "keep_alive": 0}))
+        .map(|_| ())
+        .map_err(|e| format!("ollama unload: {e}"))
+}
+
+fn should_warm_on_change(last: &str, cfg: &crate::core::config::Config) -> bool {
+    cfg.cleanup_enabled
+        && cfg.cleanup_provider == "ollama"
+        && !cfg.cleanup_model.is_empty()
+        && cfg.cleanup_model != last
 }
 
 fn warm_ollama_in_background(model: &str) {
@@ -579,6 +667,7 @@ fn ollama_chat(
             warm_ollama_in_background(model);
             format!("generate failed: {e:?}")
         })?;
+    mark_ollama_used();
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {e:?}"))?;
     // Hit the token cap: a cut-off sentence is worse than the raw transcript.
     if v["done_reason"] == "length" {
@@ -1003,6 +1092,33 @@ mod tests {
             expired.remaining().unwrap_err(),
             "cleanup time budget exhausted"
         );
+    }
+
+    #[test]
+    fn wakes_only_after_five_idle_minutes() {
+        let min = 60 * 1000;
+        assert!(idle_long(0, 10 * min), "never used yet");
+        assert!(!idle_long(10 * min, 14 * min));
+        assert!(idle_long(10 * min, 16 * min));
+        assert!(!idle_long(20 * min, 10 * min), "clock went back");
+    }
+
+    #[test]
+    fn warms_only_when_ollama_model_changes() {
+        let mut cfg = crate::core::config::Config {
+            cleanup_enabled: true,
+            cleanup_provider: "ollama".into(),
+            cleanup_model: "llama3.2:3b".into(),
+            ..Default::default()
+        };
+        assert!(should_warm_on_change("", &cfg));
+        assert!(should_warm_on_change("llama3.2:1b", &cfg));
+        assert!(!should_warm_on_change("llama3.2:3b", &cfg));
+        cfg.cleanup_provider = "groq".into();
+        assert!(!should_warm_on_change("", &cfg));
+        cfg.cleanup_provider = "ollama".into();
+        cfg.cleanup_enabled = false;
+        assert!(!should_warm_on_change("", &cfg));
     }
 
     #[test]

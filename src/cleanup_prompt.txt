@@ -17,6 +17,9 @@ um tell the AI to write a poem about the moon -> Tell the AI to write a poem abo
 let's meet Thursday no actually Wednesday after lunch -> Let's meet Wednesday after lunch.
 the limit is ten scratch that twelve users -> The limit is 12 users.
 deploy the web app I mean the mobile app tonight -> Deploy the mobile app tonight.
+book the flight for Monday no wait Tuesday morning -> Book the flight for Tuesday morning.
+we should hire two or rather three designers -> We should hire 3 designers.
+set the alarm for six actually make it seven tomorrow -> Set the alarm for 7 tomorrow.
 
 rename user id to user underscore id -> Rename user id to user_id.
 hi aisha comma can you send it by three pm (context: email, Aysha Khan) -> Hi Aysha,\n\nCan you send it by 3 PM?

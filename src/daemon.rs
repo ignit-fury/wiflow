@@ -206,6 +206,54 @@ mod hotkey_bridge_tests {
     }
 }
 
+/// Opt-in debugging: when `~/Library/Logs/wiflow/clips/` exists (created by
+/// hand), keep each STT input as a 16 kHz WAV there. Off by default; audio
+/// stays on this Mac. Delete the folder to stop.
+fn save_debug_clip(samples_16k: &[f32]) {
+    let dir = crate::logfile::log_path().with_file_name("clips");
+    if samples_16k.is_empty() || !dir.is_dir() {
+        return;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let wav = crate::core::groq_stt::encode_wav16(samples_16k, crate::core::vad::VAD_SAMPLE_RATE);
+    if let Err(e) = std::fs::write(dir.join(format!("{ms}.wav")), wav) {
+        tracing::warn!("debug clip not saved: {e}");
+    }
+}
+
+/// Per-stage worker times for one dictation, logged as one line when the
+/// pipeline returns (any path). Paste runs later on the main thread.
+struct StageTimes {
+    start: Instant,
+    hold_ms: u64,
+    prep_ms: u128,
+    stt_ms: u128,
+    context_ms: u128,
+    cleanup_ms: u128,
+}
+
+impl StageTimes {
+    fn line(&self) -> String {
+        format!(
+            "timing hold={}ms prep={}ms stt={}ms context={}ms cleanup={}ms worker_total={}ms",
+            self.hold_ms,
+            self.prep_ms,
+            self.stt_ms,
+            self.context_ms,
+            self.cleanup_ms,
+            self.start.elapsed().as_millis()
+        )
+    }
+}
+
+impl Drop for StageTimes {
+    fn drop(&mut self) {
+        tracing::info!("{}", self.line());
+    }
+}
+
 /// Model-switch-failure semantics (via `stt::transcribe_shared`): a failed
 /// new-model load returns Err and keeps the previously loaded model cached,
 /// so the caller only needs to warn and can retry with a fixed path.
@@ -214,6 +262,14 @@ fn pipeline_on_worker(
     duration_ms: u64,
     proxy: &EventLoopProxy<DaemonEvent>,
 ) {
+    let mut times = StageTimes {
+        start: Instant::now(),
+        hold_ms: duration_ms,
+        prep_ms: 0,
+        stt_ms: 0,
+        context_ms: 0,
+        cleanup_ms: 0,
+    };
     let out = capture.stop();
     let mut vad = crate::core::vad::Vad::new();
     let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
@@ -223,6 +279,8 @@ fn pipeline_on_worker(
         out.samples_mono.len(),
         out.sample_rate
     );
+    times.prep_ms = times.start.elapsed().as_millis();
+    save_debug_clip(&kept);
     if kept.is_empty() {
         tracing::info!("no speech detected, nothing to transcribe");
         let _ = proxy.send_event(DaemonEvent::Done {
@@ -255,14 +313,20 @@ fn pipeline_on_worker(
     }
     let text = transcript.text;
     let ms = t0.elapsed().as_millis();
+    times.stt_ms = ms;
     let kept_ms = kept.len() as f64 / crate::core::vad::VAD_SAMPLE_RATE as f64 * 1000.0;
     let rtf = ms as f64 / kept_ms.max(1.0);
-    tracing::info!("transcribed in {ms}ms (RTF {rtf:.2})");
+    tracing::info!(
+        "transcribed in {ms}ms (RTF {rtf:.2}, {} words from {:.1}s of audio)",
+        text.split_whitespace().count(),
+        kept_ms / 1000.0
+    );
     // Cleanup via trait (route decision + context gate + chain).
     let cleanup_provider = crate::core::traits::ChainProvider;
     // Context gate: transcript must carry value AND app must be
     // context-sensitive — otherwise the ~200ms osascript query and the
     // model call are skipped.
+    let t_ctx = Instant::now();
     let route = cleanup_provider.prepare_route(&text, &cfg);
     let ctx = match &route {
         crate::core::analyze::CleanupRoute::Llm(a) => {
@@ -285,11 +349,14 @@ fn pipeline_on_worker(
         }
         _ => String::new(),
     };
+    times.context_ms = t_ctx.elapsed().as_millis();
+    let t_clean = Instant::now();
     let outcome = cleanup_provider.clean_prepared(
         route,
         if ctx.is_empty() { None } else { Some(&ctx) },
         &cfg,
     );
+    times.cleanup_ms = t_clean.elapsed().as_millis();
     let cleaned = outcome.text;
     let issues = outcome.issues;
     for issue in &issues {
@@ -356,6 +423,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
             // Menu-selected mic + duck toggle, re-read per hold.
             let live = crate::core::config::load_config();
             duck.set_enabled(live.duck_audio);
+            crate::core::cleanup::wake_ollama_if_idle(&live);
             let mic = live.mic_name;
             match crate::core::audio::AudioCapture::start(mic) {
                 Ok(cap) => {
@@ -633,6 +701,22 @@ pub fn worker_main(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage_times_line_lists_every_stage() {
+        let t = super::StageTimes {
+            start: std::time::Instant::now(),
+            hold_ms: 1200,
+            prep_ms: 3,
+            stt_ms: 380,
+            context_ms: 0,
+            cleanup_ms: 210,
+        };
+        let line = t.line();
+        assert!(line.starts_with(
+            "timing hold=1200ms prep=3ms stt=380ms context=0ms cleanup=210ms worker_total="
+        ));
+    }
+
     use super::*;
 
     #[test]
