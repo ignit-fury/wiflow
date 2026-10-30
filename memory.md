@@ -180,3 +180,11 @@ all targets with warnings denied, formatting, and diff checks passed.
   audio block (RMS above 1e-5; Bluetooth delivers exact zeros while it
   switches profiles, the built-in mic's quiet room is ~0.004). Rejected:
   keeping the mic open between holds. Details: docs/next-phases-plan.md.
+
+- 2026-10-30 — Password-field protection (prd.md §6). Before pasting, the app
+  asks Accessibility for the focused element's role; `AXSecureTextField`
+  blocks the paste, and the text goes to the clipboard with the usual
+  inject-failed warning. When Accessibility cannot tell, macOS secure input
+  is the backup (not trusted alone: Terminal's Secure Keyboard Entry keeps it
+  on). Verified live: macOS password dialog and a Safari password input
+  blocked; a normal dialog text field still typed.
