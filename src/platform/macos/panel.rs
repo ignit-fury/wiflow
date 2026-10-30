@@ -12,7 +12,8 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSFloatingWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSFloatingWindowLevel, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -49,6 +50,24 @@ pub fn configure_pill_panel(window: &Window) {
     );
     ns_window.setHidesOnDeactivate(false);
     tracing::info!("pill panel: non-activating floating configured");
+}
+
+/// Dock icon + app switcher entry while the main window is open; menu-bar
+/// only otherwise (the bundle starts as LSUIElement). Main thread only.
+pub fn set_dock_visible(visible: bool) {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(if visible {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    });
+    if visible {
+        #[allow(deprecated)] // `activate` needs macOS 14; this works everywhere.
+        app.activateIgnoringOtherApps(true);
+    }
 }
 
 /// Show the pill window WITHOUT activating the app.

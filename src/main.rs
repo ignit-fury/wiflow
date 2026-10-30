@@ -42,8 +42,10 @@ fn main() {
         return;
     }
 
-    if args.app {
-        app::run(crate::core::config::load_config());
+    // No arguments = launched from Finder/Dock: open the main window too.
+    let bare_launch = std::env::args().len() == 1;
+    if args.app || bare_launch {
+        app::run(crate::core::config::load_config(), bare_launch);
     }
 
     if let Some(hold) = args.simulate_hold_ms {
