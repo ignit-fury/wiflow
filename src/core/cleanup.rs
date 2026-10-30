@@ -90,6 +90,44 @@ pub fn warm_ollama(model: &str) -> Result<(), String> {
         .map_err(|e| format!("ollama warm-up: {e}"))
 }
 
+/// After a settings save: load the Ollama model in the background when it
+/// changed, so the first cleanup after a switch is not a cold-load timeout.
+pub fn warm_ollama_on_change(cfg: &crate::core::config::Config) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !should_warm_on_change(&last, cfg) {
+        return;
+    }
+    let previous = std::mem::replace(&mut *last, cfg.cleanup_model.clone());
+    let model = cfg.cleanup_model.clone();
+    std::thread::spawn(move || {
+        // keep_alive -1 pins models, so free the one switched away from.
+        if !previous.is_empty() {
+            let _ = unload_ollama(&previous);
+        }
+        match warm_ollama(&model) {
+            Ok(()) => tracing::info!("ollama model loaded after switch ({model})"),
+            Err(e) => tracing::warn!("{e}"),
+        }
+    });
+}
+
+fn unload_ollama(model: &str) -> Result<(), String> {
+    http()
+        .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
+        .timeout(Duration::from_secs(5))
+        .send_json(json!({"model": model, "keep_alive": 0}))
+        .map(|_| ())
+        .map_err(|e| format!("ollama unload: {e}"))
+}
+
+fn should_warm_on_change(last: &str, cfg: &crate::core::config::Config) -> bool {
+    cfg.cleanup_enabled
+        && cfg.cleanup_provider == "ollama"
+        && !cfg.cleanup_model.is_empty()
+        && cfg.cleanup_model != last
+}
+
 fn warm_ollama_in_background(model: &str) {
     static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -1003,6 +1041,24 @@ mod tests {
             expired.remaining().unwrap_err(),
             "cleanup time budget exhausted"
         );
+    }
+
+    #[test]
+    fn warms_only_when_ollama_model_changes() {
+        let mut cfg = crate::core::config::Config {
+            cleanup_enabled: true,
+            cleanup_provider: "ollama".into(),
+            cleanup_model: "llama3.2:3b".into(),
+            ..Default::default()
+        };
+        assert!(should_warm_on_change("", &cfg));
+        assert!(should_warm_on_change("llama3.2:1b", &cfg));
+        assert!(!should_warm_on_change("llama3.2:3b", &cfg));
+        cfg.cleanup_provider = "groq".into();
+        assert!(!should_warm_on_change("", &cfg));
+        cfg.cleanup_provider = "ollama".into();
+        cfg.cleanup_enabled = false;
+        assert!(!should_warm_on_change("", &cfg));
     }
 
     #[test]

@@ -11,9 +11,9 @@ Add `.github/workflows/ci.yml`: on push and pull request, a macOS runner runs
 fmt, clippy and tests.
 
 Checks:
-- [ ] Workflow file is valid and runs on the branch push
-- [ ] fmt, clippy and test steps pass on the runner (Metal build included)
-- [ ] Tests that need models or network are skipped (`#[ignore]`) on CI
+- [x] Workflow file is valid and runs on the PR
+- [x] fmt, clippy and test steps pass on the runner (Metal build included, 4m25s)
+- [x] Tests that need models or network are skipped (`#[ignore]`) on CI
 
 ## Phase 2 — Load the Ollama model when it is switched
 
@@ -21,18 +21,18 @@ Today only startup loads the model. After a switch in Settings the first
 cleanup is cold (~3.4 s), times out, and falls back to the uncleaned text.
 
 Checks:
-- [ ] Saving a new Ollama model (or switching provider to Ollama) calls `warm_ollama` in the background
-- [ ] Unit test covers the "should warm" decision
-- [ ] Live: switch model, dictate at once, log shows no timeout
+- [x] Saving a new Ollama model (or switching provider to Ollama) calls `warm_ollama` in the background, and unloads the previous model
+- [x] Unit test covers the "should warm" decision
+- [x] Live: 3b to 1b loaded in under 8 s; 1b to 3b unloaded 1b (`ollama ps`). Tray click not yet tried by hand
 
 ## Phase 3 — Per-stage timing line
 
 One log line per dictation: capture, VAD, STT, cleanup, paste and total ms.
 
 Checks:
-- [ ] Line appears once per dictation with all stages
-- [ ] Skipped stages (no cleanup, no speech) still log a line
-- [ ] No transcript text in the line (privacy)
+- [ ] Line appears once per dictation with all stages (unit test passes; needs one live dictation)
+- [x] Skipped stages (no cleanup, no speech) still log a line (logged on drop, every return path)
+- [x] No transcript text in the line (privacy)
 
 ## Phase 4 — Accuracy: long dictations and "no wait"
 
@@ -48,8 +48,8 @@ exists).
 Checks:
 - [ ] At least one real failing clip reproduces the drop in a test
 - [ ] Fix makes those clips transcribe fully; short-clip speed stays close to today
-- [ ] "A no wait B" at sentence end gives the right text, with a unit test; the guard still rejects bad output
-- [ ] Debug clip saving stays opt-in, documented
+- [x] "A no wait B" gives the right text: three new prompt examples; llama3.2:3b now gets 7 of 7 correction sentences and 2 new unseen ones right (was 4 of 7). Guard tests added for the 3b hallucinations seen
+- [x] Debug clip saving stays opt-in, documented
 
 ## Phase 5 — Bluetooth mic cold start
 
@@ -62,4 +62,14 @@ Checks:
 
 ## Progress
 
-(filled in as phases complete)
+- Phase 1 done (CI green on PR 3).
+- Phase 2 done; tray switch by hand still to try.
+- Phase 3 done except one live dictation.
+- Phase 4b done. 4a waiting for real failing clips. The STT log line now
+  shows word count and audio seconds, so drops are visible.
+- Phase 5 waiting for the owner's decision. Options:
+  A. Leave as is (current mic is the built-in one; no Bluetooth in recent logs).
+  B. Show "connecting" in the pill until the first non-silent audio arrives,
+     so the user knows when to start speaking. Fits rules.md §5.
+  C. Keep the mic open a few seconds after release, indicator visible, so a
+     quick second hold starts warm. Conflicts with the spirit of §5.

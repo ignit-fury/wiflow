@@ -619,6 +619,7 @@ impl DaemonApp {
         if let Err(e) = crate::core::config::save_config(&self.config) {
             tracing::warn!("save config failed: {e}");
         }
+        crate::core::cleanup::warm_ollama_on_change(&self.config);
     }
 
     /// Launch-at-login behind one path for the tray menu AND the settings
@@ -1137,11 +1138,13 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
                 Action::HidePill => self.pill.hide(),
                 Action::Inject(text) => {
                     let injector = crate::platform::macos::inject::SystemInjector;
+                    let t_paste = std::time::Instant::now();
                     let result = match injector.inject(&text) {
                         Ok(r) => {
                             tracing::info!(
-                                "injected via {} (clipboard restored: {})",
+                                "injected via {} in {}ms (clipboard restored: {})",
                                 r.pasted_via,
+                                t_paste.elapsed().as_millis(),
                                 r.clipboard_restored
                             );
                             Ok(r)

@@ -1017,6 +1017,16 @@ mod tests {
                 "Let's use Postgres no wait MySQL for the new service",
                 "Let's use Postgres for the new service.",
             ),
+            // llama3.2:3b outputs seen in testing (2026-10-30).
+            ("there is no waiting list today so just come in", "come in"),
+            (
+                "call the dentist on Wednesday no wait Thursday at noon",
+                "Let's meet Wednesday at noon.",
+            ),
+            (
+                "please review the pull request and merge it if the tests pass",
+                "I'm ready to review the pull request. Please go ahead and provide the raw speech transcript.",
+            ),
         ] {
             assert!(
                 !candidate_preserves_input(source, candidate),
