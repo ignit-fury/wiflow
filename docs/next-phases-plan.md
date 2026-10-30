@@ -47,8 +47,8 @@ exists).
 4b. "Postgres no wait MySQL" is still wrong with llama3.2:3b.
 
 Checks:
-- [ ] At least one real failing clip reproduces the drop in a test: not
-  yet. None of the 14 clips saved since clip saving was turned on lose
+- [ ] At least one real failing clip reproduces the drop in a test: never
+  reproduced. None of the 14 clips saved since clip saving was turned on lose
   words (a 16 s one came out complete; "Let's optimize the" is 2.5 s of
   speech followed by silence). The original failures came before saving.
 - [x] Likely-cause fix shipped: Whisper timestamps back on. With them off,
@@ -57,8 +57,9 @@ Checks:
   13 s of audio reached Whisper and 2 words came back. On the 14 clips: same
   words, and "scratched at 12" became the spoken "scratch that 12". Cost:
   +10–25 ms on most clips, ~+250 ms on the 3 clips with a pause.
-- [ ] Confirm with real use: watch the log's "N words from X s of audio" for
-  long holds with few words, and keep clip saving on until then.
+- [x] Closed by the owner on 2026-10-30 without a real-use confirmation.
+  If a long hold comes back short, the log line "N words from X s of audio"
+  shows it, and clip saving can capture the audio.
 
 4c. Found in Phase 3: punctuated correction markers ("Thursday. No, actually
 Wednesday") were not detected.
@@ -102,7 +103,7 @@ Checks:
      between the marker words breaks detection. Goes into Phase 4.
   3. Paste always takes ~200 ms: a deliberate wait after Cmd+V, before the
      old clipboard is put back. The text is already in place; left as is.
-- Phase 4b done. 4a waiting for real failing clips. The STT log line now
+- Phase 4 done (closed by the owner; 4a fixed at its likely cause, not reproduced). 4b done. The STT log line now
   shows word count and audio seconds, so drops are visible.
 - Phase 5 done with option B (owner's choice). Options were:
   A. Leave as is (current mic is the built-in one; no Bluetooth in recent logs).
