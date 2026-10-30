@@ -133,6 +133,11 @@ pub fn prompt_path() -> PathBuf {
     app_support_dir().join("prompt.txt")
 }
 
+/// Optional, user-confirmed word/phrase replacements, outside the repository.
+pub fn corrections_path() -> PathBuf {
+    app_support_dir().join("corrections.json")
+}
+
 pub fn load_config_from(path: &Path) -> Config {
     std::fs::read_to_string(path)
         .ok()

@@ -63,11 +63,9 @@ pub fn transcribe_cloud(
     let wav = encode_wav16(samples, rate);
     let boundary = "wiflow-audio-boundary-7f3a";
     let body = build_multipart(boundary, &wav, GROQ_STT_MODEL, lang_opt(&cfg.stt_language));
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let resp = agent
+    let resp = crate::core::cleanup::http()
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .timeout(std::time::Duration::from_secs(30))
         .set("Authorization", &format!("Bearer {key}"))
         .set(
             "Content-Type",

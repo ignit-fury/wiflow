@@ -35,7 +35,7 @@ OUT (v1):
 
 ## 5. UX Flow
 1. User holds hotkey (default: Fn or Right-Option, remappable).
-2. Pill/menubar shows recording + live timer + waveform, Esc cancels.
+2. Pill/menubar shows recording + live timer + waveform. Esc stays unassigned (user decision 2026-10-06).
 3. User releases → "Transcribing…" (max 2s) → text injected at focused app cursor.
 4. Toast + history entry. If injection fails (no focus / permission), copy to clipboard + notify.
 

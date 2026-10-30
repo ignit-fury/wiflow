@@ -8,7 +8,7 @@
 ## 2. Privacy Rule
 - Audio never leaves device in default config.
 - No telemetry in v1. If added later: opt-in only, no audio upload ever.
-- History stays local (`~/Library/Application Support/Dictation/`). Clear button must actually delete.
+- History stays local (`~/Library/Application Support/wiflow/`). Clear button must actually delete.
 
 ## 3. Platform Rule
 - Target: macOS 13+ arm64 first. Must compile warning-free on `aarch64-apple-darwin`.
@@ -24,7 +24,7 @@
 ## 5. UX Rules
 - Push-to-talk only in v1. No always-listening, no background recording without visible indicator.
 - Recording indicator mandatory whenever mic is open.
-- Esc always cancels. Short tap (<300ms) never transcribes.
+- Esc stays unassigned: no global registration, dictation cancellation, or settings action (user decision 2026-10-06). Short tap (<300ms) never transcribes.
 - Injection failure must still leave text in clipboard + notify.
 
 ## 6. Docs & Memory Rules

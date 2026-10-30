@@ -12,35 +12,128 @@ const CONTEXT_PROMPT: &str = include_str!("../context_prompt.txt");
 pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
 pub const EMPTY_SENTINEL: &str = "EMPTY";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+/// Context runs before the cleanup budget starts, so it gets its own short cap.
+const CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// One HTTP client for every provider call: reuses TCP/TLS connections, so
+/// repeat calls skip the handshake. Timeouts are set per request.
+pub(crate) fn http() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+}
+
+struct CleanupBudget {
+    deadline: std::time::Instant,
+}
+
+impl CleanupBudget {
+    fn new() -> Self {
+        Self {
+            deadline: std::time::Instant::now() + CLEANUP_BUDGET,
+        }
+    }
+    fn remaining(&self) -> Result<Duration, String> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            Err("cleanup time budget exhausted".into())
+        } else {
+            Ok(remaining)
+        }
+    }
+}
 /// Strict circuit-breaker for the local cleanup call: a hanging 1B model must
 /// never block injection for seconds — timeout Err falls back to the
-/// deterministic offline transcript in `clean_chain`.
-const OLLAMA_TIMEOUT: Duration = Duration::from_millis(800);
+/// deterministic offline transcript in `clean_chain`. Sized for a warm 1B
+/// model writing ~400 tokens; cold loads are handled by `warm_ollama`.
+const OLLAMA_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Context window for cleanup: prompt (~700 tokens) + 60 s transcript + output
+/// fits easily. Ollama's 64K default reserved ~10 GB for llama3.2:3b.
+const OLLAMA_NUM_CTX: usize = 4096;
+
+/// Output token cap that scales with the input, so long dictations are not
+/// cut short (a fixed 100 truncated anything past ~70 words).
+fn ollama_token_cap(prompt: &str) -> usize {
+    (prompt.split_whitespace().count() * 2 + 32).clamp(100, 400)
+}
+
+fn tags_contain(tags: &serde_json::Value, model: &str) -> bool {
+    tags["models"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .any(|name| name == model || name.split(':').next() == Some(model))
+    })
+}
+
+/// Load `model` into Ollama memory, keep it resident, and prime the prompt
+/// cache. Blocking; cold loads take seconds.
+pub fn warm_ollama(model: &str) -> Result<(), String> {
+    http()
+        .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
+        .timeout(Duration::from_secs(60))
+        .send_json(json!({
+            "model": model,
+            // Process the system prompt now so the first real cleanup reuses
+            // Ollama's prompt cache (1.9 s cold vs 0.2 s cached, measured).
+            "system": SYSTEM_PROMPT,
+            "prompt": "ok",
+            "stream": false,
+            "keep_alive": -1,
+            // Must match `ollama_chat`, or Ollama reloads the model on first use.
+            "options": {"num_ctx": OLLAMA_NUM_CTX, "num_predict": 1},
+        }))
+        .map(|_| ())
+        .map_err(|e| format!("ollama warm-up: {e}"))
+}
+
+fn warm_ollama_in_background(model: &str) {
+    static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let model = model.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = warm_ollama(&model) {
+            tracing::warn!("{e}");
+        }
+        WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
 
 /// Provider chain (user-specified): Groq → OpenRouter → Ollama local →
 /// deterministic output. Keys come from env first (`GROQ_API_KEY`,
 /// `OPENROUTER_API_KEY`), then `~/Library/Application Support/wiflow/keys.json`
 /// (`groq_api_key` / `openrouter_api_key` fields) — never stored in the repo.
 pub fn groq_key() -> Option<String> {
-    std::env::var("GROQ_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .or_else(|| key_from_file("groq_api_key"))
+    resolve_key(
+        std::env::var("GROQ_API_KEY").ok(),
+        &keys_file_path(),
+        "groq_api_key",
+    )
 }
 
 pub fn openrouter_key() -> Option<String> {
-    std::env::var("OPENROUTER_API_KEY")
-        .ok()
+    resolve_key(
+        std::env::var("OPENROUTER_API_KEY").ok(),
+        &keys_file_path(),
+        "openrouter_api_key",
+    )
+}
+
+fn resolve_key(env_value: Option<String>, path: &std::path::Path, field: &str) -> Option<String> {
+    env_value
         .filter(|k| !k.is_empty())
-        .or_else(|| key_from_file("openrouter_api_key"))
+        .or_else(|| key_from_file(path, field))
 }
 
 /// keys.json field reader in the app support dir. Empty strings count as
 /// missing (hand-edited placeholders must not be sent as auth headers).
-fn key_from_file(field: &str) -> Option<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(keys_file_path()).ok()?).ok()?;
+fn key_from_file(path: &std::path::Path, field: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     v[field]
         .as_str()
         .map(|s| s.to_string())
@@ -84,10 +177,11 @@ pub fn clear_key(field: &str) -> Result<(), String> {
 /// Ollama is down (menu shows "not running"). Short timeout: menu builds on
 /// the winit thread, so this must never hang.
 pub fn list_ollama_models() -> Vec<String> {
-    let agent = ureq::AgentBuilder::new()
+    let Ok(resp) = http()
+        .get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
         .timeout(Duration::from_millis(500))
-        .build();
-    let Ok(resp) = agent.get(&format!("{OLLAMA_ENDPOINT}/api/tags")).call() else {
+        .call()
+    else {
         return Vec::new();
     };
     let v: serde_json::Value = resp.into_json().unwrap_or_default();
@@ -185,7 +279,13 @@ fn provider_model(p: Provider, cfg: &crate::core::config::Config) -> &str {
 
 /// Try one provider + model: key (env → keys.json) + HTTP call. Err carries a
 /// user-facing reason (missing key, HTTP status, unparseable response).
-fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<String, String> {
+fn try_provider_model(
+    p: Provider,
+    model: &str,
+    transcript: &str,
+    budget: &CleanupBudget,
+) -> Result<String, String> {
+    let timeout = budget.remaining()?;
     match p {
         Provider::Groq => {
             let key = groq_key()
@@ -196,6 +296,7 @@ fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<Stri
                 model,
                 transcript,
                 None,
+                timeout,
             )
         }
         Provider::OpenRouter => {
@@ -208,9 +309,10 @@ fn try_provider_model(p: Provider, model: &str, transcript: &str) -> Result<Stri
                 model,
                 transcript,
                 None,
+                timeout,
             )
         }
-        Provider::Ollama => ollama_chat(transcript, None, model),
+        Provider::Ollama => ollama_chat(transcript, None, model, budget),
     }
 }
 
@@ -221,17 +323,28 @@ fn try_provider_with_retry(
     p: Provider,
     cfg: &crate::core::config::Config,
     transcript: &str,
+    budget: &CleanupBudget,
 ) -> Result<String, String> {
     let primary = provider_model(p, cfg);
-    match try_provider_model(p, primary, transcript).map(|t| sanitize_llm_response(&t, transcript))
+    match try_provider_model(p, primary, transcript, budget)
+        .map(|t| sanitize_llm_response(&t, transcript))
     {
         Ok(t) => Ok(t),
         Err(e) => {
             let fallback = cfg.cleanup_fallback_model.as_str();
             if fallback != primary {
                 tracing::warn!("retry with fallback model {fallback}: {e}");
-                try_provider_model(p, fallback, transcript)
+                try_provider_model(p, fallback, transcript, budget)
                     .map(|t| sanitize_llm_response(&t, transcript))
+                    // The default fallback is a cloud model id; on Ollama a
+                    // missing fallback must not mask the primary error.
+                    .map_err(|fe| {
+                        if p == Provider::Ollama && fe.starts_with("model not installed") {
+                            e
+                        } else {
+                            fe
+                        }
+                    })
             } else {
                 Err(e)
             }
@@ -249,18 +362,25 @@ pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> Clean
             issues,
         };
     }
+    let budget = CleanupBudget::new();
     let provider = if cfg.cleanup_provider.is_empty() {
         "auto"
     } else {
         cfg.cleanup_provider.as_str()
     };
     let text = match provider {
-        "groq" => single_provider_chain(transcript, cfg, &[Provider::Groq], &mut issues),
-        "openrouter" => {
-            single_provider_chain(transcript, cfg, &[Provider::OpenRouter], &mut issues)
+        "groq" => single_provider_chain(transcript, cfg, &[Provider::Groq], &mut issues, &budget),
+        "openrouter" => single_provider_chain(
+            transcript,
+            cfg,
+            &[Provider::OpenRouter],
+            &mut issues,
+            &budget,
+        ),
+        "ollama" => {
+            single_provider_chain(transcript, cfg, &[Provider::Ollama], &mut issues, &budget)
         }
-        "ollama" => single_provider_chain(transcript, cfg, &[Provider::Ollama], &mut issues),
-        _ => full_chain(transcript, cfg, &mut issues),
+        _ => full_chain(transcript, cfg, &mut issues, &budget),
     };
     CleanupOutcome {
         text: text.unwrap_or_else(|| transcript.to_string()),
@@ -276,8 +396,9 @@ fn chain_step(
     transcript: &str,
     next: Option<Provider>,
     issues: &mut Vec<String>,
+    budget: &CleanupBudget,
 ) -> Option<String> {
-    match try_provider_with_retry(p, cfg, transcript) {
+    match try_provider_with_retry(p, cfg, transcript, budget) {
         Ok(text) => Some(text),
         Err(e) => {
             match next {
@@ -306,6 +427,7 @@ fn full_chain(
     transcript: &str,
     cfg: &crate::core::config::Config,
     issues: &mut Vec<String>,
+    budget: &CleanupBudget,
 ) -> Option<String> {
     // 1. Groq (fastest cloud, generous free tier). No key → skip silently.
     if groq_key().is_some() {
@@ -315,6 +437,7 @@ fn full_chain(
             transcript,
             Some(Provider::OpenRouter),
             issues,
+            budget,
         ) {
             return Some(text);
         }
@@ -327,12 +450,13 @@ fn full_chain(
             transcript,
             Some(Provider::Ollama),
             issues,
+            budget,
         ) {
             return Some(text);
         }
     }
     // 3. Ollama local ($0, offline). Background model check with guidance.
-    chain_step(Provider::Ollama, cfg, transcript, None, issues)
+    chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
 }
 
 /// Explicit provider: only that one, with Ollama fallback on quota errors
@@ -343,15 +467,16 @@ fn single_provider_chain(
     cfg: &crate::core::config::Config,
     providers: &[Provider],
     issues: &mut Vec<String>,
+    budget: &CleanupBudget,
 ) -> Option<String> {
     let p = providers[0];
-    match try_provider_with_retry(p, cfg, transcript) {
+    match try_provider_with_retry(p, cfg, transcript, budget) {
         Ok(text) => Some(text),
         Err(e) => {
             if p != Provider::Ollama && is_quota_error(&e) {
                 issues.push(p.quota_issue(Provider::Ollama));
                 tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-                chain_step(Provider::Ollama, cfg, transcript, None, issues)
+                chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
             } else {
                 issues.push(format!("{} failed: {e}", p.name()));
                 tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
@@ -374,43 +499,63 @@ fn chat_completion(
     model: &str,
     user_content: &str,
     system: Option<&str>,
+    timeout: Duration,
 ) -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
-    let resp = agent
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system.unwrap_or(SYSTEM_PROMPT)},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.0,
+    });
+    // gpt-oss reasons at "medium" by default; cleanup needs no deep thought.
+    if model.contains("gpt-oss") {
+        body["reasoning_effort"] = json!("low");
+    }
+    let resp = http()
         .post(url)
+        .timeout(timeout)
         .set("Authorization", &format!("Bearer {key}"))
         .set("Content-Type", "application/json")
-        .send_json(json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system.unwrap_or(SYSTEM_PROMPT)},
-                {"role": "user", "content": user_content}
-            ],
-            "temperature": 0.0,
-        }))
+        .send_json(body)
         .map_err(|e| match e {
             ureq::Error::Status(code, _) => format!("HTTP {code}"),
             other => format!("{other}"),
         })?;
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {e:?}"))?;
+    if v["choices"][0]["finish_reason"] == "length" {
+        return Err("cleanup output truncated".into());
+    }
     v["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.trim().to_string())
         .ok_or_else(|| format!("unparseable response: {}", truncate(&v.to_string())))
 }
 
-fn ollama_chat(prompt: &str, system: Option<&str>, model: &str) -> Result<String, String> {
-    // Background model check first: distinguish "not running" from
-    // "model not pulled" so the alert tells the user exactly what to do.
-    if !ollama_reachable() {
-        return Err("Ollama not running — install from ollama.com and run `ollama serve`".into());
-    }
-    if !ollama_model_installed(model) {
+fn ollama_chat(
+    prompt: &str,
+    system: Option<&str>,
+    model: &str,
+    budget: &CleanupBudget,
+) -> Result<String, String> {
+    // One bounded readiness request; share the budget with generation and retries.
+    let response = http()
+        .get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
+        .timeout(budget.remaining()?.min(Duration::from_millis(200)))
+        .call()
+        .map_err(|_| {
+            "Ollama not running — install from ollama.com and run `ollama serve`".to_string()
+        })?;
+    let models: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("bad Ollama models: {e}"))?;
+    if !tags_contain(&models, model) {
         return Err(format!("model not installed — run `ollama pull {model}`"));
     }
-    let agent = ureq::AgentBuilder::new().timeout(OLLAMA_TIMEOUT).build();
-    let resp = agent
+    let resp = http()
         .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
+        .timeout(budget.remaining()?.min(OLLAMA_TIMEOUT))
         .set("Content-Type", "application/json")
         .send_json(json!({
             "model": model,
@@ -421,14 +566,24 @@ fn ollama_chat(prompt: &str, system: Option<&str>, model: &str) -> Result<String
             // the moment the model reaches for XML or a new section.
             "options": {
                 "temperature": 0.0,
-                "num_predict": 100,
+                "num_predict": ollama_token_cap(prompt),
+                "num_ctx": OLLAMA_NUM_CTX,
                 "stop": ["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"],
             },
             // Keep weights resident in unified memory (no reload latency).
             "keep_alive": -1,
         }))
-        .map_err(|e| format!("generate failed: {e:?}"))?;
+        .map_err(|e| {
+            // A timeout almost always means the model was unloaded (3.4 s cold
+            // vs 0.12 s warm, measured): reload it so the next call is fast.
+            warm_ollama_in_background(model);
+            format!("generate failed: {e:?}")
+        })?;
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {e:?}"))?;
+    // Hit the token cap: a cut-off sentence is worse than the raw transcript.
+    if v["done_reason"] == "length" {
+        return Err("cleanup output truncated".into());
+    }
     v["response"]
         .as_str()
         .map(|s| s.trim().to_string())
@@ -448,32 +603,20 @@ pub fn check_ollama_ready(model: &str) -> Result<(), String> {
 }
 
 fn ollama_reachable() -> bool {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(2))
-        .build();
-    agent
+    http()
         .get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
+        .timeout(Duration::from_secs(2))
         .call()
         .is_ok()
 }
 
 fn ollama_model_installed(model: &str) -> bool {
-    let agent = ureq::AgentBuilder::new()
+    match http()
+        .get(&format!("{OLLAMA_ENDPOINT}/api/tags"))
         .timeout(Duration::from_secs(2))
-        .build();
-    match agent.get(&format!("{OLLAMA_ENDPOINT}/api/tags")).call() {
-        Ok(resp) => {
-            let v: serde_json::Value = resp.into_json().unwrap_or_default();
-            v["models"]
-                .as_array()
-                .map(|models| {
-                    models
-                        .iter()
-                        .filter_map(|m| m["name"].as_str())
-                        .any(|name| name == model || name.split(':').next() == Some(model))
-                })
-                .unwrap_or(false)
-        }
+        .call()
+    {
+        Ok(resp) => tags_contain(&resp.into_json().unwrap_or_default(), model),
         Err(_) => false,
     }
 }
@@ -799,6 +942,19 @@ fn synthesize_context_with_key(
     let Some(key) = key else {
         return String::new();
     };
+    // The answer depends only on (app, model), so each pair costs one call
+    // per process. Failures are not cached; the next dictation retries.
+    static CACHE: std::sync::Mutex<Vec<(String, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    let hit = |c: &(String, String, String)| c.0 == app && c.1 == cfg.context_model;
+    if let Some(c) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|c| hit(c))
+    {
+        return c.2.clone();
+    }
     let prompt = format!("App: {app}");
     if let Ok(text) = chat_completion(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -806,7 +962,13 @@ fn synthesize_context_with_key(
         &cfg.context_model,
         &prompt,
         Some(CONTEXT_PROMPT),
+        CONTEXT_TIMEOUT,
     ) {
+        CACHE.lock().unwrap_or_else(|e| e.into_inner()).push((
+            app.to_string(),
+            cfg.context_model.clone(),
+            text.clone(),
+        ));
         return text;
     }
     String::new()
@@ -814,7 +976,11 @@ fn synthesize_context_with_key(
 
 fn truncate(s: &str) -> String {
     if s.len() > 200 {
-        format!("{}…", &s[..200])
+        let mut end = 200;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     } else {
         s.to_string()
     }
@@ -823,6 +989,43 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_budget_is_shared_and_exhaustion_is_explicit() {
+        let budget = CleanupBudget::new();
+        let first = budget.remaining().unwrap();
+        assert!(first <= CLEANUP_BUDGET);
+        assert!(budget.remaining().unwrap() <= first);
+        let expired = CleanupBudget {
+            deadline: std::time::Instant::now() - Duration::from_millis(1),
+        };
+        assert_eq!(
+            expired.remaining().unwrap_err(),
+            "cleanup time budget exhausted"
+        );
+    }
+
+    #[test]
+    fn ollama_token_cap_scales_with_input() {
+        assert_eq!(ollama_token_cap("ship it"), 100);
+        assert_eq!(ollama_token_cap(&"word ".repeat(100)), 232);
+        assert_eq!(ollama_token_cap(&"word ".repeat(1000)), 400);
+    }
+
+    #[test]
+    fn tags_match_exact_or_untagged_name() {
+        let tags = json!({"models": [{"name": "llama3.2:1b"}]});
+        assert!(tags_contain(&tags, "llama3.2:1b"));
+        assert!(tags_contain(&tags, "llama3.2"));
+        assert!(!tags_contain(&tags, "qwen/qwen3.8-27b"));
+        assert!(!tags_contain(&json!({}), "llama3.2"));
+    }
+
+    #[test]
+    fn provider_diagnostics_preserve_utf8_boundaries() {
+        let text = "界".repeat(100);
+        assert_eq!(truncate(&text), format!("{}…", "界".repeat(66)));
+    }
 
     #[test]
     fn test_is_quota_error() {
@@ -877,31 +1080,41 @@ mod tests {
 
     #[test]
     fn test_keys_env_overrides_file() {
-        // env wins over keys.json; missing both → None. Uses a throwaway key
-        // file written to the REAL app dir (outside repo, gitignored by
-        // location). A real keys.json is backed up and restored afterwards.
-        let dir = crate::core::config::app_support_dir();
+        let dir = std::env::temp_dir().join(format!("wiflow-keys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let keys_path = dir.join("keys.json");
-        let backup = std::fs::read_to_string(&keys_path).ok();
+        let path = dir.join("keys.json");
         std::fs::write(
-            &keys_path,
+            &path,
             r#"{"groq_api_key":"file-key","openrouter_api_key":"file-or-key"}"#,
         )
         .unwrap();
-        std::env::remove_var("GROQ_API_KEY");
-        std::env::remove_var("OPENROUTER_API_KEY");
-        assert_eq!(groq_key(), Some("file-key".into()));
-        assert_eq!(openrouter_key(), Some("file-or-key".into()));
-        std::env::set_var("GROQ_API_KEY", "env-key");
-        assert_eq!(groq_key(), Some("env-key".into()));
-        std::env::remove_var("GROQ_API_KEY");
-        match backup {
-            Some(orig) => std::fs::write(&keys_path, orig).unwrap(),
-            None => {
-                let _ = std::fs::remove_file(&keys_path);
-            }
-        }
+        assert_eq!(
+            resolve_key(None, &path, "groq_api_key"),
+            Some("file-key".into())
+        );
+        assert_eq!(
+            resolve_key(None, &path, "openrouter_api_key"),
+            Some("file-or-key".into())
+        );
+        assert_eq!(
+            resolve_key(Some("env-key".into()), &path, "groq_api_key"),
+            Some("env-key".into())
+        );
+        assert_eq!(
+            resolve_key(Some(String::new()), &path, "groq_api_key"),
+            Some("file-key".into())
+        );
+        std::fs::write(&path, r#"{"groq_api_key":""}"#).unwrap();
+        assert_eq!(resolve_key(None, &path, "groq_api_key"), None);
+        std::fs::write(&path, "invalid json").unwrap();
+        assert_eq!(resolve_key(None, &path, "groq_api_key"), None);
+        assert_eq!(
+            resolve_key(Some("env-key".into()), &path, "groq_api_key"),
+            Some("env-key".into())
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(resolve_key(None, &path, "groq_api_key"), None);
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

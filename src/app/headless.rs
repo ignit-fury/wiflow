@@ -1,4 +1,5 @@
 use crate::core::hotkey::{PttEvent, PushToTalk};
+use crate::core::traits::CleanupProvider;
 use tracing::{info, warn};
 
 /// Subset of CLI flags consumed by the simulate-hold pipeline.
@@ -92,7 +93,7 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
                 Some(p) => {
                     if !crate::core::stt::verify_model(p) {
                         warn!(
-                            "custom model fails size check, attempting load anyway: {}",
+                            "custom model differs from pinned base.en, attempting load anyway: {}",
                             p.display()
                         );
                     }
@@ -161,21 +162,12 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
             // Same routing as the daemon: deterministic-clean transcripts
             // skip the LLM chain; complex ones run it (Groq→OpenRouter→
             // Ollama) with the focused-app context synthesized first.
-            let route = crate::core::analyze::decide_route(&text, &cfg);
-            let route_name = match &route {
-                crate::core::analyze::CleanupRoute::Direct(_) => "deterministic",
-                crate::core::analyze::CleanupRoute::Llm(_) => "llm",
-            };
-            info!(
-                "cleanup route={route_name} reason={} score={}",
-                crate::core::analyze::route_reason(&cfg, &route),
-                crate::core::analyze::route_score(&route),
-            );
-            let (cleaned, issues) = match route {
-                crate::core::analyze::CleanupRoute::Direct(a) => (a.text, Vec::new()),
+            let provider = crate::core::traits::ChainProvider;
+            let route = provider.prepare_route(&text, &cfg);
+            let ctx = match &route {
                 crate::core::analyze::CleanupRoute::Llm(a) => {
                     let key_present = crate::core::cleanup::groq_key().is_some();
-                    let ctx = if a.wants_context()
+                    if a.wants_context()
                         && cfg.cleanup_enabled
                         && cfg.context_enabled
                         && key_present
@@ -183,7 +175,7 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
                         let app = crate::platform::macos::context::focused_app_name();
                         if crate::core::analyze::context_allowed(
                             app.as_deref(),
-                            &a,
+                            a,
                             cfg.cleanup_enabled,
                             cfg.context_enabled,
                             key_present,
@@ -194,15 +186,17 @@ pub fn run_simulate_hold(args: &SimulateArgs) {
                         }
                     } else {
                         String::new()
-                    };
-                    let input = crate::core::cleanup::format_cleanup_input(
-                        if ctx.is_empty() { None } else { Some(&ctx) },
-                        &text,
-                    );
-                    let outcome = crate::core::cleanup::clean_chain(&input, &cfg);
-                    (outcome.text, outcome.issues)
+                    }
                 }
+                _ => String::new(),
             };
+            let outcome = provider.clean_prepared(
+                route,
+                if ctx.is_empty() { None } else { Some(&ctx) },
+                &cfg,
+            );
+            let cleaned = outcome.text;
+            let issues = outcome.issues;
             for issue in &issues {
                 warn!("cleanup issue: {issue}");
             }

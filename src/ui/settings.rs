@@ -61,8 +61,6 @@ pub enum HotkeyError {
     /// Bare single keys can't be registered (macOS limitation for the paths
     /// wiflow uses; bare Fn/Right-Option ride the tap as presets instead).
     SingleKey(KeyCode),
-    /// Reserved by wiflow itself (Esc cancels).
-    Reserved(&'static str),
     /// Registrable in theory, but wiflow only drives its three presets
     /// (the hotkey bridge forwards known preset ids, no restart needed).
     CustomUnsupported(String),
@@ -73,10 +71,6 @@ pub enum HotkeyError {
 /// Ctrl+Space maps to the combo preset.
 pub fn validate_hotkey(mods: ModifiersState, code: KeyCode) -> Result<HotkeyPreset, HotkeyError> {
     use winit::keyboard::KeyCode as K;
-    // Esc is wiflow's own cancel key — never a PTT binding.
-    if code == K::Escape {
-        return Err(HotkeyError::Reserved("Esc cancels dictation"));
-    }
     let only_ctrl = mods.control_key() && !mods.shift_key() && !mods.alt_key() && !mods.super_key();
     let bare = mods.is_empty();
     match (bare, only_ctrl, code) {
@@ -192,6 +186,15 @@ impl SettingsWindow {
         self.gl.window_id()
     }
 
+    pub fn repaint_deadline(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.gl.repaint_deadline(now)
+    }
+
+    /// A background mic probe can wake this window without polling frames.
+    pub fn redraw_handle(&self) -> std::sync::Arc<winit::window::Window> {
+        self.gl.window.clone()
+    }
+
     /// Closed via the window X button — the App drops the window then.
     pub fn close_requested(&self) -> bool {
         self.closed
@@ -200,11 +203,13 @@ impl SettingsWindow {
     /// Clear the locally shown history after a ClearHistory intent executes.
     pub fn clear_history_view(&mut self) {
         self.history.clear();
+        self.gl.request_redraw();
     }
 
     /// Revert the staged launch-at-login flag (OS refused the change).
     pub fn set_launch_at_login(&mut self, enable: bool) {
         self.vm.config.launch_at_login = enable;
+        self.gl.request_redraw();
     }
 
     /// Feed a winit event to egui; capture recorder keys; collect intents.
@@ -212,6 +217,12 @@ impl SettingsWindow {
         let mut intents = Vec::new();
         if *event == WindowEvent::CloseRequested {
             self.closed = true;
+            return intents;
+        }
+        // Leave Escape unassigned, including egui's popup/recorder behavior.
+        if matches!(event, WindowEvent::KeyboardInput { event: key, .. }
+            if key.physical_key == winit::keyboard::PhysicalKey::Code(KeyCode::Escape))
+        {
             return intents;
         }
         // Hotkey recorder captures raw winit keys (bare Fn/AltRight are
@@ -227,21 +238,14 @@ impl SettingsWindow {
                 use winit::keyboard::PhysicalKey;
                 if self.recording_keys && key_event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = key_event.physical_key {
-                        use winit::keyboard::KeyCode as K;
-                        if code == K::Escape {
-                            self.recording_keys = false;
-                            self.record_msg = Some("recording cancelled".into());
-                        } else {
-                            match validate_hotkey(self.record_mods, code) {
-                                Ok(preset) => {
-                                    self.recording_keys = false;
-                                    self.record_msg =
-                                        Some(format!("captured {preset:?} — switching"));
-                                    intents.push(SettingsIntent::SwitchHotkey(preset));
-                                }
-                                Err(e) => {
-                                    self.record_msg = Some(format!("not usable: {e:?}"));
-                                }
+                        match validate_hotkey(self.record_mods, code) {
+                            Ok(preset) => {
+                                self.recording_keys = false;
+                                self.record_msg = Some(format!("captured {preset:?} — switching"));
+                                intents.push(SettingsIntent::SwitchHotkey(preset));
+                            }
+                            Err(e) => {
+                                self.record_msg = Some(format!("not usable: {e:?}"));
                             }
                         }
                     }
@@ -311,7 +315,6 @@ impl SettingsWindow {
                 });
             });
         }); // end paint closure
-        self.gl.request_redraw();
         intents
     }
 }
@@ -329,7 +332,7 @@ impl SettingsWindow {
         ui.label(format!("Current: {:?}", vm.config.hotkey_preset));
         if ui
             .button(if *recording_keys {
-                "Press keys… (Esc aborts)"
+                "Cancel hotkey recording"
             } else {
                 "Record new hotkey…"
             })
@@ -506,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_accepts_presets_and_reserves_esc() {
+    fn recorder_accepts_presets_and_rejects_bare_escape() {
         assert_eq!(
             validate_hotkey(no_mods(), KeyCode::Fn),
             Ok(HotkeyPreset::Fn)
@@ -521,7 +524,7 @@ mod tests {
         );
         assert!(matches!(
             validate_hotkey(no_mods(), KeyCode::Escape),
-            Err(HotkeyError::Reserved(_))
+            Err(HotkeyError::SingleKey(KeyCode::Escape))
         ));
     }
 

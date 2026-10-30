@@ -144,10 +144,15 @@ pub enum CleanupRoute {
 /// stages are idempotent so re-running them changes nothing — see
 /// `test_deterministic_idempotent`).
 pub fn decide_route(stt_text: &str, cfg: &crate::core::config::Config) -> CleanupRoute {
+    let language = crate::core::correction::effective_language(cfg);
+    let a = if language == "auto" {
+        analyze_transcript(stt_text)
+    } else {
+        analyze_with_language(stt_text, language)
+    };
     if !cfg.cleanup_enabled {
-        return CleanupRoute::Direct(analyze_transcript(stt_text));
+        return CleanupRoute::Direct(a);
     }
-    let a = analyze_transcript(stt_text);
     if a.needs_llm {
         CleanupRoute::Llm(a)
     } else {
@@ -283,13 +288,11 @@ pub fn route_reason(cfg: &crate::core::config::Config, route: &CleanupRoute) -> 
 /// then). One lowercased copy serves all substring detectors; word-pair
 /// detectors use case-insensitive comparison without allocating.
 pub fn analyze_transcript(input: &str) -> CleanupAnalysis {
-    let text = if input.is_empty() {
-        String::new()
-    } else {
-        let stripped = crate::core::stt::strip_hallucination_tokens(input);
-        let processed = crate::core::stt::post_process(&stripped);
-        crate::core::stt::plus_to_symbol(&processed)
-    };
+    analyze_with_language(input, "auto")
+}
+
+fn analyze_with_language(input: &str, language: &str) -> CleanupAnalysis {
+    let text = crate::core::correction::deterministic_clean(input, language);
     let reasons = detect_reasons(input, &text);
     let needs_llm = reasons.filler
         || reasons.repetition
@@ -403,6 +406,27 @@ fn detect_reasons(raw_input: &str, text: &str) -> CleanupReasons {
     {
         r.self_correction = true;
     }
+    // Whole-word match so "no waiting" or "make it actually work" don't fire.
+    let padded = format!(
+        " {} ",
+        lower
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if [
+        " no wait ",
+        " wait no ",
+        " or rather ",
+        " actually make it ",
+        " actually make that ",
+    ]
+    .iter()
+    .any(|p| padded.contains(p))
+    {
+        r.self_correction = true;
+    }
     // Trailing filler / dangling correction.
     if matches!(last_core_lower.as_str(), "um" | "uh" | "eh" | "erm")
         || lower.ends_with("you know")
@@ -490,6 +514,12 @@ mod tests {
             ("HELLO WORLD MEETING", vec!["all_caps"]),
             ("wait what?? really", vec!["punct_runs"]),
             ("let's wrap up, so uh", vec!["abandoned"]),
+            ("let's use Postgres no wait MySQL", vec!["self_correction"]),
+            (
+                "call me tomorrow, actually make it Thursday",
+                vec!["self_correction"],
+            ),
+            ("there is no waiting list today", vec![]),
         ];
         for (input, want) in cases {
             let a = analyzed(input);
@@ -605,13 +635,10 @@ mod tests {
             }
             CleanupRoute::Direct(_) => panic!("self-correction must reach LLM"),
         }
-        // Disabled → direct passthrough of whatever STT produced.
+        // Disabled AI → direct deterministic correction, without any provider call.
         match decide_route("um the the thing", &off) {
             CleanupRoute::Direct(a) => {
-                assert_eq!(
-                    a.text,
-                    crate::core::baseline::deterministic_clean("um the the thing")
-                )
+                assert_eq!(a.text, "The thing")
             }
             CleanupRoute::Llm(_) => panic!("disabled cleanup must never route to LLM"),
         }
@@ -645,7 +672,7 @@ mod tests {
         );
         assert_eq!(
             route_reason(&on, &decide_route("um well the the thing", &on)),
-            "filler,repetition"
+            "already_clean"
         );
         assert_eq!(
             route_reason(&off, &decide_route("whatever", &off)),
@@ -846,7 +873,7 @@ mod tests {
             }
         }
         eprintln!("ROUTE direct={direct}/12 llm={llm}/12 (was 11/12 llm)");
-        assert_eq!((direct, llm), (9, 3));
+        assert_eq!((direct, llm), (11, 1));
     }
 
     #[test]

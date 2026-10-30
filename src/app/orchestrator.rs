@@ -252,9 +252,9 @@ impl<M: MediaController> Orchestrator<M> {
 
     fn handle_ptt_down(&mut self) -> Vec<Action> {
         if self.machine.on_down() == Admission::Accept {
-            // Freeze settings + context at STARTING time (H6/H24).
+            // Freeze settings at STARTING time (H6/H24).
             let config = crate::core::config::load_config();
-            let mut session = begin_session(&config, OsascriptContext);
+            let mut session = begin_session(&config);
             // Apply the session's toggle now (flag flip only — zero backend
             // touch). The media probe runs at LISTENING (R16, below), not
             // here: osascript-backed queries must never gate Control::Down.
@@ -779,13 +779,12 @@ mod tests {
 
     #[test]
     fn supervision_deadline_fires_without_worker_events() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Use a very short watchdog to avoid sleeping in the test.
-        std::env::set_var("WIFLOW_MAX_RECORDING_MS", "50");
-
         let mut orch = new_orchestrator();
         orch.handle(&evt_ptt_down());
         orch.handle(&evt_capture_started());
+        // Short watchdog set on the session itself: the env var is shared
+        // with session.rs tests running in parallel under a different lock.
+        orch.session.as_mut().unwrap().watchdog_ms = 50;
 
         // Set supervision time far in the past so the deadline has expired.
         orch.supervision_at = Some(Instant::now() - Duration::from_millis(200));
@@ -803,9 +802,6 @@ mod tests {
             is_notify(&actions),
             "supervision expiry must produce a notification"
         );
-
-        // Cleanup
-        std::env::remove_var("WIFLOW_MAX_RECORDING_MS");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! configurations — instead of two copies of the spike pattern.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
@@ -34,12 +35,14 @@ pub struct GlWindowOpts<'a> {
 
 /// One egui-painted window on the shared event loop.
 pub struct GlWindow {
-    pub window: Window,
+    pub window: Arc<Window>,
     surface: glutin::surface::Surface<WindowSurface>,
     context: PossiblyCurrentContext,
     painter: egui_glow::Painter,
     pub egui_ctx: egui::Context,
     pub egui_state: egui_winit::State,
+    repaint_at: Option<Instant>,
+    surface_size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl GlWindow {
@@ -101,12 +104,14 @@ impl GlWindow {
         );
         window.set_visible(false);
         Ok(Self {
-            window,
+            surface_size: window.inner_size(),
+            window: Arc::new(window),
             surface,
             context,
             painter,
             egui_ctx,
             egui_state,
+            repaint_at: None,
         })
     }
 
@@ -118,6 +123,7 @@ impl GlWindow {
     /// non-activating before its first show) — creation never shows.
     pub fn show(&self) {
         self.window.set_visible(true);
+        self.window.request_redraw();
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -130,27 +136,139 @@ impl GlWindow {
 
     /// Feed a winit event to egui. Returns true when egui wants a repaint.
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
-        self.egui_state.on_window_event(&self.window, event).repaint
+        let resized = matches!(
+            event,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+        );
+        // Resize on the following paint, after selecting this GL context.
+        let repaint = self.egui_state.on_window_event(&self.window, event).repaint;
+        redraw_for_event(event, repaint || resized)
+    }
+
+    /// Consume a due repaint once; idle egui output has no deadline.
+    pub fn repaint_deadline(&mut self, now: Instant) -> Option<Instant> {
+        if self.repaint_at.is_some_and(|deadline| deadline <= now) {
+            self.repaint_at = None;
+            self.window.request_redraw();
+        }
+        self.repaint_at
     }
 
     /// Run one egui frame (`ui` draws) + swap. No redraw requested here —
     /// the caller decides (continuous while a pill is visible, on-demand
     /// for settings).
     pub fn paint(&mut self, ui: impl FnMut(&egui::Context)) {
+        self.repaint_at = None;
+        let dims = self.window.inner_size();
+        if dims.width == 0 || dims.height == 0 {
+            return;
+        }
+        // Settings and the recording pill have separate GL contexts.
+        // Select this window's context before resizing or painting it.
+        if let Err(e) = self.context.make_current(&self.surface) {
+            tracing::warn!("make GL context current: {e}");
+            return;
+        }
+        if dims != self.surface_size {
+            self.window.resize_surface(&self.surface, &self.context);
+            self.surface_size = dims;
+        }
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let output = self.egui_ctx.run(raw_input, ui);
+        let delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |viewport| viewport.repaint_delay);
+        self.repaint_at = deadline_after(Instant::now(), delay);
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         let clipped = self
             .egui_ctx
             .tessellate(output.shapes, output.pixels_per_point);
-        let dims = self.window.inner_size();
         self.painter.paint_and_update_textures(
             [dims.width, dims.height],
             output.pixels_per_point,
             &clipped,
             &output.textures_delta,
         );
-        self.surface.swap_buffers(&self.context).unwrap();
+        if let Err(e) = self.surface.swap_buffers(&self.context) {
+            tracing::warn!("swap GL buffers: {e}");
+        }
+    }
+}
+
+fn deadline_after(now: Instant, delay: Duration) -> Option<Instant> {
+    if delay == Duration::MAX {
+        None
+    } else {
+        now.checked_add(delay)
+    }
+}
+
+fn redraw_for_event(event: &WindowEvent, repaint: bool) -> bool {
+    // egui-winit marks RedrawRequested as needing repaint. The App already
+    // paints that event; queuing another here creates an endless redraw loop.
+    repaint && !matches!(event, WindowEvent::RedrawRequested)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redraw_event_does_not_queue_itself_again() {
+        assert!(!redraw_for_event(&WindowEvent::RedrawRequested, true));
+        assert!(redraw_for_event(
+            &WindowEvent::Resized(winit::dpi::PhysicalSize::new(800, 600)),
+            true
+        ));
+        assert!(!redraw_for_event(&WindowEvent::Focused(false), false));
+    }
+
+    #[test]
+    fn idle_egui_stops_scheduling_frames() {
+        let ctx = egui::Context::default();
+        let mut deadline = Some(Instant::now());
+        // Egui can request settling frames after its first layout.
+        for _ in 0..10 {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Settings");
+                });
+            });
+            deadline = deadline_after(
+                Instant::now(),
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            );
+            if deadline.is_none() {
+                break;
+            }
+        }
+        assert!(
+            deadline.is_none(),
+            "idle settings must let the event loop sleep"
+        );
+    }
+
+    #[test]
+    fn egui_delayed_repaint_preserves_its_deadline() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        let delay = Duration::from_millis(500);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.request_repaint_after(delay)
+        });
+        let now = Instant::now();
+        // Egui subtracts its predicted next-frame time from the requested
+        // delay. Preserve that adjusted deadline instead of repainting now.
+        let scheduled = deadline_after(
+            now,
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        )
+        .unwrap();
+        assert!(scheduled > now + Duration::from_millis(450));
+        assert!(scheduled <= now + delay);
     }
 }

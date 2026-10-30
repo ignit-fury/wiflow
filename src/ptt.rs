@@ -73,12 +73,12 @@ impl PttMachine {
         }
     }
 
-    /// Esc: Listening|Starting → Cancelled (clears any remembered release).
+    /// Internal cancel: Listening|Starting → Cancelled (clears any remembered release).
     pub fn on_cancel(&mut self) -> Admission {
         match self.phase {
             Phase::Listening | Phase::Starting => {
                 self.pending_up = false;
-                self.set(Phase::Cancelled, "Esc")
+                self.set(Phase::Cancelled, "Cancel")
             }
             _ => Admission::Ignore,
         }
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(m.phase(), Phase::Idle);
     }
 
-    /// Down (pending capture) → Esc → Failed → finalized → Idle.
+    /// Down (pending capture) → Cancel → Failed → finalized → Idle.
     #[test]
     fn test_down_cancel_cycle() {
         let mut m = PttMachine::new();
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(m.phase(), Phase::Idle);
     }
 
-    /// Esc while Idle/Processing is ignored.
+    /// Cancel while Idle/Processing is ignored.
     #[test]
     fn test_cancel_outside_recording_ignored() {
         let mut m = PttMachine::new();

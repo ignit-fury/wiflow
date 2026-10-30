@@ -1,15 +1,18 @@
-# Tasks — Dictation App (phase 1 complete: audio + hotkey prototype working)
+# Tasks — Wiflow Dictation
 
-> Phase 1 built 2026-09-30 after user approval. Phase 2+ needs approval per phase.
+> Current status (2026-10-06): implementation through S0–S5 is complete.
+> Reliability follow-up adds isolated key tests, SHA-256 model verification,
+> and a 60-second acoustic regression. Live user acceptance remains pending.
+> Earlier phase sections retain historical results; current setup is in README.md.
 
-## Phase 0 — Docs (current)
+## Phase 0 — Docs (complete)
 - [x] `prd.md` — scope, push-to-talk, $0 rule
 - [x] `architecture.md` — pipeline + crates + layout
 - [x] `rules.md` — cost/privacy/quality gates
 - [x] `design.md` — A locked, B/C deferred
 - [x] `task.md` — this file
 - [x] `memory.md` — decisions log
-- [ ] User reviews 6 docs, locks default hotkey + default model choice
+- [x] Default hotkey/model locked: Ctrl+Space and base.en (see Phase 3/5 records)
 - [x] Commit docs to git
 
 ## Phase 1 — Audio + Hotkey prototype (complete 2026-09-30)
@@ -55,7 +58,7 @@
   - [x] `dump_wav` dogfoods `audio::f32_to_i16`
   - [x] `--model` override `verify_model`-warns before load (SHA256 pin deferred)
   - [x] RTF denominator → kept-audio duration (`kept_ms` from 16k kept len)
-  - [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances) — still set, deferred to pre-ship
+  - [x] Revisit `set_single_segment(true)` — standard multi-segment output + 60-second acoustic regression, 2026-10-06; live watchdog check remains pending
   - [ ] Log `raw N → 16k M → kept K` (current `kept/total` log mixes rates) — cosmetic, deferred
   - [ ] User-session spoken validation (sandbox mic silent; TTS substitute only so far)
 - [x] `inject.rs`: clipboard save → set text → Cmd+V via `enigo` → restore (Task 2: real round-trip in GUI session; Task 4 wired into Transcribe arm with empty-skip + clipboard fallback + warn; `--no-inject` flag for headless/CI)
@@ -84,12 +87,12 @@
 - [x] DMG: `target/Wiflow-0.1.0-arm64.dmg` 2,111,080 bytes (2.0 MB), `hdiutil verify` VALID; bundle `target/Wiflow.app` 4.1 MB ad-hoc signed (Signature=adhoc, Identifier=com.wiflow.dictation); bundle `--app` runs: tray built, both hotkeys registered, no panic; first-run model download via `ensure_model` (base.en 147,964,211 bytes, size-gated)
 
 ## v1.1 (tracked deferred — do not start without approval)
-- [ ] Recording pill overlay window (tray icon + tooltip carry the indicator in v1)
-- [ ] Settings window (v1 uses menu submenus + config.json)
-- [ ] Rich toasts (v1 uses tooltip + tracing logs)
-- [ ] Revisit `set_single_segment(true)` before 60s holds ship (may truncate long utterances)
+- [x] Recording pill overlay window — delivered in S4
+- [x] Settings window — delivered in S4
+- [x] Notification Center banners — delivered in S4
+- [x] Long-audio transcription: multi-segment output + synthetic 60-second regression (2026-10-06)
 - [ ] `dirs`-crate path centralization (HOME fallback accepted for v1)
-- [ ] SHA256 model pin (size gate only in v1)
+- [x] SHA-256 model pins for tiny/base/small, revision-pinned URLs, resumable partial files, verified atomic install (2026-10-06)
 - [ ] Layout-aware paste (Dvorak/IME-aware injection)
 - [x] Exit crashes fixed (2026-10-01, commit 15e26fe): two root causes from crash reports + on-demand repro — (1) enigo `key()` on worker thread tripped HIToolbox main-queue assert (`dispatch_assert_queue_fail` → SIGTRAP); inject now runs in the winit `user_event` Done handler (main thread), live-verified (inject Ok + app alive). (2) leaked WhisperContext (static) kept ggml residency-set entries; whisper.cpp C++ static device destructor aborted (SIGABRT) at exit; `stt::shutdown()` drops the ctx before every normal exit path, test-verified (leak + shutdown → exit 0). Rejected-TTS note: mic can't hear `say` output on this machine — the repro used synthetic tone via test.
 - [x] Trace-trap crash user-reported in `--app` runs — same two root causes as above, both fixed
@@ -117,7 +120,7 @@
 - [x] egui 0.31 + egui-winit 0.31 + egui_glow 0.31 + glutin 0.32 resolve and compile on rustc 1.95 (`examples/egui_spike.rs` builds warning-free)
 - [x] Runtime proven: spike window renders egui frames error-free for 9s (GL context + painter + event input all live)
 - [x] (a)/(c) by API: `ActiveEventLoop::create_window` available in `user_event`; `Window::set_visible` covers show/hide
-- [ ] CONDITION (user decision required): adopting egui needs MSRV 1.75 → 1.81 (egui 0.31 floor). Confirm before Tasks 14-16 move deps to [dependencies].
+- [x] MSRV raised to 1.81 for egui 0.31; user confirmation recorded under S4 below
 
 ## Architecture Alignment S0–S5 (complete 2026-10-04, branch `arch-alignment`)
 - [x] S0 housekeeping commit (PTT lifecycle work)
@@ -147,3 +150,43 @@
 - [ ] Transcription banner appears with Focus/DND off
 - [ ] Settings click-through: record hotkey, change mic, Save, reopen, Test-record
 - [ ] Spinner animation eyeballed during a long transcription
+
+## Reliability follow-up — 2026-10-06
+
+- [x] API-key resolution test uses temporary files and explicit environment values; no real credentials or process environment mutations
+- [x] SHA-256 verification rejects same-sized corruption; download tests cover interrupted/resumed files, invalid partials, atomic install, and existing valid models
+- [x] 60-second base.en CPU regression recognizes speech at 2, 33, and 51 seconds
+- [x] README, reproducible speech-fixture generator, CLI startup guidance, and stale checkbox reconciliation
+- [ ] Live app/microphone/watchdog acceptance: use docs/manual-validation.md; synthetic success does not waive it
+
+## Esc removal — 2026-10-06
+
+- [x] User re-locked Esc as unassigned; supersedes historical Esc-cancel acceptance notes
+- [x] Removed global Esc registration, cancel forwarding, and device-event fallback
+- [x] Settings ignores Esc; the recorder button cancels hotkey recording
+- [x] Regression check: Esc press/release never enters the push-to-talk bridge
+- [ ] Live validation after restarting the rebuilt app: Esc leaves idle/recording/settings unaffected
+
+## Settings redraw and resize — 2026-10-06
+
+- [x] Removed unconditional repaint from settings frames and prevented RedrawRequested from queuing itself
+- [x] Honor egui's delayed repaint output through the shared event-loop deadline
+- [x] Wake Settings when the background mic probe completes; request repaint after App-owned view changes
+- [x] Resize GL surface on physical-size changes, select the correct window context, skip zero-sized rendering
+- [x] Headless regression checks for idle settling, timed repaints, and redraw-event feedback
+- [ ] Live resize/minimize/display-scaling and idle responsiveness checks: docs/manual-validation.md
+# Sentence and word corrections
+
+- [x] Share deterministic corrections across local/cloud transcription.
+- [x] Add optional language-scoped whole-word dictionary without cascades.
+- [x] Preserve technical spans and validate AI output with local fallback.
+- [x] Bound cleanup provider retries with one shared request budget.
+- [x] Add preservation, dictionary, routing, and fallback regressions.
+- [ ] Validate personal recordings and live focused-app paste manually.
+# Reported technical-term recognition (2026-10-20)
+
+- [x] Trace “postfix calculation” → “To fix the calculation” against local settings and session routes.
+- [x] Check confirmed recognition vocabulary on synthetic technical and ordinary speech.
+- [x] Add local recognition hint without forced word replacement.
+- [x] Add optional acoustic regressions covering the technical term, VAD/cleanup, and ordinary phrase.
+- [ ] Confirm the user's own voice now preserves “postfix calculation”.
