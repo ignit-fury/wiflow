@@ -705,6 +705,9 @@ impl DaemonApp {
                 }
             }
             I::OpenMicSettings => crate::core::config::permissions::open_mic_settings(),
+            I::OpenInputMonitoringSettings => {
+                crate::core::config::permissions::open_input_monitoring_settings()
+            }
             I::OpenAccessibilitySettings => {
                 crate::core::config::permissions::open_accessibility_settings()
             }
@@ -760,6 +763,7 @@ impl DaemonApp {
             color: [r, g, b],
             test_status: self.test_record_result.lock().unwrap().clone(),
             accessibility_ok: crate::platform::macos::accessibility_trusted(),
+            input_monitoring_ok: crate::platform::macos::input_monitoring_granted(),
         }
     }
 
@@ -1369,6 +1373,12 @@ fn app_main(
     let (manager, ptt_hotkey, won, tap) = if is_bare {
         // Bare-modifier presets ride a listen-only CGEventTap (raw
         // flagsChanged) — RegisterEventHotKey cannot see them.
+        // Without Input Monitoring the tap is created but macOS only feeds
+        // it while Wiflow is frontmost: ask up front (prompt shows once).
+        if !crate::platform::macos::input_monitoring_granted() {
+            tracing::warn!("input monitoring not granted — requesting");
+            crate::platform::macos::request_input_monitoring();
+        }
         match crate::platform::macos::tap::spawn(config.hotkey_preset, proxy.clone()) {
             Ok(t) => {
                 let manager = global_hotkey::GlobalHotKeyManager::new().unwrap_or_else(|e| {

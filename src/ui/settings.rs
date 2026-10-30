@@ -123,6 +123,7 @@ pub enum SettingsIntent {
     /// Open System Settings panels (existing menu paths).
     OpenMicSettings,
     OpenAccessibilitySettings,
+    OpenInputMonitoringSettings,
 }
 
 // ── Window (winit + egui, lives on the existing event loop) ─────────────────
@@ -155,6 +156,8 @@ pub struct LiveStatus {
     pub test_status: Option<String>,
     /// Accessibility permission granted (needed to paste).
     pub accessibility_ok: bool,
+    /// Input Monitoring granted (the hotkey works in every app).
+    pub input_monitoring_ok: bool,
 }
 
 /// Dictation count, total words, average processing time (ms).
@@ -436,13 +439,22 @@ impl SettingsWindow {
                 .circle_filled(rect.center(), 8.0, egui::Color32::from_rgb(r, g, b));
             ui.label(egui::RichText::new(&live.headline).size(20.0).strong());
         });
-        if !live.accessibility_ok {
+        for (ok, msg) in [
+            (
+                live.input_monitoring_ok,
+                "Input Monitoring is off — the hotkey only works while Wiflow is in front.",
+            ),
+            (
+                live.accessibility_ok,
+                "Accessibility is off — Wiflow can't paste text.",
+            ),
+        ] {
+            if ok {
+                continue;
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 150, 0),
-                    "Accessibility is off — Wiflow can't paste text.",
-                );
+                ui.colored_label(egui::Color32::from_rgb(230, 150, 0), msg);
                 if ui.button("Fix in Permissions").clicked() {
                     *tab = Tab::Permissions;
                 }
@@ -551,18 +563,41 @@ impl SettingsWindow {
             ui.label(format!("Mic test: {status}"));
         }
         ui.add_space(12.0);
-        ui.label(egui::RichText::new("2. Accessibility").strong());
-        ui.label("Needed to paste text into the app you're typing in.");
-        ui.horizontal(|ui| {
-            if live.accessibility_ok {
-                ui.colored_label(egui::Color32::from_rgb(60, 180, 90), "✔ granted");
-            } else {
-                ui.colored_label(egui::Color32::from_rgb(230, 150, 0), "not granted");
-            }
-            if ui.button("Open Accessibility settings…").clicked() {
-                intents.push(SettingsIntent::OpenAccessibilitySettings);
-            }
-        });
+        let rows = [
+            (
+                "2. Input Monitoring",
+                "Needed to hear your hotkey while you work in other apps.",
+                live.input_monitoring_ok,
+                "Open Input Monitoring settings…",
+                SettingsIntent::OpenInputMonitoringSettings,
+            ),
+            (
+                "3. Accessibility",
+                "Needed to paste text into the app you're typing in.",
+                live.accessibility_ok,
+                "Open Accessibility settings…",
+                SettingsIntent::OpenAccessibilitySettings,
+            ),
+        ];
+        for (title, why, ok, button, intent) in rows {
+            ui.label(egui::RichText::new(title).strong());
+            ui.label(why);
+            ui.horizontal(|ui| {
+                if ok {
+                    ui.colored_label(egui::Color32::from_rgb(60, 180, 90), "✔ granted");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(230, 150, 0), "not granted");
+                }
+                if ui.button(button).clicked() {
+                    intents.push(intent);
+                }
+            });
+            ui.add_space(12.0);
+        }
+        ui.small(
+            "After turning a switch on, quit Wiflow from the menu bar and open it again. \
+             A rebuilt Wiflow.app counts as a new app, so grant these again after a rebuild.",
+        );
     }
 
     fn hotkey_panel(
