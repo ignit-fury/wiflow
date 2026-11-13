@@ -89,6 +89,8 @@ pub enum DaemonEvent {
     /// Cleanup-chain alert (rate-limit exhausted, missing Ollama model):
     /// surfaced as the tray warn-note so the user can act on it.
     CleanupIssue(String),
+    /// Wiflow was launched again while running: show the main window.
+    OpenWindow,
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.
@@ -424,6 +426,7 @@ fn worker_on_control_down<S: DaemonEventSender>(
             let live = crate::core::config::load_config();
             duck.set_enabled(live.duck_audio);
             crate::core::cleanup::wake_ollama_if_idle(&live);
+            crate::core::traits::wake_stt_if_idle(&live);
             let mic = live.mic_name;
             match crate::core::audio::AudioCapture::start(mic) {
                 Ok(cap) => {

@@ -197,6 +197,17 @@ impl GlWindow {
     }
 }
 
+impl Drop for GlWindow {
+    /// Free the painter's GPU objects (shaders, textures, buffers): they
+    /// leaked on every window close before this.
+    fn drop(&mut self) {
+        // destroy() issues GL calls, which need this window's context.
+        if self.context.make_current(&self.surface).is_ok() {
+            self.painter.destroy();
+        }
+    }
+}
+
 fn deadline_after(now: Instant, delay: Duration) -> Option<Instant> {
     if delay == Duration::MAX {
         None
