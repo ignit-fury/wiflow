@@ -9,7 +9,7 @@ name = "wiflow-dictation"
 path = "src/main.rs"
 
 [dependencies]
-cpal = "0.15"
+cpal = "0.16"
 ringbuf = "0.4"
 ring = "0.17"
 hound = "3.5"
