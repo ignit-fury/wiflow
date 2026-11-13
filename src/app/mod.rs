@@ -1,4 +1,5 @@
 pub mod headless;
+mod instance;
 pub mod orchestrator;
 pub mod session;
 
@@ -26,6 +27,7 @@ fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
         DaemonEvent::Done { .. } => "Done",
         DaemonEvent::Failed { .. } => "Failed",
         DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
+        DaemonEvent::OpenWindow => "OpenWindow",
     }
 }
 
@@ -1095,6 +1097,15 @@ impl DaemonApp {
 impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
+    /// Quit from the Dock, Cmd+Q or logout (AppKit terminate). Same cleanup
+    /// as the menu Quit: without `stt::shutdown` the Metal device destructor
+    /// aborts the process on exit (SIGABRT crash reports 2026-11-12).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        tracing::info!("quit via system (Dock, Cmd+Q or logout)");
+        let _ = self.orchestrator.handle_shutdown();
+        crate::core::stt::shutdown();
+    }
+
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
@@ -1148,6 +1159,11 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DaemonEvent) {
+        if matches!(event, DaemonEvent::OpenWindow) {
+            // Opened in about_to_wait, which runs right after this.
+            self.open_settings_requested = true;
+            return;
+        }
         let before = self.orchestrator.phase();
         let actions = self.orchestrator.handle(&event);
         if actions.is_empty() {
@@ -1466,9 +1482,9 @@ fn app_main(
         let warm_cfg = config.clone();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            match crate::core::traits::local_model_path(&warm_cfg).and_then(|path| {
-                crate::core::stt::transcribe_shared(&path, &[], "", &warm_cfg.stt_language)
-            }) {
+            match crate::core::traits::local_model_path(&warm_cfg)
+                .and_then(|path| crate::core::stt::warm(&path, &warm_cfg.stt_language))
+            {
                 Ok(_) => tracing::info!("whisper warm in {}ms", t0.elapsed().as_millis()),
                 Err(e) => tracing::warn!("whisper warm-up failed: {e}"),
             }
@@ -1531,11 +1547,23 @@ fn app_main(
 
 /// `open_window`: show the main window at start (Finder/Dock launch);
 /// `--app` (login item, scripts) starts in the menu bar only.
+fn instance_socket() -> std::path::PathBuf {
+    crate::core::config::app_support_dir().join("wiflow.sock")
+}
+
 pub fn run(initial: Config, open_window: bool) -> ! {
+    if instance::already_running(&instance_socket()) {
+        println!("Wiflow is already running — showing its window.");
+        std::process::exit(0);
+    }
     let event_loop = EventLoop::<DaemonEvent>::with_user_event()
         .build()
         .expect("winit event loop");
     let proxy = event_loop.create_proxy();
+    let launch_proxy = proxy.clone();
+    instance::listen(&instance_socket(), move || {
+        let _ = launch_proxy.send_event(DaemonEvent::OpenWindow);
+    });
     app_main(event_loop, proxy, initial, open_window)
 }
 

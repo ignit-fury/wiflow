@@ -317,4 +317,74 @@ mod tests {
             assert_eq!(super::recording_rms(), v, "bits round-trip {v}");
         }
     }
+
+    /// Hardware check (needs a mic): a capture on a mic chosen BY NAME must
+    /// release the device on stop. cpal 0.15 kept named-device streams alive
+    /// through a reference cycle, so the mic stayed on (orange dot) and kept
+    /// recording after every hold. Run: cargo test named_mic -- --ignored
+    #[test]
+    #[ignore]
+    fn named_mic_is_released_after_stop() {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let device = host.default_input_device().expect("a mic");
+        let name = device.name().expect("mic name");
+        let id = default_input_id();
+        assert!(!device_running(id), "close other apps using the mic first");
+        let cap = AudioCapture::start(Some(name)).expect("start named mic");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(device_running(id), "mic runs while recording");
+        let _ = cap.stop();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!device_running(id), "mic must be released after stop");
+    }
+
+    #[repr(C)]
+    struct Address {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioObjectGetPropertyData(
+            object: u32,
+            address: *const Address,
+            qualifier_size: u32,
+            qualifier: *const std::ffi::c_void,
+            size: *mut u32,
+            data: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    fn get_u32(object: u32, selector: &[u8; 4]) -> u32 {
+        let address = Address {
+            selector: u32::from_be_bytes(*selector),
+            scope: u32::from_be_bytes(*b"glob"),
+            element: 0,
+        };
+        let mut value = 0u32;
+        let mut size = 4u32;
+        // SAFETY: a u32 out-param sized 4 bytes, as CoreAudio expects.
+        unsafe {
+            AudioObjectGetPropertyData(
+                object,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                (&mut value as *mut u32).cast(),
+            );
+        }
+        value
+    }
+
+    fn default_input_id() -> u32 {
+        get_u32(1, b"dIn ") // kAudioObjectSystemObject, kAudioHardwarePropertyDefaultInputDevice
+    }
+
+    fn device_running(id: u32) -> bool {
+        get_u32(id, b"gone") != 0 // kAudioDevicePropertyDeviceIsRunningSomewhere
+    }
 }

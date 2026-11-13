@@ -46,6 +46,24 @@ pub fn local_model_path(cfg: &Config) -> Result<std::path::PathBuf, String> {
     })
 }
 
+/// On key press: after a break, warm the local Whisper model in the
+/// background while the user is still speaking.
+pub fn wake_stt_if_idle(cfg: &Config) {
+    if cfg.stt_provider == "groq" || !crate::core::stt::idle() {
+        return;
+    }
+    let cfg = cfg.clone();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        match local_model_path(&cfg)
+            .and_then(|path| crate::core::stt::warm(&path, &cfg.stt_language))
+        {
+            Ok(()) => tracing::info!("whisper woken after idle in {}ms", t0.elapsed().as_millis()),
+            Err(e) => tracing::warn!("whisper wake failed: {e}"),
+        }
+    });
+}
+
 /// Production: Groq cloud (opt-in) → local whisper fallback.
 pub struct RouterRecognizer;
 
