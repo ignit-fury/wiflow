@@ -4,6 +4,7 @@ pub mod inject;
 pub mod media;
 pub mod panel;
 pub mod secure;
+pub mod selection;
 pub mod tap;
 
 #[link(name = "ApplicationServices", kind = "framework")]

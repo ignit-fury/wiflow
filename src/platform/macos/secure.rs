@@ -40,6 +40,8 @@ unsafe extern "C" {
         external: u8,
     ) -> CFTypeRef;
     fn CFStringGetCString(s: CFTypeRef, buf: *mut u8, size: isize, encoding: u32) -> u8;
+    fn CFStringGetLength(s: CFTypeRef) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
     fn CFGetTypeID(cf: CFTypeRef) -> usize;
     fn CFStringGetTypeID() -> usize;
     fn CFRelease(cf: CFTypeRef);
@@ -102,18 +104,53 @@ unsafe fn copy_attribute(element: CFTypeRef, name: &str) -> Option<CFTypeRef> {
     (err == AX_OK && !value.is_null()).then_some(value)
 }
 
+/// UTF-8 contents of a CFString of any length (None when not a string).
+unsafe fn cf_string_to_rust(value: CFTypeRef) -> Option<String> {
+    if CFGetTypeID(value) != CFStringGetTypeID() {
+        return None;
+    }
+    let len = CFStringGetLength(value);
+    if len == 0 {
+        return Some(String::new());
+    }
+    let max = CFStringGetMaximumSizeForEncoding(len, UTF8);
+    if max < 0 {
+        return None;
+    }
+    let cap = max + 1; // room for the NUL
+    let mut buf = vec![0u8; cap as usize];
+    if CFStringGetCString(value, buf.as_mut_ptr(), cap, UTF8) == 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 unsafe fn copy_string_attribute(element: CFTypeRef, name: &str) -> Option<String> {
     let value = copy_attribute(element, name)?;
-    let mut out = None;
-    if CFGetTypeID(value) == CFStringGetTypeID() {
-        let mut buf = [0u8; 128];
-        if CFStringGetCString(value, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0 {
-            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            out = Some(String::from_utf8_lossy(&buf[..end]).into_owned());
-        }
-    }
+    let out = cf_string_to_rust(value);
     CFRelease(value);
     out
+}
+
+/// String value of `attribute` on the focused UI element (None when
+/// Accessibility cannot tell or the element has no such string).
+pub(super) fn focused_string_attribute(attribute: &str) -> Option<String> {
+    // SAFETY: every CF object created or copied here is released once.
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return None;
+        }
+        // A hung target app must not stall the edit.
+        AXUIElementSetMessagingTimeout(system, 0.25);
+        let focused = copy_attribute(system, "AXFocusedUIElement");
+        CFRelease(system);
+        let focused = focused?;
+        let value = copy_string_attribute(focused, attribute);
+        CFRelease(focused);
+        value
+    }
 }
 
 #[cfg(test)]
@@ -129,5 +166,17 @@ mod tests {
         );
         assert!(should_block(None, true), "unknown element, secure input on");
         assert!(!should_block(None, false));
+    }
+
+    #[test]
+    fn long_strings_are_read_in_full() {
+        // 10,000 bytes of UTF-8: far past the old 128-byte buffer.
+        let long = "é".repeat(5000);
+        // SAFETY: the CFString is created and released inside this test.
+        unsafe {
+            let cf = super::cf_string(&long);
+            assert_eq!(super::cf_string_to_rust(cf).as_deref(), Some(long.as_str()));
+            super::CFRelease(cf);
+        }
     }
 }
