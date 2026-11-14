@@ -28,9 +28,10 @@ permissions, restart Wiflow if macOS still blocks recording or hotkeys.
 **Edit selected text by voice:** select text in any app, hold the push-to-talk
 key (Right Option or Fn) together with Shift and say what to change: "make it
 shorter", "fix the grammar", "translate to Spanish". The selection is replaced;
-Cmd+Z undoes it. It uses your AI cleanup provider (Ollama by default), so AI
-cleanup must be on. Selections up to about 250 words. In editors that copy the
-whole line when nothing is selected (VS Code), select the text first.
+Cmd+Z undoes it. It uses your AI cleanup provider (with the default `auto`, Groq or
+OpenRouter whenever a key exists, and then the selected text is sent to that
+cloud provider; otherwise Ollama), so AI cleanup must be on. Selections up to
+about 250 words. Not for terminals.
 
 The default hotkey is Ctrl+Space. Fn and Right Option are also available.
 For Fn, set System Settings → Keyboard → “Press 🌐 key to” to “Do Nothing”.

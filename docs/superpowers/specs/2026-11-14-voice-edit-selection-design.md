@@ -1,7 +1,7 @@
 # Voice-edit selected text — design
 
 Date: 2026-11-14
-Status: draft, awaiting review
+Status: implemented
 
 ## Goal
 
@@ -48,18 +48,18 @@ already exists, not longer dictation.
 
 | Piece | Change |
 |---|---|
-| `src/platform/macos/tap.rs` | While the PTT key is down, record whether Shift is down. Pure helper `edit_mode(flags)`, unit-tested. |
-| `src/platform/macos/selection.rs` (new) | `selected_text() -> Option<String>`: read `AXSelectedText` of the focused element; fall back to Cmd+C and restore the clipboard. Returns `None` in a password field (reuses `password_field_focused`). |
-| `src/core/edit.rs` (new) | `build_edit_prompt`, `check_result`, `edit_text`. |
-| `src/daemon.rs` | In `pipeline_on_worker`, branch on edit mode: read selection in a thread while STT runs, skip cleanup for the instruction, call `edit_text`. |
-| `src/core/cleanup.rs` | `CleanupBudget` gains a constructor taking a duration; the Ollama request timeout and token cap become parameters. Normal dictation keeps the 2 s budget and 1.5 s Ollama timeout. Edits use about 8 s. The edit path calls the configured provider (auto: first with a key, else Ollama); there is no fallback chain, so a failed edit leaves the text alone. |
+| `src/platform/macos/tap.rs` | While the PTT key is down, record whether Shift is down. Pure helpers `shift_with_ptt` and `edit_flag_after` (unit-tested); the worker reads and clears the flag with `take_edit_held()`. |
+| `src/platform/macos/selection.rs` (new) | `selected_text() -> Option<String>`: read `AXSelectedText` of the focused element; the AX answer is final when present (even empty), and Cmd+C (clipboard restored) runs only when AX has no answer. Returns `None` in a password field. `selected_text_ax()` is the AX-only read used to re-check the selection before pasting. |
+| `src/core/edit.rs` (new) | `build_user_message`, `check_request`, `check_result`, `run`. |
+| `src/daemon.rs` | In `pipeline_on_worker`, take the edit flag before stopping the capture; when AI cleanup is on, read the selection in a thread while STT runs; `finish_edit` (generic over `DaemonEventSender`) skips cleanup for the instruction, calls `edit::run`, and, if AX can still read the selection and it differs from the edited text, sends a notice instead of pasting. |
+| `src/core/cleanup.rs` | `CleanupBudget` carries the Ollama timeout, stop list and token cap; `CleanupBudget::for_edit()` gives about 8 s, no stop list and a fixed 400-token cap, while dictation keeps the 2 s budget, 1.5 s Ollama timeout, its stop list and `ollama_token_cap(prompt)`. `edit_chat` calls the provider chosen by `edit_provider` (auto: first with a key, else Ollama); there is no fallback chain, so a failed edit leaves the text alone. |
 | `DaemonEvent::Notice` | User-facing worker message shown as a native notification, no state change. |
 | Docs | README usage line, `memory.md` decision entry. `rules.md` §5 needs no change: still push-to-talk only, mic indicator unchanged. |
 
 ## Result checks (`check_result`)
 
 - Strip wrappers such as "Here is the edited text:" and surrounding quotes,
-  reusing `sanitize_llm_response`.
+  with its own wrapper-stripping (not `sanitize_llm_response`).
 - Reject an empty result.
 - Reject a result more than 6x the selection length when that exceeds 200
   characters (a runaway or chatty answer). "Make it longer" and bullets stay
@@ -84,8 +84,8 @@ notification.
 
 ## Testing
 
-- **Unit:** `edit_mode` flag detection, prompt building, `check_result` cases
-  (wrapper, empty, runaway, normal), the `CleanupBudget` duration constructor.
+- **Unit:** `shift_with_ptt` / `edit_flag_after` flag detection, prompt building, `check_result` cases
+  (wrapper, empty, runaway, normal), `CleanupBudget::for_edit` options, `finish_edit` with a fake event sender, and the AX-final `pick` in selection.
 - **Provider choice:** pure `edit_provider` test; the HTTP path is covered by
   the live check (no fake-model infrastructure exists, and cargo test must not
   call real models).
@@ -113,5 +113,6 @@ notification.
   less reliable for complex instructions. The provider chain lets users point
   edits at a larger model.
 - Edits are not saved to history.
-- Editors that copy the whole line when nothing is selected (VS Code) will
-  edit and paste that line at the cursor; Cmd+Z undoes it.
+- With a native AX answer of "nothing selected" no Cmd+C is sent, so code editors no longer edit the current line; Electron apps without AX still use Cmd+C.
+- Terminals are unsupported: AX returns a stale scrollback selection there.
+- With `auto`, the selected text goes to Groq/OpenRouter when a key exists.
