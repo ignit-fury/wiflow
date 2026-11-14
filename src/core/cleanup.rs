@@ -602,7 +602,6 @@ fn edit_provider(provider: &str, has_groq: bool, has_openrouter: bool) -> Provid
 
 /// One edit request to the configured provider. No fallback chain: a failed
 /// edit leaves the user's text alone and says why.
-#[allow(dead_code)] // consumed by core::edit, wired in Task 4
 pub fn edit_chat(
     system: &str,
     user: &str,

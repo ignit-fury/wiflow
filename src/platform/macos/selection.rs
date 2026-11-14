@@ -36,7 +36,6 @@ const HOLD_KEYS: u64 = 0x0002_0000 | 0x0008_0000 | 0x0080_0000;
 /// field is a password field, or no method could read it. Blocks (waits for
 /// the PTT keys to be released and for the copy), so call it from a worker
 /// thread.
-#[allow(dead_code)] // used by the worker from Task 4
 pub fn selected_text() -> Option<String> {
     if super::secure::password_field_focused() {
         return None;

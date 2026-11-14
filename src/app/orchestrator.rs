@@ -122,6 +122,7 @@ impl<M: MediaController> Orchestrator<M> {
             DaemonEvent::CleanupIssue(msg) => self.handle_cleanup_issue(msg),
             // App-shell concern, never reaches the dictation lifecycle.
             DaemonEvent::OpenWindow => Vec::new(),
+            DaemonEvent::Notice(_) => Vec::new(),
         }
     }
 
@@ -1001,6 +1002,15 @@ mod tests {
         orch.handle(&evt_done(""));
         assert_eq!(orch.machine.phase(), Phase::Idle);
         assert_eq!(probe.write_count(), 0, "disabled: zero backend writes");
+    }
+
+    #[test]
+    fn notice_changes_nothing() {
+        let mut o = new_orchestrator();
+        assert!(o
+            .handle(&DaemonEvent::Notice("Select text first".into()))
+            .is_empty());
+        assert_eq!(o.phase(), Phase::Idle);
     }
 
     #[test]

@@ -91,6 +91,9 @@ pub enum DaemonEvent {
     CleanupIssue(String),
     /// Wiflow was launched again while running: show the main window.
     OpenWindow,
+    /// User-facing message from the worker (voice-edit could not run): shown
+    /// as a native notification; the session state is untouched.
+    Notice(String),
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.
@@ -273,6 +276,8 @@ fn pipeline_on_worker(
         cleanup_ms: 0,
     };
     let out = capture.stop();
+    // Taken at release: true when the hold was made with Shift (a voice edit).
+    let edit_mode = crate::platform::macos::tap::take_edit_held();
     let mut vad = crate::core::vad::Vad::new();
     let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
     tracing::info!(
@@ -292,6 +297,9 @@ fn pipeline_on_worker(
         });
         return;
     }
+    // Voice-edit hold: read the selection while the instruction is transcribed.
+    let selection =
+        edit_mode.then(|| std::thread::spawn(crate::platform::macos::selection::selected_text));
     let cfg = crate::core::config::load_config();
     // Context needs the focused app (~200 ms osascript); read it while STT
     // runs instead of after. Same gate as the context step below.
@@ -323,6 +331,10 @@ fn pipeline_on_worker(
         text.split_whitespace().count(),
         kept_ms / 1000.0
     );
+    if edit_mode {
+        finish_edit(selection, &text, &cfg, duration_ms, rtf, proxy);
+        return;
+    }
     // Cleanup via trait (route decision + context gate + chain).
     let cleanup_provider = crate::core::traits::ChainProvider;
     // Context gate: transcript must carry value AND app must be
@@ -400,6 +412,48 @@ fn pipeline_on_worker(
         duration_ms,
         rtf,
     });
+}
+
+/// Voice-edit tail of the pipeline: spoken instruction + selection in, edited
+/// text out. Every failure leaves the user's text alone: a notice goes out and
+/// the session ends with an empty `Done`.
+fn finish_edit(
+    selection: Option<std::thread::JoinHandle<Option<String>>>,
+    instruction: &str,
+    cfg: &crate::core::config::Config,
+    duration_ms: u64,
+    rtf: f64,
+    proxy: &EventLoopProxy<DaemonEvent>,
+) {
+    let selected = selection.and_then(|h| h.join().ok().flatten());
+    let end = |text: String| {
+        let _ = proxy.send_event(DaemonEvent::Done {
+            text,
+            duration_ms,
+            rtf,
+        });
+    };
+    if instruction.trim().is_empty() {
+        tracing::info!("edit hold: no instruction heard");
+        return end(String::new());
+    }
+    let t0 = Instant::now();
+    match crate::core::edit::run(instruction, selected.as_deref(), cfg) {
+        Ok(text) => {
+            tracing::info!(
+                "edit done in {}ms ({} -> {} chars)",
+                t0.elapsed().as_millis(),
+                selected.as_deref().map_or(0, |s| s.chars().count()),
+                text.chars().count()
+            );
+            end(text)
+        }
+        Err(notice) => {
+            tracing::warn!("edit not applied: {notice}");
+            let _ = proxy.send_event(DaemonEvent::Notice(notice));
+            end(String::new())
+        }
+    }
 }
 
 trait DaemonEventSender {

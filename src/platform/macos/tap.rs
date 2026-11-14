@@ -114,7 +114,6 @@ pub fn edit_flag_after(prev: bool, ptt_event: Option<bool>, flags: u64, watched:
 static EDIT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// True when the hold that just ended was an edit hold; clears the flag.
-#[allow(dead_code)] // used by the worker from Task 4
 pub fn take_edit_held() -> bool {
     EDIT_HELD.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
