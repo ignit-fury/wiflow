@@ -59,6 +59,8 @@ pub const KEYCODE_FN: u32 = 63;
 const OPTION_FLAGS: u64 = 0x0008_0000;
 /// CGEventFlags maskFunction (Fn key down indicator)
 const FUNCTION_FLAGS: u64 = 0x0080_0000;
+/// CGEventFlags maskShift
+const SHIFT_FLAGS: u64 = 0x0002_0000;
 
 /// Which bare-modifier keycodes a preset watches (None = combo preset,
 /// those ride global-hotkey instead).
@@ -86,6 +88,35 @@ pub fn modifier_event(keycode: i64, flags: u64, watched: u32) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// True while the PTT key and Shift are both down: the hold is a voice edit.
+pub fn shift_with_ptt(flags: u64, watched: u32) -> bool {
+    flags & SHIFT_FLAGS != 0 && flags & flags_mask_for_keycode(watched) != 0
+}
+
+/// Next value of the edit-hold flag after one flagsChanged event: a new hold
+/// (PTT key down) clears it, Shift with the PTT key down sets it, releases
+/// leave it for the worker to take.
+pub fn edit_flag_after(prev: bool, ptt_event: Option<bool>, flags: u64, watched: u32) -> bool {
+    let mut held = prev;
+    if ptt_event == Some(true) {
+        held = false;
+    }
+    if shift_with_ptt(flags, watched) {
+        held = true;
+    }
+    held
+}
+
+/// Set by the tap when Shift is held during a PTT hold. One hold exists at a
+/// time, so a single flag is enough.
+static EDIT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when the hold that just ended was an edit hold; clears the flag.
+#[allow(dead_code)] // used by the worker from Task 4
+pub fn take_edit_held() -> bool {
+    EDIT_HELD.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// What to do when macOS delivers an out-of-band tap-system event.
@@ -176,7 +207,18 @@ unsafe extern "C" fn tap_callback(
         let ctx = &*(user_info as *const TapCtx);
         let keycode = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
         let flags = CGEventGetFlags(event);
-        if let Some(down) = modifier_event(keycode, flags, ctx.keycode) {
+        let ptt = modifier_event(keycode, flags, ctx.keycode);
+        // Shift held during the hold marks it as a voice edit.
+        EDIT_HELD.store(
+            edit_flag_after(
+                EDIT_HELD.load(std::sync::atomic::Ordering::SeqCst),
+                ptt,
+                flags,
+                ctx.keycode,
+            ),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if let Some(down) = ptt {
             let (ev, session) = if down {
                 (DaemonEvent::PttDown, next_session())
             } else {
@@ -357,5 +399,37 @@ mod tests {
         assert!(!recovery_up_needed(FUNCTION_FLAGS, KEYCODE_FN));
         // Other modifiers held are irrelevant.
         assert!(recovery_up_needed(OPTION_FLAGS, KEYCODE_FN));
+    }
+
+    #[test]
+    fn shift_with_ptt_needs_both_keys_down() {
+        assert!(shift_with_ptt(OPTION_FLAGS | SHIFT_FLAGS, 61));
+        assert!(!shift_with_ptt(OPTION_FLAGS, 61));
+        assert!(
+            !shift_with_ptt(SHIFT_FLAGS, 61),
+            "Shift alone is not a hold"
+        );
+        assert!(shift_with_ptt(FUNCTION_FLAGS | SHIFT_FLAGS, 63));
+    }
+
+    #[test]
+    fn edit_flag_follows_the_hold() {
+        // Shift already down when the PTT key goes down.
+        assert!(edit_flag_after(
+            false,
+            Some(true),
+            OPTION_FLAGS | SHIFT_FLAGS,
+            61
+        ));
+        // Shift pressed later: a flagsChanged for Shift, not for the PTT key.
+        assert!(edit_flag_after(false, None, OPTION_FLAGS | SHIFT_FLAGS, 61));
+        // A plain hold, and any release, never set it.
+        assert!(!edit_flag_after(false, Some(true), OPTION_FLAGS, 61));
+        assert!(!edit_flag_after(false, Some(false), 0, 61));
+        // Releasing either key keeps an edit hold an edit hold until taken.
+        assert!(edit_flag_after(true, Some(false), SHIFT_FLAGS, 61));
+        assert!(edit_flag_after(true, None, OPTION_FLAGS, 61));
+        // A new plain hold clears the previous flag.
+        assert!(!edit_flag_after(true, Some(true), OPTION_FLAGS, 61));
     }
 }
