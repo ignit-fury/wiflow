@@ -40,10 +40,25 @@ pub fn selected_text() -> Option<String> {
     if super::secure::password_field_focused() {
         return None;
     }
-    if let Some(text) = super::secure::focused_string_attribute("AXSelectedText").and_then(usable) {
-        return Some(text);
+    pick(
+        super::secure::focused_string_attribute("AXSelectedText"),
+        copy_selection_with_cmd_c,
+    )
+}
+
+/// An AX answer is final, even an empty one: Cmd+C with no selection copies
+/// the whole line in code editors. Cmd+C only when AX has no answer at all.
+fn pick(ax: Option<String>, cmd_c: impl FnOnce() -> Option<String>) -> Option<String> {
+    match ax {
+        Some(text) => usable(text),
+        None => cmd_c().and_then(usable),
     }
-    copy_selection_with_cmd_c().and_then(usable)
+}
+
+/// Current selection by Accessibility only (never a keystroke). `None` when
+/// AX cannot say.
+pub fn selected_text_ax() -> Option<String> {
+    super::secure::focused_string_attribute("AXSelectedText")
 }
 
 fn usable(text: String) -> Option<String> {
@@ -120,6 +135,18 @@ mod tests {
         assert_eq!(usable("  \n ".into()), None);
         assert_eq!(usable(String::new()), None);
         assert_eq!(usable("hi there".into()).as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn ax_answer_is_final_and_cmd_c_only_runs_without_one() {
+        let boom = || -> Option<String> { panic!("Cmd+C must not run") };
+        assert_eq!(pick(Some(String::new()), boom), None);
+        assert_eq!(pick(Some("sel".into()), boom).as_deref(), Some("sel"));
+        assert_eq!(
+            pick(None, || Some("copied".into())).as_deref(),
+            Some("copied")
+        );
+        assert_eq!(pick(None, || Some("  ".into())), None);
     }
 
     /// Needs a front app with text selected. Run: cargo test cmd_c_fallback -- --ignored --nocapture

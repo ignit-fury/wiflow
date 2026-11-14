@@ -29,13 +29,22 @@ struct CleanupBudget {
     deadline: std::time::Instant,
     /// Per-request cap for the local Ollama call.
     ollama_timeout: Duration,
+    /// Stop sequences for Ollama; dictation only (an edit may legitimately
+    /// contain "Context:" or blank lines).
+    ollama_stop: &'static [&'static str],
+    /// Fixed Ollama output cap; `None` scales with the prompt (dictation).
+    ollama_token_cap: Option<usize>,
 }
+
+const DICTATION_STOP: &[&str] = &["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"];
 
 impl CleanupBudget {
     fn new() -> Self {
         Self {
             deadline: std::time::Instant::now() + CLEANUP_BUDGET,
             ollama_timeout: OLLAMA_TIMEOUT,
+            ollama_stop: DICTATION_STOP,
+            ollama_token_cap: None,
         }
     }
     /// Edits rewrite a whole selection: far longer than tidying a sentence.
@@ -43,7 +52,17 @@ impl CleanupBudget {
         Self {
             deadline: std::time::Instant::now() + EDIT_BUDGET,
             ollama_timeout: EDIT_BUDGET,
+            ollama_stop: &[],
+            ollama_token_cap: Some(400),
         }
+    }
+    fn ollama_options(&self, prompt: &str) -> serde_json::Value {
+        json!({
+            "temperature": 0.0,
+            "num_predict": self.ollama_token_cap.unwrap_or_else(|| ollama_token_cap(prompt)),
+            "num_ctx": OLLAMA_NUM_CTX,
+            "stop": self.ollama_stop,
+        })
     }
     fn remaining(&self) -> Result<Duration, String> {
         let remaining = self
@@ -700,12 +719,7 @@ fn ollama_chat(
             "stream": false,
             // Hardened for 1B SLMs: deterministic, generation-capped, stops
             // the moment the model reaches for XML or a new section.
-            "options": {
-                "temperature": 0.0,
-                "num_predict": ollama_token_cap(prompt),
-                "num_ctx": OLLAMA_NUM_CTX,
-                "stop": ["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"],
-            },
+            "options": budget.ollama_options(prompt),
             // Keep weights resident in unified memory (no reload latency).
             "keep_alive": -1,
         }))
@@ -1149,6 +1163,18 @@ mod tests {
     }
 
     #[test]
+    fn edit_ollama_options_have_no_stop_list_and_full_cap() {
+        let short = "ship it";
+        let edit = CleanupBudget::for_edit().ollama_options(short);
+        assert_eq!(edit["num_predict"], 400);
+        assert_eq!(edit["stop"], json!([]));
+        let dict = CleanupBudget::new().ollama_options(short);
+        assert_eq!(dict["num_predict"], 100);
+        assert_eq!(dict["stop"][4], "Context:");
+        assert_eq!(dict["stop"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
     fn cleanup_budget_is_shared_and_exhaustion_is_explicit() {
         let budget = CleanupBudget::new();
         let first = budget.remaining().unwrap();
@@ -1157,6 +1183,8 @@ mod tests {
         let expired = CleanupBudget {
             deadline: std::time::Instant::now() - Duration::from_millis(1),
             ollama_timeout: OLLAMA_TIMEOUT,
+            ollama_stop: DICTATION_STOP,
+            ollama_token_cap: None,
         };
         assert_eq!(
             expired.remaining().unwrap_err(),

@@ -275,9 +275,10 @@ fn pipeline_on_worker(
         context_ms: 0,
         cleanup_ms: 0,
     };
-    let out = capture.stop();
-    // Taken at release: true when the hold was made with Shift (a voice edit).
+    // Taken at release, before the (slow) stop, so a quick re-press cannot
+    // set a flag this hold would consume: true when the hold had Shift.
     let edit_mode = crate::platform::macos::tap::take_edit_held();
+    let out = capture.stop();
     let mut vad = crate::core::vad::Vad::new();
     let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
     tracing::info!(
@@ -297,10 +298,11 @@ fn pipeline_on_worker(
         });
         return;
     }
-    // Voice-edit hold: read the selection while the instruction is transcribed.
-    let selection =
-        edit_mode.then(|| std::thread::spawn(crate::platform::macos::selection::selected_text));
     let cfg = crate::core::config::load_config();
+    // Voice-edit hold: read the selection while the instruction is transcribed.
+    // Skipped when cleanup is off: the edit is refused then, so no Cmd+C.
+    let selection = (edit_mode && cfg.cleanup_enabled)
+        .then(|| std::thread::spawn(crate::platform::macos::selection::selected_text));
     // Context needs the focused app (~200 ms osascript); read it while STT
     // runs instead of after. Same gate as the context step below.
     let key_present = crate::core::cleanup::groq_key().is_some();
@@ -332,7 +334,15 @@ fn pipeline_on_worker(
         kept_ms / 1000.0
     );
     if edit_mode {
-        finish_edit(selection, &text, &cfg, duration_ms, rtf, proxy);
+        finish_edit(
+            selection,
+            &text,
+            &cfg,
+            duration_ms,
+            rtf,
+            proxy,
+            crate::platform::macos::selection::selected_text_ax,
+        );
         return;
     }
     // Cleanup via trait (route decision + context gate + chain).
@@ -423,7 +433,9 @@ fn finish_edit(
     cfg: &crate::core::config::Config,
     duration_ms: u64,
     rtf: f64,
-    proxy: &EventLoopProxy<DaemonEvent>,
+    proxy: &impl DaemonEventSender,
+    // AX-only read of the current selection, to catch a moved selection.
+    recheck: impl FnOnce() -> Option<String>,
 ) {
     let selected = selection.and_then(|h| h.join().ok().flatten());
     let end = |text: String| {
@@ -439,6 +451,12 @@ fn finish_edit(
     }
     let t0 = Instant::now();
     match crate::core::edit::run(instruction, selected.as_deref(), cfg) {
+        Ok(_) if selection_moved(selected.as_deref(), recheck()) => {
+            let notice = "The selection changed, so the edit was not applied.".to_string();
+            tracing::warn!("edit not applied: {notice}");
+            let _ = proxy.send_event(DaemonEvent::Notice(notice));
+            end(String::new())
+        }
         Ok(text) => {
             tracing::info!(
                 "edit done in {}ms ({} -> {} chars)",
@@ -454,6 +472,12 @@ fn finish_edit(
             end(String::new())
         }
     }
+}
+
+/// True when AX can read the selection now and it is no longer the text that
+/// was edited. AX `None` (original came from Cmd+C) proceeds as before.
+fn selection_moved(original: Option<&str>, now: Option<String>) -> bool {
+    matches!((original, now), (Some(o), Some(n)) if o != n)
 }
 
 trait DaemonEventSender {
@@ -758,6 +782,47 @@ pub fn worker_main(
 }
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+
+    impl DaemonEventSender for Recorder {
+        fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+            self.0.lock().unwrap().push(match event {
+                DaemonEvent::Notice(m) => format!("notice:{m}"),
+                DaemonEvent::Done { text, .. } => format!("done:{text}"),
+                _ => "other".into(),
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn edit_without_selection_notices_then_ends_empty() {
+        let rec = Recorder::default();
+        let cfg = crate::core::config::Config::default();
+        finish_edit(None, "make it shorter", &cfg, 1, 0.0, &rec, || None);
+        let ev = rec.0.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].starts_with("notice:") && ev[0].contains("Select text first"));
+        assert_eq!(ev[1], "done:");
+    }
+
+    #[test]
+    fn edit_without_instruction_only_ends_empty() {
+        let rec = Recorder::default();
+        let cfg = crate::core::config::Config::default();
+        finish_edit(None, "  ", &cfg, 1, 0.0, &rec, || None);
+        assert_eq!(*rec.0.lock().unwrap(), vec!["done:".to_string()]);
+    }
+
+    #[test]
+    fn selection_moved_only_when_ax_disagrees() {
+        assert!(selection_moved(Some("a"), Some("b".into())));
+        assert!(!selection_moved(Some("a"), Some("a".into())));
+        assert!(!selection_moved(Some("a"), None));
+        assert!(!selection_moved(None, Some("b".into())));
+    }
+
     #[test]
     fn stage_times_line_lists_every_stage() {
         let t = super::StageTimes {
