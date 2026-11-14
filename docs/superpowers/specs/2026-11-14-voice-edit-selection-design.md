@@ -36,8 +36,9 @@ already exists, not longer dictation.
 4. The instruction gets only the existing light `post_process` step. It skips
    the cleanup chain and the preserve-input guard.
 5. `core::edit::edit_text(instruction, selection, cfg)` calls the configured
-   provider chain with the system rule "apply the instruction to the text;
-   output only the edited text".
+   provider (auto: first with a key, else Ollama); there is no fallback chain,
+   so a failed edit leaves the text alone. The system rule is "apply the
+   instruction to the text; output only the edited text".
 6. The result is sent as `DaemonEvent::Done { text }`, so the existing
    inject step pastes it over the still-selected text. Cmd+Z in the target app
    undoes it. The recording pill, ducking, mic teardown and session lifecycle
@@ -51,7 +52,8 @@ already exists, not longer dictation.
 | `src/platform/macos/selection.rs` (new) | `selected_text() -> Option<String>`: read `AXSelectedText` of the focused element; fall back to Cmd+C and restore the clipboard. Returns `None` in a password field (reuses `password_field_focused`). |
 | `src/core/edit.rs` (new) | `build_edit_prompt`, `check_result`, `edit_text`. |
 | `src/daemon.rs` | In `pipeline_on_worker`, branch on edit mode: read selection in a thread while STT runs, skip cleanup for the instruction, call `edit_text`. |
-| `src/core/cleanup.rs` | `CleanupBudget` gains a constructor taking a duration; the Ollama request timeout and token cap become parameters. Normal dictation keeps the 2 s budget and 1.5 s Ollama timeout. Edits use about 8 s. |
+| `src/core/cleanup.rs` | `CleanupBudget` gains a constructor taking a duration; the Ollama request timeout and token cap become parameters. Normal dictation keeps the 2 s budget and 1.5 s Ollama timeout. Edits use about 8 s. The edit path calls the configured provider (auto: first with a key, else Ollama); there is no fallback chain, so a failed edit leaves the text alone. |
+| `DaemonEvent::Notice` | User-facing worker message shown as a native notification, no state change. |
 | Docs | README usage line, `memory.md` decision entry. `rules.md` §5 needs no change: still push-to-talk only, mic indicator unchanged. |
 
 ## Result checks (`check_result`)
@@ -78,13 +80,15 @@ notification.
 | Provider unreachable, timed out or erroring | Notice with the provider error. |
 | Instruction transcribes to nothing | Treated as "no speech detected": nothing happens. |
 | Result rejected by `check_result` | Nothing pasted; notice. |
+| Selection longer than 1500 characters | Notice, no model call. |
 
 ## Testing
 
 - **Unit:** `edit_mode` flag detection, prompt building, `check_result` cases
   (wrapper, empty, runaway, normal), the `CleanupBudget` duration constructor.
-- **Provider call:** `edit_text` against a localhost fake model, matching the
-  existing rule of no real LLM calls in `cargo test`.
+- **Provider choice:** pure `edit_provider` test; the HTTP path is covered by
+  the live check (no fake-model infrastructure exists, and cargo test must not
+  call real models).
 - **Live:** in TextEdit, select text, send a synthetic Right Option + Shift
   hold with a spoken instruction through BlackHole, and verify the text is
   replaced and Cmd+Z restores it. Also verify plain dictation is unchanged and
@@ -108,4 +112,6 @@ notification.
 - `llama3.2:3b` is reliable for "shorter", "fix grammar" and "translate" and
   less reliable for complex instructions. The provider chain lets users point
   edits at a larger model.
-- Edited text appears in history like any dictation.
+- Edits are not saved to history.
+- Editors that copy the whole line when nothing is selected (VS Code) will
+  edit and paste that line at the cursor; Cmd+Z undoes it.
