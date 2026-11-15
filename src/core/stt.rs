@@ -236,16 +236,25 @@ pub fn transcribe_shared(
 }
 
 /// Quick pass for the live pill (16 kHz mono in). Never used for the pasted
-/// text; hallucination tokens such as "[BLANK_AUDIO]" are stripped.
-pub fn transcribe_preview(
-    model_path: &Path,
-    samples: &[f32],
-    language: &str,
-) -> Result<String, String> {
-    with_shared_model(model_path, |stt| {
-        stt.transcribe_with(samples, "", language, Decode::PREVIEW)
-    })
-    .map(|text| strip_hallucination_tokens(&text).trim().to_string())
+/// text; hallucination tokens such as "[BLANK_AUDIO]" are stripped. Skips
+/// (returns empty) instead of waiting when the model is busy, loading or not
+/// loaded, so key-up and the watchdog are never delayed.
+pub fn transcribe_preview(samples: &[f32], language: &str) -> Result<String, String> {
+    let Some(slot) = STT.get() else {
+        return Ok(String::new());
+    };
+    let Ok(mut guard) = slot.try_lock() else {
+        return Ok(String::new());
+    };
+    let Some((_, stt)) = guard.as_mut() else {
+        return Ok(String::new());
+    };
+    STT_USED_MS.store(
+        crate::core::cleanup::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    stt.transcribe_with(samples, "", language, Decode::PREVIEW)
+        .map(|text| strip_hallucination_tokens(&text).trim().to_string())
 }
 
 /// When the shared model last ran, in ms since the epoch (0 = never).
@@ -676,8 +685,10 @@ pub(crate) fn plus_to_symbol(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn preview_with_missing_model_is_err() {
-        assert!(transcribe_preview(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
+    fn preview_skips_when_the_model_is_busy() {
+        let slot = STT.get_or_init(|| Mutex::new(None));
+        let _held = slot.lock().unwrap();
+        assert_eq!(transcribe_preview(&[0.1; 160], ""), Ok(String::new()));
     }
 
     /// Needs the small model and `say`. Run: cargo test --release preview_hears -- --ignored
@@ -702,7 +713,8 @@ mod tests {
             .into_samples::<i16>()
             .map(|s| s.unwrap() as f32 / 32768.0)
             .collect();
-        let text = transcribe_preview(&path, &audio, "").unwrap();
+        warm(&path, "").unwrap();
+        let text = transcribe_preview(&audio, "").unwrap();
         assert!(text.to_lowercase().contains("hello"), "got {text:?}");
     }
 

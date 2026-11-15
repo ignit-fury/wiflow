@@ -647,9 +647,7 @@ fn live_preview(
     }
     let audio = crate::core::vad::resample_to_16k(tail, rate);
     let t0 = Instant::now();
-    match crate::core::traits::local_model_path(&cfg)
-        .and_then(|path| crate::core::stt::transcribe_preview(&path, &audio, &cfg.stt_language))
-    {
+    match crate::core::stt::transcribe_preview(&audio, &cfg.stt_language) {
         Ok(text) if !text.is_empty() => {
             tracing::info!(
                 "live preview: {} words in {}ms",
