@@ -65,8 +65,8 @@ pub(crate) struct Decode {
 impl Decode {
     /// Final transcript: beam search with whisper.cpp's default 0.2 retry
     /// step. A 0.4 step (at most 3 passes) changed words on the noisy
-    /// benchmark clip, so the default stays; `temperature_step_keeps_words`
-    /// is the gate if this is revisited.
+    /// benchmark clip, so the default stays; re-run
+    /// `temperature_step_keeps_words` to re-evaluate the 0.4 step.
     pub(crate) const FULL: Decode = Decode {
         beam: true,
         temperature_inc: 0.2,
@@ -1190,8 +1190,9 @@ mod tests {
         eprintln!("tone transcript: {text:?}");
     }
 
-    /// Gate for `Decode::FULL`: the 0.4 step must give the same words as
-    /// whisper.cpp's 0.2 on clean and noisy clips. Needs the small model and
+    /// Re-evaluates the 0.4 retry step: it must give the same words as
+    /// `Decode::FULL` (0.2) on clean and noisy clips. Expected to fail today
+    /// (0.4 changed words on the noisy clip), hence `#[ignore]`. Needs the small model and
     /// macOS `say`. Run: cargo test --release temperature_step -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -1215,9 +1216,9 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let old_step = Decode {
+        let candidate = Decode {
             beam: true,
-            temperature_inc: 0.2,
+            temperature_inc: 0.4,
         };
         let (mut slowest_old, mut slowest_new) = (0u128, 0u128);
         for (i, phrase) in phrases.iter().enumerate() {
@@ -1247,17 +1248,17 @@ mod tests {
                 .collect();
             for (kind, audio) in [("clean", &clean), ("noisy", &noisy)] {
                 let t = std::time::Instant::now();
-                let old = stt.transcribe_with(audio, "", "", old_step).unwrap();
+                let old = stt.transcribe_with(audio, "", "", Decode::FULL).unwrap();
                 let ms_old = t.elapsed().as_millis();
                 let t = std::time::Instant::now();
-                let new = stt.transcribe_with(audio, "", "", Decode::FULL).unwrap();
+                let new = stt.transcribe_with(audio, "", "", candidate).unwrap();
                 let ms_new = t.elapsed().as_millis();
-                eprintln!("STEP {kind} {i}: 0.2 {ms_old}ms {old:?} | FULL {ms_new}ms {new:?}");
+                eprintln!("STEP {kind} {i}: 0.2 {ms_old}ms {old:?} | 0.4 {ms_new}ms {new:?}");
                 assert_eq!(words(&old), words(&new), "{kind} clip {i}: words changed");
                 slowest_old = slowest_old.max(ms_old);
                 slowest_new = slowest_new.max(ms_new);
             }
         }
-        eprintln!("STEP slowest: 0.2 {slowest_old}ms, FULL {slowest_new}ms");
+        eprintln!("STEP slowest: 0.2 {slowest_old}ms, 0.4 {slowest_new}ms");
     }
 }
