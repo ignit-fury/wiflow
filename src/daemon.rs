@@ -94,6 +94,9 @@ pub enum DaemonEvent {
     /// User-facing message from the worker (voice-edit could not run): shown
     /// as a native notification; the session state is untouched.
     Notice(String),
+    /// Words heard so far while the key is held (live preview for the pill).
+    #[allow(dead_code)] // sent by the worker from Task 8
+    LivePreview(String),
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.

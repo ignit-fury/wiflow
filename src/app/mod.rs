@@ -29,6 +29,7 @@ fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
         DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
         DaemonEvent::OpenWindow => "OpenWindow",
         DaemonEvent::Notice(_) => "Notice",
+        DaemonEvent::LivePreview(_) => "LivePreview",
     }
 }
 
@@ -1163,6 +1164,11 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         if matches!(event, DaemonEvent::OpenWindow) {
             // Opened in about_to_wait, which runs right after this.
             self.open_settings_requested = true;
+            return;
+        }
+        // Live preview is display-only: straight to the pill, no lifecycle.
+        if let DaemonEvent::LivePreview(text) = &event {
+            self.pill.set_live_text(text.clone());
             return;
         }
         let before = self.orchestrator.phase();

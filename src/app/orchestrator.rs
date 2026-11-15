@@ -123,6 +123,8 @@ impl<M: MediaController> Orchestrator<M> {
             // App-shell concern, never reaches the dictation lifecycle.
             DaemonEvent::OpenWindow => Vec::new(),
             DaemonEvent::Notice(_) => Vec::new(),
+            // The app shell hands it straight to the pill.
+            DaemonEvent::LivePreview(_) => Vec::new(),
         }
     }
 
@@ -1009,6 +1011,15 @@ mod tests {
         let mut o = new_orchestrator();
         assert!(o
             .handle(&DaemonEvent::Notice("Select text first".into()))
+            .is_empty());
+        assert_eq!(o.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn live_preview_changes_nothing() {
+        let mut o = new_orchestrator();
+        assert!(o
+            .handle(&DaemonEvent::LivePreview("hello".into()))
             .is_empty());
         assert_eq!(o.phase(), Phase::Idle);
     }
