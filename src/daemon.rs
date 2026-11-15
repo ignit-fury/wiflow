@@ -622,6 +622,13 @@ fn watchdog(
 
 /// How often the pill's live text refreshes while the key is held.
 const PREVIEW_EVERY: Duration = Duration::from_millis(1000);
+/// No preview starts this close to the watchdog: a pass would delay it past
+/// the app's own supervision tick, which would then error the session.
+const PREVIEW_DEADLINE_MARGIN: Duration = Duration::from_secs(2);
+
+fn preview_allowed(now: Instant, deadline: Instant) -> bool {
+    deadline.saturating_duration_since(now) > PREVIEW_DEADLINE_MARGIN
+}
 /// Most recent audio one preview pass transcribes: keeps passes short on
 /// long holds (about 0.1–0.3 s).
 const PREVIEW_TAIL_SECS: usize = 15;
@@ -720,7 +727,9 @@ pub fn worker_main(
                                 &duck,
                             );
                         } else {
-                            live_preview(&mut capture, &proxy);
+                            if preview_allowed(Instant::now(), deadline) {
+                                live_preview(&mut capture, &proxy);
+                            }
                             preview_at = Some(Instant::now() + PREVIEW_EVERY);
                         }
                         continue;
@@ -838,6 +847,15 @@ pub fn worker_main(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_skipped_near_watchdog_deadline() {
+        let now = Instant::now();
+        assert!(preview_allowed(now, now + Duration::from_secs(30)));
+        assert!(!preview_allowed(now, now + Duration::from_millis(1999)));
+        assert!(!preview_allowed(now, now + PREVIEW_DEADLINE_MARGIN));
+        assert!(!preview_allowed(now + Duration::from_secs(1), now));
+    }
+
     #[derive(Default)]
     struct Recorder(std::sync::Mutex<Vec<String>>);
 
