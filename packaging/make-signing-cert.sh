@@ -41,7 +41,7 @@ EOF
 fi
 security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$TMP/cert.pem"
 security find-identity -v -p codesigning | grep "\"$NAME\"" || {
-  echo "Wiflow Dev is not trusted for code signing yet; rerun this script" >&2
+  echo "Wiflow Dev is not trusted for code signing yet. If it keeps failing, delete \"Wiflow Dev\" in Keychain Access\n  (login keychain, My Certificates / Certificates) and run this script again" >&2
   exit 1
 }
 echo "Created $NAME. Rebuild with: sh packaging/build-app.sh"

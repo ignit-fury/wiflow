@@ -458,6 +458,7 @@ fn retry_model<'a>(p: Provider, primary: &str, fallback: &'a str) -> Option<&'a 
 /// Explicit retry: after the primary model fails on a provider, retry the
 /// SAME provider with `cleanup_fallback_model` before moving down the chain.
 /// The fallback error stands when the fallback equals the primary.
+/// Ollama never retries with the fallback model (see `retry_model`).
 fn try_provider_with_retry(
     p: Provider,
     cfg: &crate::core::config::Config,

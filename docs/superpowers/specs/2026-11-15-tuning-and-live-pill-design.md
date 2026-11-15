@@ -1,7 +1,7 @@
 # Tuning fixes and live text in the pill — design
 
 Date: 2026-11-15
-Status: approved in conversation, awaiting written-spec review
+Status: implemented
 
 ## Goal
 
@@ -87,7 +87,7 @@ Preview is local-only: off when the speech provider is Groq.
 | Piece | Change |
 |---|---|
 | `core/audio.rs` | `AudioCapture::snapshot()` moves new samples from the realtime ring into an internal buffer and returns everything so far; `stop()` returns that buffer plus the rest. `sample_rate()` getter. |
-| `core/stt.rs` | `Decode::PREVIEW` (greedy, one pass, no retries) and `transcribe_preview(model_path, samples, language)` on the shared model, with hallucination tokens stripped. |
+| `core/stt.rs` | `Decode::PREVIEW` (greedy, one pass, no retries) and `transcribe_preview(samples, language)`, which uses only an already-loaded shared model (never waits), with hallucination tokens stripped. |
 | `core/config.rs`, `ui/settings.rs` | `live_preview: bool` (default true) and its checkbox. |
 | `daemon.rs` | The worker, while the mic is open, wakes at the earlier of the watchdog deadline and the next preview time (every 1 s). A preview pass takes the last 15 s or less, skips silence, transcribes with `Decode::PREVIEW`, and sends `DaemonEvent::LivePreview(text)`. |
 | `app/mod.rs`, `app/orchestrator.rs` | `LivePreview` goes straight to the pill (no orchestrator action, no state change). |
@@ -121,3 +121,11 @@ Preview is local-only: off when the speech provider is Groq.
   fragmented undo, breaks cleanup and voice-edit).
 - Preview for Groq speech-to-text.
 - Changing the final transcription path's beam search.
+
+## As built
+
+- The 0.4 temperature step failed the benchmark (words changed on a noisy clip), so `Decode::FULL` keeps 0.2 and decoding is unchanged.
+- Cleanup time counts only dictated words; the app-context header is excluded.
+- `transcribe_preview(samples, language)` has no model path and never waits. It uses an already-loaded model via `try_lock` and returns empty when the model is busy or not loaded, so the pill stays blank until the model is warm (it is warmed at launch).
+- The worker never starts a preview within 2 s of the 60 s watchdog.
+- The cert script reuses an existing (even untrusted) "Wiflow Dev" cert instead of creating a second.

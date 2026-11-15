@@ -36,7 +36,9 @@ about 250 words. Not for terminals.
 **Live text:** while you hold the key, the recording pill shows the words
 heard so far. The pasted text still comes from the full pass when you
 release. Turn it off in Settings ("Show words in the pill while dictating").
-It uses the local model only.
+It uses the local model only. The pill shows words as they are spoken even
+while a password field is focused (the paste is still blocked there), so turn
+live text off when screen-sharing if that matters.
 
 The default hotkey is Ctrl+Space. Fn and Right Option are also available.
 For Fn, set System Settings → Keyboard → “Press 🌐 key to” to “Do Nothing”.
@@ -119,5 +121,6 @@ ad-hoc. Grant the permissions one last time after the first signed build. If
 launch at login was turned on from a terminal build, turn it off and on again
 in Wiflow so the login item points at the signed app.
 
-The build script creates an ad-hoc-signed `target/Wiflow.app`. Follow
+The build script creates `target/Wiflow.app`, signed with the "Wiflow Dev"
+certificate when present, otherwise ad-hoc. Follow
 [NOTARIZE.md](docs/NOTARIZE.md) for signing and notarization before distribution.
