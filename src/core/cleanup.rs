@@ -13,6 +13,17 @@ pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
 pub const EMPTY_SENTINEL: &str = "EMPTY";
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+/// Extra cleanup time per 10 dictated words: long dictations take longer to
+/// tidy, and a fixed 1.5 s timed out on 50+ words and pasted raw text.
+const PER_10_WORDS: Duration = Duration::from_millis(400);
+/// Most a dictation ever waits for cleanup.
+const DICTATION_CAP: Duration = Duration::from_secs(6);
+
+/// `base` plus 0.4 s per whole 10 words, capped at 6 s.
+fn scaled_for(base: Duration, words: usize) -> Duration {
+    (base + PER_10_WORDS * (words / 10) as u32).min(DICTATION_CAP)
+}
+
 /// Time limit for one voice-edit request (rewrites take longer than cleanup).
 const EDIT_BUDGET: Duration = Duration::from_secs(8);
 /// Context runs before the cleanup budget starts, so it gets its own short cap.
@@ -39,10 +50,11 @@ struct CleanupBudget {
 const DICTATION_STOP: &[&str] = &["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"];
 
 impl CleanupBudget {
-    fn new() -> Self {
+    /// Dictation cleanup; limits grow with the transcript's word count.
+    fn new(words: usize) -> Self {
         Self {
-            deadline: std::time::Instant::now() + CLEANUP_BUDGET,
-            ollama_timeout: OLLAMA_TIMEOUT,
+            deadline: std::time::Instant::now() + scaled_for(CLEANUP_BUDGET, words),
+            ollama_timeout: scaled_for(OLLAMA_TIMEOUT, words),
             ollama_stop: DICTATION_STOP,
             ollama_token_cap: None,
         }
@@ -436,6 +448,13 @@ fn try_provider_model(
     }
 }
 
+/// Model to retry with after the primary fails, if any. Ollama never retries:
+/// the shared fallback setting holds a cloud model id (default
+/// `qwen/qwen3.8-27b`) that is not installed locally.
+fn retry_model<'a>(p: Provider, primary: &str, fallback: &'a str) -> Option<&'a str> {
+    (p != Provider::Ollama && fallback != primary).then_some(fallback)
+}
+
 /// Explicit retry: after the primary model fails on a provider, retry the
 /// SAME provider with `cleanup_fallback_model` before moving down the chain.
 /// The fallback error stands when the fallback equals the primary.
@@ -450,25 +469,14 @@ fn try_provider_with_retry(
         .map(|t| sanitize_llm_response(&t, transcript))
     {
         Ok(t) => Ok(t),
-        Err(e) => {
-            let fallback = cfg.cleanup_fallback_model.as_str();
-            if fallback != primary {
+        Err(e) => match retry_model(p, primary, &cfg.cleanup_fallback_model) {
+            Some(fallback) => {
                 tracing::warn!("retry with fallback model {fallback}: {e}");
                 try_provider_model(p, fallback, transcript, None, budget)
                     .map(|t| sanitize_llm_response(&t, transcript))
-                    // The default fallback is a cloud model id; on Ollama a
-                    // missing fallback must not mask the primary error.
-                    .map_err(|fe| {
-                        if p == Provider::Ollama && fe.starts_with("model not installed") {
-                            e
-                        } else {
-                            fe
-                        }
-                    })
-            } else {
-                Err(e)
             }
-        }
+            None => Err(e),
+        },
     }
 }
 
@@ -482,7 +490,7 @@ pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> Clean
             issues,
         };
     }
-    let budget = CleanupBudget::new();
+    let budget = CleanupBudget::new(plain_transcript_of(transcript).split_whitespace().count());
     let provider = if cfg.cleanup_provider.is_empty() {
         "auto"
     } else {
@@ -1142,6 +1150,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_cloud_providers_retry_with_the_fallback_model() {
+        assert_eq!(retry_model(Provider::Groq, "a", "b"), Some("b"));
+        assert_eq!(retry_model(Provider::OpenRouter, "a", "b"), Some("b"));
+        assert_eq!(
+            retry_model(Provider::Groq, "a", "a"),
+            None,
+            "same model: no retry"
+        );
+        assert_eq!(
+            retry_model(Provider::Ollama, "llama3.2:3b", "qwen/qwen3.8-27b"),
+            None,
+            "the shared fallback is a cloud model id, never installed in Ollama"
+        );
+    }
+
+    #[test]
     fn edit_provider_follows_config_then_keys() {
         assert_eq!(edit_provider("groq", false, false), Provider::Groq);
         assert_eq!(
@@ -1159,7 +1183,7 @@ mod tests {
         let edit = CleanupBudget::for_edit();
         assert!(edit.remaining().unwrap() > Duration::from_secs(5));
         assert_eq!(edit.ollama_timeout, EDIT_BUDGET);
-        assert_eq!(CleanupBudget::new().ollama_timeout, OLLAMA_TIMEOUT);
+        assert_eq!(CleanupBudget::new(0).ollama_timeout, OLLAMA_TIMEOUT);
     }
 
     #[test]
@@ -1168,7 +1192,7 @@ mod tests {
         let edit = CleanupBudget::for_edit().ollama_options(short);
         assert_eq!(edit["num_predict"], 400);
         assert_eq!(edit["stop"], json!([]));
-        let dict = CleanupBudget::new().ollama_options(short);
+        let dict = CleanupBudget::new(0).ollama_options(short);
         assert_eq!(dict["num_predict"], 100);
         assert_eq!(dict["stop"][4], "Context:");
         assert_eq!(dict["stop"].as_array().unwrap().len(), 5);
@@ -1176,7 +1200,7 @@ mod tests {
 
     #[test]
     fn cleanup_budget_is_shared_and_exhaustion_is_explicit() {
-        let budget = CleanupBudget::new();
+        let budget = CleanupBudget::new(0);
         let first = budget.remaining().unwrap();
         assert!(first <= CLEANUP_BUDGET);
         assert!(budget.remaining().unwrap() <= first);
@@ -1190,6 +1214,32 @@ mod tests {
             expired.remaining().unwrap_err(),
             "cleanup time budget exhausted"
         );
+    }
+
+    #[test]
+    fn dictation_time_grows_with_length_and_caps() {
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 0), OLLAMA_TIMEOUT);
+        assert_eq!(
+            scaled_for(OLLAMA_TIMEOUT, 9),
+            OLLAMA_TIMEOUT,
+            "under 10 words: unchanged"
+        );
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 50), Duration::from_millis(3500));
+        assert_eq!(scaled_for(CLEANUP_BUDGET, 50), Duration::from_millis(4000));
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 500), DICTATION_CAP);
+        let long = CleanupBudget::new(150);
+        assert_eq!(long.ollama_timeout, DICTATION_CAP);
+        assert!(long.remaining().unwrap() > Duration::from_secs(5));
+        assert_eq!(CleanupBudget::new(3).ollama_timeout, OLLAMA_TIMEOUT);
+    }
+
+    #[test]
+    fn cleanup_time_counts_only_dictated_words() {
+        let input = format_cleanup_input(
+            Some("The user is writing an email to a colleague about the budget."),
+            "ship it",
+        );
+        assert_eq!(plain_transcript_of(&input).split_whitespace().count(), 2);
     }
 
     #[test]

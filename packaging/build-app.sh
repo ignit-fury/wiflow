@@ -25,5 +25,12 @@ scan = b"".join(b"\x00" + raw[i:i+stride] for i in range(0, len(raw), stride))
 png += chunk(b"IDAT", zlib.compress(bytes(scan))) + chunk(b"IEND", b"")
 open(sys.argv[1], "wb").write(png)
 EOF
-codesign --force --deep --sign - "$APP"
+# A stable identity keeps macOS permissions across rebuilds
+# (create it once with: sh packaging/make-signing-cert.sh).
+if security find-identity -v -p codesigning | grep -q '"Wiflow Dev"'; then
+  codesign --force --deep --sign "Wiflow Dev" "$APP"
+else
+  echo "note: no 'Wiflow Dev' certificate; signing ad-hoc (permissions reset on every rebuild)"
+  codesign --force --deep --sign - "$APP"
+fi
 echo "built $APP"

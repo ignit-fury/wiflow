@@ -53,6 +53,26 @@ fn is_metal_init_error(msg: &str) -> bool {
     m.contains("metal") || m.contains("ggml_metal") || m.contains("mtl") || m.contains("gpu")
 }
 
+/// How Whisper decodes a clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Decode {
+    /// Beam search (5 beams) when true, one greedy pass when false.
+    beam: bool,
+    /// Temperature added on each retry when Whisper is unsure; 0 = no retries.
+    temperature_inc: f32,
+}
+
+impl Decode {
+    /// Final transcript: beam search with whisper.cpp's default 0.2 retry
+    /// step. A 0.4 step (at most 3 passes) changed words on the noisy
+    /// benchmark clip, so the default stays; `temperature_step_keeps_words`
+    /// is the gate if this is revisited.
+    pub(crate) const FULL: Decode = Decode {
+        beam: true,
+        temperature_inc: 0.2,
+    };
+}
+
 impl Stt {
     pub fn load(path: &Path) -> Result<Self, String> {
         // Metal first (fast path, unchanged behavior on success); on a
@@ -104,15 +124,30 @@ impl Stt {
         initial_prompt: &str,
         language: &str,
     ) -> Result<String, String> {
+        self.transcribe_with(samples_16k, initial_prompt, language, Decode::FULL)
+    }
+
+    pub(crate) fn transcribe_with(
+        &mut self,
+        samples_16k: &[f32],
+        initial_prompt: &str,
+        language: &str,
+        decode: Decode,
+    ) -> Result<String, String> {
         if samples_16k.is_empty() {
             return Ok(String::new());
         }
         // Beam search (whisper.cpp CLI default) over greedy: fewer dropped or
         // misheard words; cost measured in docs/perf-accuracy-plan.md.
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
-        });
+        let mut params = if decode.beam {
+            FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            })
+        } else {
+            FullParams::new(SamplingStrategy::Greedy { best_of: 1 })
+        };
+        params.set_temperature_inc(decode.temperature_inc);
         params.set_n_threads(num_threads());
         params.set_print_progress(false);
         // Use Whisper's standard multi-segment output for holds up to 60s.
@@ -1083,5 +1118,76 @@ mod tests {
             .transcribe(&tone, "", "")
             .expect("transcribe must not error");
         eprintln!("tone transcript: {text:?}");
+    }
+
+    /// Gate for `Decode::FULL`: the 0.4 step must give the same words as
+    /// whisper.cpp's 0.2 on clean and noisy clips. Needs the small model and
+    /// macOS `say`. Run: cargo test --release temperature_step -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn temperature_step_keeps_words() {
+        let path = ensure_model_variant("small").expect("small model");
+        let mut stt = Stt::load(&path).expect("load");
+        let dir = std::env::temp_dir().join("wiflow_temperature_step");
+        std::fs::create_dir_all(&dir).unwrap();
+        let phrases = [
+            "OK.",
+            "Ship it.",
+            "Book the flight for Monday, no wait, Tuesday morning.",
+            "We should hire three designers this quarter. The budget covers two senior roles and one junior role, and I want the job posts live by Friday.",
+        ];
+        let words = |s: &str| {
+            s.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let old_step = Decode {
+            beam: true,
+            temperature_inc: 0.2,
+        };
+        let (mut slowest_old, mut slowest_new) = (0u128, 0u128);
+        for (i, phrase) in phrases.iter().enumerate() {
+            let wav = dir.join(format!("{i}.wav"));
+            let ok = std::process::Command::new("say")
+                .args([
+                    "-o",
+                    wav.to_str().unwrap(),
+                    "--data-format=LEI16@16000",
+                    phrase,
+                ])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "say failed");
+            let clean: Vec<f32> = hound::WavReader::open(&wav)
+                .unwrap()
+                .into_samples::<i16>()
+                .map(|s| s.unwrap() as f32 / 32768.0)
+                .collect();
+            // A quiet, noisy copy pushes the decoder into retries: the case
+            // this change targets.
+            let noisy: Vec<f32> = clean
+                .iter()
+                .enumerate()
+                .map(|(j, s)| s * 0.3 + 0.08 * (((j * 7919) % 1000) as f32 / 500.0 - 1.0))
+                .collect();
+            for (kind, audio) in [("clean", &clean), ("noisy", &noisy)] {
+                let t = std::time::Instant::now();
+                let old = stt.transcribe_with(audio, "", "", old_step).unwrap();
+                let ms_old = t.elapsed().as_millis();
+                let t = std::time::Instant::now();
+                let new = stt.transcribe_with(audio, "", "", Decode::FULL).unwrap();
+                let ms_new = t.elapsed().as_millis();
+                eprintln!("STEP {kind} {i}: 0.2 {ms_old}ms {old:?} | FULL {ms_new}ms {new:?}");
+                assert_eq!(words(&old), words(&new), "{kind} clip {i}: words changed");
+                slowest_old = slowest_old.max(ms_old);
+                slowest_new = slowest_new.max(ms_new);
+            }
+        }
+        eprintln!("STEP slowest: 0.2 {slowest_old}ms, FULL {slowest_new}ms");
     }
 }

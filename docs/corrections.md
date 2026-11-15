@@ -14,8 +14,9 @@ discarded text. A rejected result or provider failure returns the local
 corrections. These checks are conservative heuristics, not a complete
 semantic guarantee.
 
-Cleanup provider requests share a two-second budget; Ollama generation
-also retains its 800 ms timeout. Context synthesis has its existing,
+Cleanup provider requests share a budget of two seconds plus 0.4 s per ten
+dictated words (at most six seconds); the Ollama request timeout grows the
+same way from 1.5 s. Context synthesis has its existing,
 separate timeout. Recording, Fn handling, STT provider selection, history,
 and clipboard fallback keep their existing lifecycle.
 

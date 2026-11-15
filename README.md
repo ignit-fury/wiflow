@@ -102,5 +102,17 @@ sh packaging/build-app.sh
 sh packaging/make-dmg.sh
 ```
 
+To keep macOS permissions across rebuilds, run this once first (macOS asks
+for your password to trust the certificate):
+
+```sh
+sh packaging/make-signing-cert.sh
+```
+
+`build-app.sh` then signs with this "Wiflow Dev" certificate instead of
+ad-hoc. Grant the permissions one last time after the first signed build. If
+launch at login was turned on from a terminal build, turn it off and on again
+in Wiflow so the login item points at the signed app.
+
 The build script creates an ad-hoc-signed `target/Wiflow.app`. Follow
 [NOTARIZE.md](docs/NOTARIZE.md) for signing and notarization before distribution.

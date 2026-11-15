@@ -194,3 +194,10 @@ all targets with warnings denied, formatting, and diff checks passed.
   8 s budget, edits not saved to history). Why: usage is short chat
   dictations; rewriting existing text saves the most steps. Ctrl+Space preset
   excluded (not on the event tap).
+- 2026-11-15 — Tuning: cleanup time scales with dictated words (2 s budget /
+  1.5 s Ollama + 0.4 s per 10 words, cap 6 s); Ollama no longer retries with
+  the shared fallback model; stable "Wiflow Dev" signing so permissions
+  survive rebuilds. Whisper retry cap (temperature step 0.4) was benchmarked
+  and rejected (changed words on a noisy clip), so decoding keeps the 0.2
+  default via `Decode::FULL`. Why: measured cleanup timeouts, wasted retries,
+  re-granting after every build.

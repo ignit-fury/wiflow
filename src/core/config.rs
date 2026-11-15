@@ -42,9 +42,9 @@ pub struct Config {
     /// quota errors).
     #[serde(default)]
     pub cleanup_provider: String,
-    /// Post-Processing Fallback: when the primary model fails on a provider,
-    /// the SAME provider is retried with this model before moving down the
-    /// chain.
+    /// Post-Processing Fallback: when the primary model fails on a cloud
+    /// provider (Groq, OpenRouter), the SAME provider is retried with this
+    /// model before moving down the chain. Ollama never retries with it.
     #[serde(default = "default_fallback_model")]
     pub cleanup_fallback_model: String,
     /// Context-synthesis layer (focused app → 2-sentence context hint).
