@@ -220,13 +220,11 @@ impl AudioCapture {
 
     /// Everything captured so far, without stopping (live preview). Moves new
     /// samples out of the realtime ring; `stop` returns them too.
-    #[allow(dead_code)] // called by the worker from Task 8
     pub fn snapshot(&mut self) -> &[f32] {
         self.taken.extend(self.consumer.pop_iter());
         &self.taken
     }
 
-    #[allow(dead_code)] // called by the worker from Task 8
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

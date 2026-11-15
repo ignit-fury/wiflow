@@ -237,7 +237,6 @@ pub fn transcribe_shared(
 
 /// Quick pass for the live pill (16 kHz mono in). Never used for the pasted
 /// text; hallucination tokens such as "[BLANK_AUDIO]" are stripped.
-#[allow(dead_code)] // called by the worker from Task 8
 pub fn transcribe_preview(
     model_path: &Path,
     samples: &[f32],

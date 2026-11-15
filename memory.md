@@ -201,3 +201,4 @@ all targets with warnings denied, formatting, and diff checks passed.
   and rejected (changed words on a noisy clip), so decoding keeps the 0.2
   default via `Decode::FULL`. Why: measured cleanup timeouts, wasted retries,
   re-granting after every build.
+- 2026-11-15 — Live text in the pill: worker re-transcribes the last ≤15 s every 1 s (greedy, no retries) and sends LivePreview to the pill; final paste unchanged; toggle live_preview (default on); local STT only. Why: user wants to see what has been heard while dictating; typing into the app live was rejected (flicker, fragmented undo, breaks cleanup).

@@ -33,6 +33,11 @@ OpenRouter whenever a key exists, and then the selected text is sent to that
 cloud provider; otherwise Ollama), so AI cleanup must be on. Selections up to
 about 250 words. Not for terminals.
 
+**Live text:** while you hold the key, the recording pill shows the words
+heard so far. The pasted text still comes from the full pass when you
+release. Turn it off in Settings ("Show words in the pill while dictating").
+It uses the local model only.
+
 The default hotkey is Ctrl+Space. Fn and Right Option are also available.
 For Fn, set System Settings → Keyboard → “Press 🌐 key to” to “Do Nothing”.
 Focus a text field, hold the hotkey, speak, and release. Wiflow leaves Esc
