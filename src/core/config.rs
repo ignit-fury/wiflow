@@ -54,6 +54,9 @@ pub struct Config {
     /// + delayed Music/Spotify pause, both restored exactly after).
     #[serde(default = "default_true")]
     pub duck_audio: bool,
+    /// Show the words heard so far in the recording pill while the key is held.
+    #[serde(default = "default_true")]
+    pub live_preview: bool,
     /// Small model for context synthesis.
     #[serde(default = "default_context_model")]
     pub context_model: String,
@@ -108,6 +111,7 @@ impl Default for Config {
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
+            live_preview: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -271,6 +275,7 @@ mod tests {
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
+            live_preview: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -299,6 +304,11 @@ mod tests {
         std::fs::write(&p, "{nope").unwrap();
         assert_eq!(load_config_from(&p), Config::default());
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn live_preview_defaults_on() {
+        assert!(Config::default().live_preview);
     }
 
     #[test]

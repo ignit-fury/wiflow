@@ -71,6 +71,13 @@ impl Decode {
         beam: true,
         temperature_inc: 0.2,
     };
+
+    /// Live preview while the key is held: one greedy pass, no retries. Fast;
+    /// the final transcript never uses it.
+    pub(crate) const PREVIEW: Decode = Decode {
+        beam: false,
+        temperature_inc: 0.0,
+    };
 }
 
 impl Stt {
@@ -196,13 +203,12 @@ fn audio_ctx_for(samples_16k: usize) -> i32 {
 
 static STT: OnceLock<Mutex<Option<(PathBuf, Stt)>>> = OnceLock::new();
 
-/// Load once, reload on model switch, retry after failure (Err never sticks).
+/// Run `job` on the shared model: load once, reload on model switch, retry
+/// after failure (Err never sticks).
 /// First-implemented fix for the Phase 4 `OnceLock<Result>` Err-sticks finding.
-pub fn transcribe_shared(
+fn with_shared_model(
     model_path: &Path,
-    samples: &[f32],
-    initial_prompt: &str,
-    language: &str,
+    job: impl FnOnce(&mut Stt) -> Result<String, String>,
 ) -> Result<String, String> {
     let slot = STT.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -214,11 +220,33 @@ pub fn transcribe_shared(
         crate::core::cleanup::now_ms(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    guard
-        .as_mut()
-        .expect("slot just filled")
-        .1
-        .transcribe(samples, initial_prompt, language)
+    job(&mut guard.as_mut().expect("slot just filled").1)
+}
+
+/// Load once, reload on model switch, retry after failure (Err never sticks).
+pub fn transcribe_shared(
+    model_path: &Path,
+    samples: &[f32],
+    initial_prompt: &str,
+    language: &str,
+) -> Result<String, String> {
+    with_shared_model(model_path, |stt| {
+        stt.transcribe(samples, initial_prompt, language)
+    })
+}
+
+/// Quick pass for the live pill (16 kHz mono in). Never used for the pasted
+/// text; hallucination tokens such as "[BLANK_AUDIO]" are stripped.
+#[allow(dead_code)] // called by the worker from Task 8
+pub fn transcribe_preview(
+    model_path: &Path,
+    samples: &[f32],
+    language: &str,
+) -> Result<String, String> {
+    with_shared_model(model_path, |stt| {
+        stt.transcribe_with(samples, "", language, Decode::PREVIEW)
+    })
+    .map(|text| strip_hallucination_tokens(&text).trim().to_string())
 }
 
 /// When the shared model last ran, in ms since the epoch (0 = never).
@@ -648,6 +676,37 @@ pub(crate) fn plus_to_symbol(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_with_missing_model_is_err() {
+        assert!(transcribe_preview(Path::new("/nonexistent/ggml.bin"), &[0.1; 160], "").is_err());
+    }
+
+    /// Needs the small model and `say`. Run: cargo test --release preview_hears -- --ignored
+    #[test]
+    #[ignore]
+    fn preview_hears_the_words() {
+        let path = ensure_model_variant("small").expect("small model");
+        let wav = std::env::temp_dir().join("wiflow_preview.wav");
+        let ok = std::process::Command::new("say")
+            .args([
+                "-o",
+                wav.to_str().unwrap(),
+                "--data-format=LEI16@16000",
+                "hello world",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let audio: Vec<f32> = hound::WavReader::open(&wav)
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let text = transcribe_preview(&path, &audio, "").unwrap();
+        assert!(text.to_lowercase().contains("hello"), "got {text:?}");
+    }
+
     use super::*;
     use std::path::Path;
 
