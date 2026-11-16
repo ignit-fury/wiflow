@@ -734,6 +734,10 @@ impl SettingsWindow {
             &mut vm.config.duck_audio,
             "Lower other audio while dictating",
         );
+        ui.checkbox(
+            &mut vm.config.live_preview,
+            "Show words in the pill while dictating",
+        );
         // Launch-at-login is OS state, not session state: applies at once
         // through the App (same path as the tray menu), never staged.
         let before = vm.config.launch_at_login;

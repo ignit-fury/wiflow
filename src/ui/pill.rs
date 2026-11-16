@@ -25,9 +25,41 @@ const BAR_COUNT: usize = 32;
 /// Above digital silence. Bluetooth mics deliver exact zeros while they
 /// switch profiles; a built-in mic's room noise is ~1e-4 or more.
 const LIVE_RMS: f32 = 1e-5;
+/// Pill window height: timer row, waveform, live-text row.
+const PILL_HEIGHT: f32 = 108.0;
+/// Pill window width in points.
+const PILL_WIDTH: f32 = 320.0;
+/// Characters of live text that fit the pill's one line.
+const LIVE_CHARS: usize = 44;
 /// Blend one step toward the target. Pure; unit-tested below.
 pub fn smooth_rms(prev: f32, target: f32) -> f32 {
     prev + (target - prev) * SMOOTH_ALPHA
+}
+
+/// The end of `text` that fits one pill line: whole words, with "…" in front
+/// when words were cut. Pure; unit-tested.
+pub fn live_tail(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut len = 1; // the leading "…"
+    for word in text.split_whitespace().rev() {
+        let add = word.chars().count() + usize::from(!kept.is_empty());
+        if len + add > max_chars {
+            break;
+        }
+        len += add;
+        kept.push(word);
+    }
+    if kept.is_empty() {
+        // One word longer than the line: keep its end.
+        let end: Vec<char> = text.chars().rev().take(max_chars - 1).collect();
+        return format!("…{}", end.into_iter().rev().collect::<String>());
+    }
+    kept.reverse();
+    format!("…{}", kept.join(" "))
 }
 
 /// Pill render state: what to show, derived ONLY from `show`/`hide` calls
@@ -41,6 +73,8 @@ pub struct PillState {
     history: VecDeque<f32>,
     /// A non-silent sample arrived since `show_now` (false = "connecting").
     heard: bool,
+    /// Words heard so far (live preview); cleared on every show.
+    live: String,
 }
 
 impl PillState {
@@ -51,6 +85,7 @@ impl PillState {
             smoothed: 0.0,
             history: VecDeque::with_capacity(BAR_COUNT),
             heard: false,
+            live: String::new(),
         }
     }
 
@@ -61,6 +96,16 @@ impl PillState {
         self.smoothed = 0.0;
         self.history.clear();
         self.heard = false;
+        self.live.clear();
+    }
+
+    /// Latest live-preview text (render cache only).
+    pub fn set_live(&mut self, text: String) {
+        self.live = text;
+    }
+
+    pub fn live(&self) -> &str {
+        &self.live
     }
 
     pub fn hide(&mut self) {
@@ -131,6 +176,11 @@ impl Pill {
         self.state.is_visible()
     }
 
+    /// Show the words heard so far; drawn on the next animation frame.
+    pub fn set_live_text(&mut self, text: String) {
+        self.state.set_live(text);
+    }
+
     pub fn window_id(&self) -> Option<WindowId> {
         self.gl.as_ref().map(|g| g.window_id())
     }
@@ -146,8 +196,8 @@ impl Pill {
                 event_loop,
                 &GlWindowOpts {
                     title: "wiflow",
-                    width: 320.0,
-                    height: 84.0,
+                    width: PILL_WIDTH,
+                    height: PILL_HEIGHT,
                     decorations: false,
                     always_on_top: true,
                     position: Some((x, y)),
@@ -164,10 +214,14 @@ impl Pill {
                 }
             }
         }
+        self.state.show_now();
         if let Some(g) = self.gl.as_ref() {
             crate::platform::macos::panel::order_front_without_activating(&g.window);
+            // Restart the frame loop: `frame` stops requesting redraws while
+            // hidden, so without this every hold after the first showed a
+            // frozen picture (no timer, waveform or live text).
+            g.request_redraw();
         }
-        self.state.show_now();
     }
 
     /// Hide the pill (idempotent). Called on every LISTENING exit and from
@@ -191,6 +245,7 @@ impl Pill {
         let elapsed = self.state.elapsed();
         let bars = self.state.bars();
         let connecting = self.state.connecting();
+        let live = self.state.live().to_string();
         g.paint(|ctx| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(24, 24, 28)))
@@ -238,6 +293,13 @@ impl Pill {
                                 );
                             }
                         });
+                        // Row 3: the words heard so far (live preview).
+                        if !live.is_empty() {
+                            ui.label(
+                                egui::RichText::new(live_tail(&live, LIVE_CHARS))
+                                    .color(egui::Color32::from_rgb(230, 230, 235)),
+                            );
+                        }
                     });
                 });
         });
@@ -253,15 +315,18 @@ impl Default for Pill {
 
 /// Top-center of the primary monitor, in physical pixels.
 fn pill_position(event_loop: &ActiveEventLoop) -> (i32, i32) {
-    let (w, x0) = event_loop
+    let (w, x0, scale) = event_loop
         .primary_monitor()
-        .map(|m| {
-            let s = m.size();
-            let p = m.position();
-            (s.width as i32, p.x)
-        })
-        .unwrap_or((1440, 0));
-    (x0 + w / 2 - 160, 48)
+        .map(|m| (m.size().width as i32, m.position().x, m.scale_factor()))
+        .unwrap_or((1440, 0, 1.0));
+    (centered_x(x0, w, scale), 48)
+}
+
+/// Left edge (physical px) that centres the pill on a monitor. The monitor
+/// is measured in physical pixels but the pill's width is in points, so the
+/// half-width must be scaled (it sat 80 pt right of centre on Retina).
+fn centered_x(monitor_x: i32, monitor_width_px: i32, scale: f64) -> i32 {
+    monitor_x + monitor_width_px / 2 - (PILL_WIDTH as f64 / 2.0 * scale) as i32
 }
 
 #[cfg(test)]
@@ -343,5 +408,36 @@ mod tests {
         assert_eq!(p.elapsed(), Duration::ZERO);
         p.push_sample(0.9);
         assert_eq!(p.bars().len(), BAR_COUNT, "hidden push changes nothing");
+    }
+
+    #[test]
+    fn live_text_resets_on_every_hold() {
+        let mut p = PillState::new();
+        p.show_now();
+        p.set_live("hello there".into());
+        assert_eq!(p.live(), "hello there");
+        p.show_now();
+        assert_eq!(p.live(), "", "a new hold starts empty");
+    }
+
+    #[test]
+    fn pill_is_centred_in_points_on_retina() {
+        // 1470-pt-wide Retina display = 2940 px; pill is 320 pt = 640 px.
+        assert_eq!(centered_x(0, 2940, 2.0), 1150, "pill centre at 1470 px");
+        assert_eq!(centered_x(0, 1440, 1.0), 560, "non-Retina unchanged");
+        assert_eq!(centered_x(2940, 2940, 2.0), 4090, "second monitor offset");
+    }
+
+    #[test]
+    fn live_tail_keeps_the_newest_whole_words() {
+        assert_eq!(live_tail("  short text ", 20), "short text");
+        let tail = live_tail("the quick brown fox jumps over the lazy dog", 20);
+        assert_eq!(tail, "…over the lazy dog");
+        assert!(tail.chars().count() <= 20);
+        assert_eq!(
+            live_tail("supercalifragilistic", 8),
+            "…ilistic",
+            "one long word keeps its end"
+        );
     }
 }

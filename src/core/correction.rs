@@ -223,6 +223,55 @@ pub fn deterministic_clean(input: &str, language: &str) -> String {
     result
 }
 
+/// Identical words in a row at which a run is a decoder loop, not speech.
+/// Whisper sometimes repeats the last word on retries ("test test … test");
+/// three or four repeats ("very very very") are kept as meant.
+const RUNAWAY_REPEAT: usize = 5;
+
+/// Collapse a run of `RUNAWAY_REPEAT`+ identical words (ignoring case and
+/// punctuation) to its first word plus the run's closing punctuation. Lines
+/// without such a run are returned byte for byte.
+pub fn collapse_runaway_repeats(input: &str) -> String {
+    let core = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        let words: Vec<&str> = body.split_whitespace().collect();
+        let mut kept: Vec<String> = Vec::with_capacity(words.len());
+        let mut collapsed = false;
+        let mut i = 0;
+        while i < words.len() {
+            let key = core(words[i]);
+            let mut j = i + 1;
+            while j < words.len() && !key.is_empty() && core(words[j]) == key {
+                j += 1;
+            }
+            if j - i >= RUNAWAY_REPEAT {
+                let first = words[i].trim_end_matches(|c: char| !c.is_alphanumeric());
+                let last = words[j - 1];
+                let closing = &last[last.trim_end_matches(|c: char| !c.is_alphanumeric()).len()..];
+                kept.push(format!("{first}{closing}"));
+                collapsed = true;
+            } else {
+                kept.extend(words[i..j].iter().map(|w| w.to_string()));
+            }
+            i = j;
+        }
+        if collapsed {
+            out.push_str(&kept.join(" "));
+        } else {
+            out.push_str(body);
+        }
+        out.push_str(newline);
+    }
+    out
+}
+
 fn normalize_spaces(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut space = false;
@@ -826,6 +875,37 @@ fn spoken_numbers(words: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runaway_word_repeats_collapse_to_one() {
+        assert_eq!(
+            collapse_runaway_repeats(
+                "This is the testing of test test test test test test test test test test test test test test."
+            ),
+            "This is the testing of test."
+        );
+        assert_eq!(
+            collapse_runaway_repeats("Test, test, test, test, test, test."),
+            "Test."
+        );
+        assert_eq!(
+            collapse_runaway_repeats("one\nb b b b b b\nthree"),
+            "one\nb\nthree"
+        );
+    }
+
+    #[test]
+    fn meant_repetition_and_other_text_stay_untouched() {
+        for text in [
+            "very very very good",
+            "go go go go now",
+            "hello  world, spacing kept",
+            "I had had enough.",
+            "",
+        ] {
+            assert_eq!(collapse_runaway_repeats(text), text);
+        }
+    }
 
     #[test]
     fn correction_and_preservation_corpus() {

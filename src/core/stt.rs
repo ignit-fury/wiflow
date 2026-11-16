@@ -53,6 +53,33 @@ fn is_metal_init_error(msg: &str) -> bool {
     m.contains("metal") || m.contains("ggml_metal") || m.contains("mtl") || m.contains("gpu")
 }
 
+/// How Whisper decodes a clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Decode {
+    /// Beam search (5 beams) when true, one greedy pass when false.
+    beam: bool,
+    /// Temperature added on each retry when Whisper is unsure; 0 = no retries.
+    temperature_inc: f32,
+}
+
+impl Decode {
+    /// Final transcript: beam search with whisper.cpp's default 0.2 retry
+    /// step. A 0.4 step (at most 3 passes) changed words on the noisy
+    /// benchmark clip, so the default stays; re-run
+    /// `temperature_step_keeps_words` to re-evaluate the 0.4 step.
+    pub(crate) const FULL: Decode = Decode {
+        beam: true,
+        temperature_inc: 0.2,
+    };
+
+    /// Live preview while the key is held: one greedy pass, no retries. Fast;
+    /// the final transcript never uses it.
+    pub(crate) const PREVIEW: Decode = Decode {
+        beam: false,
+        temperature_inc: 0.0,
+    };
+}
+
 impl Stt {
     pub fn load(path: &Path) -> Result<Self, String> {
         // Metal first (fast path, unchanged behavior on success); on a
@@ -104,15 +131,30 @@ impl Stt {
         initial_prompt: &str,
         language: &str,
     ) -> Result<String, String> {
+        self.transcribe_with(samples_16k, initial_prompt, language, Decode::FULL)
+    }
+
+    pub(crate) fn transcribe_with(
+        &mut self,
+        samples_16k: &[f32],
+        initial_prompt: &str,
+        language: &str,
+        decode: Decode,
+    ) -> Result<String, String> {
         if samples_16k.is_empty() {
             return Ok(String::new());
         }
         // Beam search (whisper.cpp CLI default) over greedy: fewer dropped or
         // misheard words; cost measured in docs/perf-accuracy-plan.md.
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
-        });
+        let mut params = if decode.beam {
+            FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            })
+        } else {
+            FullParams::new(SamplingStrategy::Greedy { best_of: 1 })
+        };
+        params.set_temperature_inc(decode.temperature_inc);
         params.set_n_threads(num_threads());
         params.set_print_progress(false);
         // Use Whisper's standard multi-segment output for holds up to 60s.
@@ -161,13 +203,12 @@ fn audio_ctx_for(samples_16k: usize) -> i32 {
 
 static STT: OnceLock<Mutex<Option<(PathBuf, Stt)>>> = OnceLock::new();
 
-/// Load once, reload on model switch, retry after failure (Err never sticks).
+/// Run `job` on the shared model: load once, reload on model switch, retry
+/// after failure (Err never sticks).
 /// First-implemented fix for the Phase 4 `OnceLock<Result>` Err-sticks finding.
-pub fn transcribe_shared(
+fn with_shared_model(
     model_path: &Path,
-    samples: &[f32],
-    initial_prompt: &str,
-    language: &str,
+    job: impl FnOnce(&mut Stt) -> Result<String, String>,
 ) -> Result<String, String> {
     let slot = STT.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -179,11 +220,41 @@ pub fn transcribe_shared(
         crate::core::cleanup::now_ms(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    guard
-        .as_mut()
-        .expect("slot just filled")
-        .1
-        .transcribe(samples, initial_prompt, language)
+    job(&mut guard.as_mut().expect("slot just filled").1)
+}
+
+/// Load once, reload on model switch, retry after failure (Err never sticks).
+pub fn transcribe_shared(
+    model_path: &Path,
+    samples: &[f32],
+    initial_prompt: &str,
+    language: &str,
+) -> Result<String, String> {
+    with_shared_model(model_path, |stt| {
+        stt.transcribe(samples, initial_prompt, language)
+    })
+}
+
+/// Quick pass for the live pill (16 kHz mono in). Never used for the pasted
+/// text; hallucination tokens such as "[BLANK_AUDIO]" are stripped. Skips
+/// (returns empty) instead of waiting when the model is busy, loading or not
+/// loaded, so key-up and the watchdog are never delayed.
+pub fn transcribe_preview(samples: &[f32], language: &str) -> Result<String, String> {
+    let Some(slot) = STT.get() else {
+        return Ok(String::new());
+    };
+    let Ok(mut guard) = slot.try_lock() else {
+        return Ok(String::new());
+    };
+    let Some((_, stt)) = guard.as_mut() else {
+        return Ok(String::new());
+    };
+    STT_USED_MS.store(
+        crate::core::cleanup::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    stt.transcribe_with(samples, "", language, Decode::PREVIEW)
+        .map(|text| strip_hallucination_tokens(&text).trim().to_string())
 }
 
 /// When the shared model last ran, in ms since the epoch (0 = never).
@@ -613,6 +684,40 @@ pub(crate) fn plus_to_symbol(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_skips_when_the_model_is_busy() {
+        let slot = STT.get_or_init(|| Mutex::new(None));
+        let _held = slot.lock().unwrap();
+        assert_eq!(transcribe_preview(&[0.1; 160], ""), Ok(String::new()));
+    }
+
+    /// Needs the small model and `say`. Run: cargo test --release preview_hears -- --ignored
+    #[test]
+    #[ignore]
+    fn preview_hears_the_words() {
+        let path = ensure_model_variant("small").expect("small model");
+        let wav = std::env::temp_dir().join("wiflow_preview.wav");
+        let ok = std::process::Command::new("say")
+            .args([
+                "-o",
+                wav.to_str().unwrap(),
+                "--data-format=LEI16@16000",
+                "hello world",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let audio: Vec<f32> = hound::WavReader::open(&wav)
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        warm(&path, "").unwrap();
+        let text = transcribe_preview(&audio, "").unwrap();
+        assert!(text.to_lowercase().contains("hello"), "got {text:?}");
+    }
+
     use super::*;
     use std::path::Path;
 
@@ -1083,5 +1188,77 @@ mod tests {
             .transcribe(&tone, "", "")
             .expect("transcribe must not error");
         eprintln!("tone transcript: {text:?}");
+    }
+
+    /// Re-evaluates the 0.4 retry step: it must give the same words as
+    /// `Decode::FULL` (0.2) on clean and noisy clips. Expected to fail today
+    /// (0.4 changed words on the noisy clip), hence `#[ignore]`. Needs the small model and
+    /// macOS `say`. Run: cargo test --release temperature_step -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn temperature_step_keeps_words() {
+        let path = ensure_model_variant("small").expect("small model");
+        let mut stt = Stt::load(&path).expect("load");
+        let dir = std::env::temp_dir().join("wiflow_temperature_step");
+        std::fs::create_dir_all(&dir).unwrap();
+        let phrases = [
+            "OK.",
+            "Ship it.",
+            "Book the flight for Monday, no wait, Tuesday morning.",
+            "We should hire three designers this quarter. The budget covers two senior roles and one junior role, and I want the job posts live by Friday.",
+        ];
+        let words = |s: &str| {
+            s.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let candidate = Decode {
+            beam: true,
+            temperature_inc: 0.4,
+        };
+        let (mut slowest_old, mut slowest_new) = (0u128, 0u128);
+        for (i, phrase) in phrases.iter().enumerate() {
+            let wav = dir.join(format!("{i}.wav"));
+            let ok = std::process::Command::new("say")
+                .args([
+                    "-o",
+                    wav.to_str().unwrap(),
+                    "--data-format=LEI16@16000",
+                    phrase,
+                ])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "say failed");
+            let clean: Vec<f32> = hound::WavReader::open(&wav)
+                .unwrap()
+                .into_samples::<i16>()
+                .map(|s| s.unwrap() as f32 / 32768.0)
+                .collect();
+            // A quiet, noisy copy pushes the decoder into retries: the case
+            // this change targets.
+            let noisy: Vec<f32> = clean
+                .iter()
+                .enumerate()
+                .map(|(j, s)| s * 0.3 + 0.08 * (((j * 7919) % 1000) as f32 / 500.0 - 1.0))
+                .collect();
+            for (kind, audio) in [("clean", &clean), ("noisy", &noisy)] {
+                let t = std::time::Instant::now();
+                let old = stt.transcribe_with(audio, "", "", Decode::FULL).unwrap();
+                let ms_old = t.elapsed().as_millis();
+                let t = std::time::Instant::now();
+                let new = stt.transcribe_with(audio, "", "", candidate).unwrap();
+                let ms_new = t.elapsed().as_millis();
+                eprintln!("STEP {kind} {i}: 0.2 {ms_old}ms {old:?} | 0.4 {ms_new}ms {new:?}");
+                assert_eq!(words(&old), words(&new), "{kind} clip {i}: words changed");
+                slowest_old = slowest_old.max(ms_old);
+                slowest_new = slowest_new.max(ms_new);
+            }
+        }
+        eprintln!("STEP slowest: 0.2 {slowest_old}ms, 0.4 {slowest_new}ms");
     }
 }
