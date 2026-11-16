@@ -2,7 +2,9 @@
 
 Local and cloud transcripts pass through the same correction stage before
 injection. English cleanup removes simple fillers (`um`, `uh`, `erm`) and
-obvious repeated function words such as `the the`. It preserves paragraphs,
+obvious repeated function words such as `the the`. A run of five or more identical
+words (a Whisper decoding loop such as `test test … test`) collapses to
+one word before routing; three or four repeats are kept as spoken. It preserves paragraphs,
 grammatical repetitions such as `had had`, quoted text, commands, paths,
 URLs, identifiers, acronyms, and numeric literals. Existing capitalization
 and spoken math cleanup run here too.
