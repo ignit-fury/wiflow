@@ -27,6 +27,8 @@ const BAR_COUNT: usize = 32;
 const LIVE_RMS: f32 = 1e-5;
 /// Pill window height: timer row, waveform, live-text row.
 const PILL_HEIGHT: f32 = 108.0;
+/// Pill window width in points.
+const PILL_WIDTH: f32 = 320.0;
 /// Characters of live text that fit the pill's one line.
 const LIVE_CHARS: usize = 44;
 /// Blend one step toward the target. Pure; unit-tested below.
@@ -194,7 +196,7 @@ impl Pill {
                 event_loop,
                 &GlWindowOpts {
                     title: "wiflow",
-                    width: 320.0,
+                    width: PILL_WIDTH,
                     height: PILL_HEIGHT,
                     decorations: false,
                     always_on_top: true,
@@ -212,10 +214,14 @@ impl Pill {
                 }
             }
         }
+        self.state.show_now();
         if let Some(g) = self.gl.as_ref() {
             crate::platform::macos::panel::order_front_without_activating(&g.window);
+            // Restart the frame loop: `frame` stops requesting redraws while
+            // hidden, so without this every hold after the first showed a
+            // frozen picture (no timer, waveform or live text).
+            g.request_redraw();
         }
-        self.state.show_now();
     }
 
     /// Hide the pill (idempotent). Called on every LISTENING exit and from
@@ -309,15 +315,18 @@ impl Default for Pill {
 
 /// Top-center of the primary monitor, in physical pixels.
 fn pill_position(event_loop: &ActiveEventLoop) -> (i32, i32) {
-    let (w, x0) = event_loop
+    let (w, x0, scale) = event_loop
         .primary_monitor()
-        .map(|m| {
-            let s = m.size();
-            let p = m.position();
-            (s.width as i32, p.x)
-        })
-        .unwrap_or((1440, 0));
-    (x0 + w / 2 - 160, 48)
+        .map(|m| (m.size().width as i32, m.position().x, m.scale_factor()))
+        .unwrap_or((1440, 0, 1.0));
+    (centered_x(x0, w, scale), 48)
+}
+
+/// Left edge (physical px) that centres the pill on a monitor. The monitor
+/// is measured in physical pixels but the pill's width is in points, so the
+/// half-width must be scaled (it sat 80 pt right of centre on Retina).
+fn centered_x(monitor_x: i32, monitor_width_px: i32, scale: f64) -> i32 {
+    monitor_x + monitor_width_px / 2 - (PILL_WIDTH as f64 / 2.0 * scale) as i32
 }
 
 #[cfg(test)]
@@ -409,6 +418,14 @@ mod tests {
         assert_eq!(p.live(), "hello there");
         p.show_now();
         assert_eq!(p.live(), "", "a new hold starts empty");
+    }
+
+    #[test]
+    fn pill_is_centred_in_points_on_retina() {
+        // 1470-pt-wide Retina display = 2940 px; pill is 320 pt = 640 px.
+        assert_eq!(centered_x(0, 2940, 2.0), 1150, "pill centre at 1470 px");
+        assert_eq!(centered_x(0, 1440, 1.0), 560, "non-Retina unchanged");
+        assert_eq!(centered_x(2940, 2940, 2.0), 4090, "second monitor offset");
     }
 
     #[test]
