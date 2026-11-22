@@ -1567,6 +1567,9 @@ pub fn run(initial: Config, open_window: bool) -> ! {
         println!("Wiflow is already running — showing its window.");
         std::process::exit(0);
     }
+    if let Ok(exe) = std::env::current_exe() {
+        crate::core::config::repair_launch_agent(&exe);
+    }
     let event_loop = EventLoop::<DaemonEvent>::with_user_event()
         .build()
         .expect("winit event loop");
