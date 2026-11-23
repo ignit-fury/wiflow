@@ -385,8 +385,10 @@ impl Provider {
     }
 
     /// Quota-exhausted wording (differs per provider: rate limit vs credits).
-    fn quota_issue(self, fallback: Provider) -> String {
+    /// A 401 is a rejected key, not a quota, so it says what to fix instead.
+    fn quota_issue(self, err: &str, fallback: Provider) -> String {
         let detail = match self {
+            _ if err.contains("401") => "rejected the API key (HTTP 401); update it in Settings",
             Provider::Groq => "tokens/rate limit exhausted",
             Provider::OpenRouter => "tokens/credits exhausted",
             Provider::Ollama => "quota exhausted",
@@ -533,7 +535,7 @@ fn chain_step(
             match next {
                 Some(n) => {
                     if is_quota_error(&e) {
-                        issues.push(p.quota_issue(n));
+                        issues.push(p.quota_issue(&e, n));
                     } else {
                         issues.push(format!(
                             "{} failed ({e}) — falling back to {}",
@@ -603,7 +605,7 @@ fn single_provider_chain(
         Ok(text) => Some(text),
         Err(e) => {
             if p != Provider::Ollama && is_quota_error(&e) {
-                issues.push(p.quota_issue(Provider::Ollama));
+                issues.push(p.quota_issue(&e, Provider::Ollama));
                 tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
                 chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
             } else {
@@ -647,7 +649,16 @@ pub fn edit_chat(
         Some(system),
         &CleanupBudget::for_edit(),
     )
-    .map_err(|e| format!("{} edit failed: {e}", p.name()))
+    .map_err(|e| format!("{} edit failed: {e}{}", p.name(), key_hint(&e)))
+}
+
+/// Tells the user what to fix when a provider rejects the API key.
+fn key_hint(err: &str) -> &'static str {
+    if err.contains("401") {
+        " (API key rejected; update it in Settings)"
+    } else {
+        ""
+    }
 }
 
 /// 429 (rate limit), 402 (payment/credits), or 401 (quota/auth exhausted).
@@ -1299,6 +1310,18 @@ mod tests {
         assert!(is_quota_error("HTTP 401"));
         assert!(!is_quota_error("HTTP 500"));
         assert!(!is_quota_error("network down"));
+    }
+
+    #[test]
+    fn rejected_key_is_not_reported_as_rate_limit() {
+        let msg = Provider::Groq.quota_issue("HTTP 401", Provider::Ollama);
+        assert!(msg.contains("API key"), "{msg}");
+        assert!(!msg.contains("rate limit"), "{msg}");
+        assert!(msg.ends_with("falling back to Ollama"), "{msg}");
+        let msg = Provider::Groq.quota_issue("HTTP 429", Provider::Ollama);
+        assert!(msg.contains("rate limit"), "{msg}");
+        assert!(key_hint("HTTP 401").contains("Settings"));
+        assert_eq!(key_hint("HTTP 500"), "");
     }
 
     #[test]
