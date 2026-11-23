@@ -388,7 +388,9 @@ impl Provider {
     /// A 401 is a rejected key, not a quota, so it says what to fix instead.
     fn quota_issue(self, err: &str, fallback: Provider) -> String {
         let detail = match self {
-            _ if err.contains("401") => "rejected the API key (HTTP 401); update it in Settings",
+            _ if err.contains("401") => {
+                "rejected the API key (HTTP 401); update it in AI Keys & Models in the menu bar"
+            }
             Provider::Groq => "tokens/rate limit exhausted",
             Provider::OpenRouter => "tokens/credits exhausted",
             Provider::Ollama => "quota exhausted",
@@ -655,9 +657,51 @@ pub fn edit_chat(
 /// Tells the user what to fix when a provider rejects the API key.
 fn key_hint(err: &str) -> &'static str {
     if err.contains("401") {
-        " (API key rejected; update it in Settings)"
+        " (API key rejected; update it in AI Keys & Models in the menu bar)"
     } else {
         ""
+    }
+}
+
+/// One line per provider for the "Test API Keys" menu item: does each saved
+/// key work? Makes a free authenticated GET (no tokens used); blocking, so
+/// call it off the event loop.
+pub fn check_keys() -> String {
+    let probe = |url: &str, key: Option<String>| {
+        key.map(|k| {
+            http()
+                .get(url)
+                .timeout(Duration::from_secs(8))
+                .set("Authorization", &format!("Bearer {k}"))
+                .call()
+                .map(|_| ())
+                .map_err(|e| match e {
+                    ureq::Error::Status(code, _) => format!("HTTP {code}"),
+                    other => format!("{other}"),
+                })
+        })
+    };
+    [
+        key_verdict(
+            "Groq",
+            probe("https://api.groq.com/openai/v1/models", groq_key()),
+        ),
+        key_verdict(
+            "OpenRouter",
+            probe("https://openrouter.ai/api/v1/key", openrouter_key()),
+        ),
+    ]
+    .join("\n")
+}
+
+fn key_verdict(name: &str, result: Option<Result<(), String>>) -> String {
+    match result {
+        None => format!("{name}: not set"),
+        Some(Ok(())) => format!("{name}: works"),
+        Some(Err(e)) if e.contains("401") || e.contains("403") => {
+            format!("{name}: rejected, paste a new key")
+        }
+        Some(Err(e)) => format!("{name}: couldn't check ({})", truncate(&e)),
     }
 }
 
@@ -1312,6 +1356,32 @@ mod tests {
         assert!(!is_quota_error("network down"));
     }
 
+    /// Network: checks the real saved keys. Prints only the verdict.
+    /// `cargo test live_key_check -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_key_check() {
+        let verdict = check_keys();
+        println!("{verdict}");
+        assert!(verdict.starts_with("Groq: ") && verdict.contains("\nOpenRouter: "));
+    }
+
+    #[test]
+    fn key_check_says_what_to_do() {
+        assert_eq!(key_verdict("Groq", None), "Groq: not set");
+        assert_eq!(key_verdict("Groq", Some(Ok(()))), "Groq: works");
+        for code in ["HTTP 401", "HTTP 403"] {
+            assert_eq!(
+                key_verdict("Groq", Some(Err(code.into()))),
+                "Groq: rejected, paste a new key"
+            );
+        }
+        assert_eq!(
+            key_verdict("OpenRouter", Some(Err("HTTP 503".into()))),
+            "OpenRouter: couldn't check (HTTP 503)"
+        );
+    }
+
     #[test]
     fn rejected_key_is_not_reported_as_rate_limit() {
         let msg = Provider::Groq.quota_issue("HTTP 401", Provider::Ollama);
@@ -1320,7 +1390,7 @@ mod tests {
         assert!(msg.ends_with("falling back to Ollama"), "{msg}");
         let msg = Provider::Groq.quota_issue("HTTP 429", Provider::Ollama);
         assert!(msg.contains("rate limit"), "{msg}");
-        assert!(key_hint("HTTP 401").contains("Settings"));
+        assert!(key_hint("HTTP 401").contains("AI Keys"));
         assert_eq!(key_hint("HTTP 500"), "");
     }
 

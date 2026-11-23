@@ -155,6 +155,7 @@ pub struct MenuIds {
     key_openrouter: MenuId,
     key_groq_clear: MenuId,
     key_or_clear: MenuId,
+    key_test: MenuId,
     ollama_models: Vec<(String, MenuId)>,
     ollama_refresh: MenuId,
     show_logs: MenuId,
@@ -204,6 +205,7 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
         key_openrouter: MenuId::new("wiflow:key:openrouter"),
         key_groq_clear: MenuId::new("wiflow:key:groq:clear"),
         key_or_clear: MenuId::new("wiflow:key:or:clear"),
+        key_test: MenuId::new("wiflow:key:test"),
         ollama_models: ollama_models
             .iter()
             .enumerate()
@@ -437,8 +439,20 @@ pub fn build_menu(
         or_set,
         None,
     );
+    let key_test = MenuItem::with_id(
+        ids.key_test.clone(),
+        "Test API Keys",
+        groq_set || or_set,
+        None,
+    );
     ai_menu
-        .append_items(&[&key_groq, &key_openrouter, &key_groq_clear, &key_or_clear])
+        .append_items(&[
+            &key_groq,
+            &key_openrouter,
+            &key_groq_clear,
+            &key_or_clear,
+            &key_test,
+        ])
         .expect("menu append");
     ai_menu
         .append(&PredefinedMenuItem::separator())
@@ -772,6 +786,17 @@ impl DaemonApp {
     }
 
     /// Note only when it won't clobber the recording indicator.
+    /// Check the saved API keys off the event loop; the verdict arrives as a
+    /// notification (keys are never logged, only the verdict).
+    fn test_api_keys(&self) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let verdict = crate::core::cleanup::check_keys();
+            tracing::info!("api key check: {}", verdict.replace('\n', "; "));
+            let _ = proxy.send_event(DaemonEvent::Notice(verdict));
+        });
+    }
+
     fn warn_note(&mut self, msg: String) {
         tracing::warn!("{msg}");
         if self.state != AppState::Recording {
@@ -992,6 +1017,7 @@ impl DaemonApp {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("groq api key saved");
+                        self.test_api_keys();
                     }
                     Err(e) => self.warn_note(format!("save groq key failed: {e}")),
                 },
@@ -1005,11 +1031,16 @@ impl DaemonApp {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("openrouter api key saved");
+                        self.test_api_keys();
                     }
                     Err(e) => self.warn_note(format!("save openrouter key failed: {e}")),
                 },
                 None => tracing::debug!("openrouter key dialog cancelled"),
             }
+            return;
+        }
+        if *id == ids.key_test {
+            self.test_api_keys();
             return;
         }
         if *id == ids.key_groq_clear {
@@ -1743,6 +1774,7 @@ mod tests {
             ids.key_openrouter,
             ids.key_groq_clear,
             ids.key_or_clear,
+            ids.key_test,
             ids.ollama_refresh,
             ids.show_logs,
             ids.settings_window,

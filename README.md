@@ -60,7 +60,10 @@ default; configured cloud cleanup providers receive transcript/context
 text. Disable those options in Settings for a fully local workflow, or
 choose local Ollama. Cloud providers require your own credentials.
 
-Add API keys through Settings. Wiflow also reads `GROQ_API_KEY` and
+Add API keys from the menu bar under **AI Keys & Models**. Saving a key
+checks it, and **Test API Keys** checks both again later; the result
+appears as a notification ("works", "not set" or "rejected"). The check
+uses no tokens. Wiflow also reads `GROQ_API_KEY` and
 `OPENROUTER_API_KEY`; nonempty environment values override saved keys.
 Keep credentials outside the repository.
 
