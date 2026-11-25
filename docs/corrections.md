@@ -14,7 +14,8 @@ use the configured AI cleanup chain. Its result is checked for changed
 protected content, negation, unsupported numbers, added vocabulary, and
 discarded text. A rejected result or provider failure returns the local
 corrections. These checks are conservative heuristics, not a complete
-semantic guarantee.
+semantic guarantee. A provider that reports a token limit is skipped until
+the limit resets; see the README.
 
 Cleanup provider requests share a budget of two seconds plus 0.4 s per ten
 dictated words (at most six seconds); the Ollama request timeout grows the

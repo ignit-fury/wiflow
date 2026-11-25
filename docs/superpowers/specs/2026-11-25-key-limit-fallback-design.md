@@ -1,7 +1,7 @@
 # Fallback when an API key runs out of tokens — design
 
 Date: 2026-11-25
-Status: approved design, not implemented
+Status: implemented
 
 ## Goal
 
@@ -84,8 +84,7 @@ Voice-edit uses the same order. It keeps its own budget (8 s) and its
 ## Error handling
 
 - The store lives in memory only; a restart clears it.
-- A poisoned store lock is treated as "nothing skipped", so cleanup still
-  runs.
+- A poisoned store lock is recovered (its data is plain instants), so cleanup still runs.
 - If the fallback also fails, today's messages and raw-text paste apply.
 
 ## Testing
@@ -113,3 +112,9 @@ dictation does not call the skipped provider.
 - Groq speech-to-text (already falls back to local Whisper).
 - Remembering skip periods across restarts.
 - Parsing Groq's `x-ratelimit-reset-*` headers; `Retry-After` is enough.
+
+## As built
+
+- The live check is an ignored test (`live_skipped_groq_uses_ollama`)
+  that starts a skip period in code; the banner uses the existing
+  `DaemonEvent::Notice` path.

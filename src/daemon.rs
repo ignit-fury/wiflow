@@ -388,6 +388,9 @@ fn pipeline_on_worker(
     for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
+    if let Some(notice) = crate::core::cleanup::take_limit_notice() {
+        let _ = proxy.send_event(DaemonEvent::Notice(notice));
+    }
     if crate::core::cleanup::is_filler_result(&cleaned) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
@@ -452,7 +455,11 @@ fn finish_edit(
         return end(String::new());
     }
     let t0 = Instant::now();
-    match crate::core::edit::run(instruction, selected.as_deref(), cfg) {
+    let result = crate::core::edit::run(instruction, selected.as_deref(), cfg);
+    if let Some(notice) = crate::core::cleanup::take_limit_notice() {
+        let _ = proxy.send_event(DaemonEvent::Notice(notice));
+    }
+    match result {
         Ok(_) if selection_moved(selected.as_deref(), recheck()) => {
             let notice = "The selection changed, so the edit was not applied.".to_string();
             tracing::warn!("edit not applied: {notice}");

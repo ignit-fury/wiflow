@@ -752,7 +752,6 @@ fn skips() -> std::sync::MutexGuard<'static, Skips> {
 }
 
 /// The notice from a skip period that just started, once.
-#[allow(dead_code)] // used from Task 4
 pub fn take_limit_notice() -> Option<String> {
     skips().notice.take()
 }
@@ -1909,5 +1908,26 @@ mod tests {
             Ok(()) => {} // running + model installed
             Err(e) => eprintln!("skipped (ollama not ready here): {e}"),
         }
+    }
+
+    /// Needs Ollama running. A skipped Groq is never called: with a working
+    /// or a rejected Groq key alike, the only provider used is Ollama.
+    /// `cargo test live_skipped_groq_uses_ollama -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_skipped_groq_uses_ollama() {
+        start_skip(Groq, Duration::from_secs(30), Ollama);
+        assert_eq!(
+            take_limit_notice().as_deref(),
+            Some("Groq is out of tokens; using Ollama for about 1 min.")
+        );
+        let cfg = crate::core::config::Config {
+            cleanup_provider: "groq".into(),
+            ..Default::default()
+        };
+        let out = clean_chain("um so the meeting is on friday", &cfg);
+        println!("{out:?}");
+        assert!(out.issues.is_empty(), "Groq was called: {:?}", out.issues);
+        assert!(!out.text.trim().is_empty());
     }
 }

@@ -67,6 +67,12 @@ uses no tokens. Wiflow also reads `GROQ_API_KEY` and
 `OPENROUTER_API_KEY`; nonempty environment values override saved keys.
 Keep credentials outside the repository.
 
+When Groq or OpenRouter says a key is out of tokens (HTTP 429 or 402),
+Wiflow stops using it until the limit resets (the provider's wait time,
+or 1 minute) and shows one notification. Meanwhile dictation and
+voice-edit use the fallback chosen in Settings under "When an API key
+runs out of tokens": local Ollama (default) or the auto chain.
+
 | Data | Location |
 | --- | --- |
 | Settings, keys, history, vocabulary | `~/Library/Application Support/wiflow/` |
