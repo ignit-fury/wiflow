@@ -485,6 +485,108 @@ fn try_provider_with_retry(
     }
 }
 
+fn has_key(p: Provider) -> bool {
+    match p {
+        Provider::Groq => groq_key().is_some(),
+        Provider::OpenRouter => openrouter_key().is_some(),
+        Provider::Ollama => true,
+    }
+}
+
+/// Providers to try, in order, for one cleanup or edit. `configured` is
+/// `cleanup_provider`, `fallback` is `cleanup_limit_fallback`. Skipped
+/// providers are left out; Ollama is never skipped and always last. The
+/// bool is true when the first entry is the explicitly chosen provider:
+/// its non-key, non-limit errors end the call (today's rule).
+fn route(
+    configured: &str,
+    fallback: &str,
+    has_key: impl Fn(Provider) -> bool,
+    skipped: impl Fn(Provider) -> bool,
+) -> (Vec<Provider>, bool) {
+    let auto = |leave_out: Option<Provider>| -> Vec<Provider> {
+        [Provider::Groq, Provider::OpenRouter]
+            .into_iter()
+            .filter(|&p| Some(p) != leave_out && has_key(p) && !skipped(p))
+            .chain([Provider::Ollama])
+            .collect()
+    };
+    let chosen = match configured {
+        "groq" => Provider::Groq,
+        "openrouter" => Provider::OpenRouter,
+        "ollama" => return (vec![Provider::Ollama], true),
+        _ => return (auto(None), false),
+    };
+    let rest = if fallback == "auto" {
+        auto(Some(chosen))
+    } else {
+        vec![Provider::Ollama]
+    };
+    if skipped(chosen) {
+        (rest, false)
+    } else {
+        (std::iter::once(chosen).chain(rest).collect(), true)
+    }
+}
+
+/// Try `order` until one provider succeeds. A token limit (429/402) calls
+/// `on_limit(provider, skip time, next provider)`. With `strict`, the first
+/// provider falls back only on key or limit errors. Issue texts match the
+/// old chain. Err carries the last provider tried and its error.
+fn walk(
+    order: &[Provider],
+    strict: bool,
+    issues: &mut Vec<String>,
+    mut try_one: impl FnMut(Provider) -> Result<String, String>,
+    mut on_limit: impl FnMut(Provider, Duration, Provider),
+) -> Result<String, (Provider, String)> {
+    let mut last = (Provider::Ollama, String::from("no provider to try"));
+    for (i, &p) in order.iter().enumerate() {
+        let e = match try_one(p) {
+            Ok(text) => return Ok(text),
+            Err(e) => e,
+        };
+        tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
+        let first_strict = strict && i == 0;
+        let next = order
+            .get(i + 1)
+            .copied()
+            .filter(|_| !first_strict || is_quota_error(&e));
+        if let Some(d) = skip_for(&e) {
+            on_limit(p, d, next.unwrap_or(Provider::Ollama));
+        }
+        match next {
+            Some(n) if is_quota_error(&e) => issues.push(p.quota_issue(&e, n)),
+            Some(n) => issues.push(format!(
+                "{} failed ({e}) — falling back to {}",
+                p.name(),
+                n.name()
+            )),
+            None if first_strict => issues.push(format!("{} failed: {e}", p.name())),
+            None => issues.push(format!("{} fallback failed: {e}", p.name())),
+        }
+        last = (p, e);
+        if next.is_none() {
+            break;
+        }
+    }
+    Err(last)
+}
+
+fn start_skip(p: Provider, d: Duration, next: Provider) {
+    skips().start(p, d, Instant::now(), next);
+}
+
+fn route_for(cfg: &crate::core::config::Config) -> (Vec<Provider>, bool) {
+    let now = Instant::now();
+    route(
+        &cfg.cleanup_provider,
+        &cfg.cleanup_limit_fallback,
+        has_key,
+        |p| skips().is_skipped(p, now),
+    )
+}
+
 /// Run the full provider chain. Never fails: worst case the input is
 /// returned unchanged with issues recorded for the UI alert.
 pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> CleanupOutcome {
@@ -496,162 +598,39 @@ pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> Clean
         };
     }
     let budget = CleanupBudget::new(plain_transcript_of(transcript).split_whitespace().count());
-    let provider = if cfg.cleanup_provider.is_empty() {
-        "auto"
-    } else {
-        cfg.cleanup_provider.as_str()
-    };
-    let text = match provider {
-        "groq" => single_provider_chain(transcript, cfg, &[Provider::Groq], &mut issues, &budget),
-        "openrouter" => single_provider_chain(
-            transcript,
-            cfg,
-            &[Provider::OpenRouter],
-            &mut issues,
-            &budget,
-        ),
-        "ollama" => {
-            single_provider_chain(transcript, cfg, &[Provider::Ollama], &mut issues, &budget)
-        }
-        _ => full_chain(transcript, cfg, &mut issues, &budget),
-    };
+    let (order, strict) = route_for(cfg);
+    let text = walk(
+        &order,
+        strict,
+        &mut issues,
+        |p| try_provider_with_retry(p, cfg, transcript, &budget),
+        start_skip,
+    )
+    .ok();
     CleanupOutcome {
         text: text.unwrap_or_else(|| transcript.to_string()),
         issues,
     }
 }
 
-/// One chain step: try `p`; on failure push the user-facing issue and fall
-/// back to `next` (when present). Returns Some(cleaned) on success.
-fn chain_step(
-    p: Provider,
-    cfg: &crate::core::config::Config,
-    transcript: &str,
-    next: Option<Provider>,
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    match try_provider_with_retry(p, cfg, transcript, budget) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            match next {
-                Some(n) => {
-                    if is_quota_error(&e) {
-                        issues.push(p.quota_issue(&e, n));
-                    } else {
-                        issues.push(format!(
-                            "{} failed ({e}) — falling back to {}",
-                            p.name(),
-                            n.name()
-                        ));
-                    }
-                }
-                None => issues.push(format!("{} fallback failed: {e}", p.name())),
-            }
-            tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-            None
-        }
-    }
-}
-
-/// Auto chain (existing behavior): Groq → OpenRouter → Ollama, silently
-/// skipping cloud providers with no key.
-fn full_chain(
-    transcript: &str,
-    cfg: &crate::core::config::Config,
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    // 1. Groq (fastest cloud, generous free tier). No key → skip silently.
-    if groq_key().is_some() {
-        if let Some(text) = chain_step(
-            Provider::Groq,
-            cfg,
-            transcript,
-            Some(Provider::OpenRouter),
-            issues,
-            budget,
-        ) {
-            return Some(text);
-        }
-    }
-    // 2. OpenRouter (free-tier models available).
-    if openrouter_key().is_some() {
-        if let Some(text) = chain_step(
-            Provider::OpenRouter,
-            cfg,
-            transcript,
-            Some(Provider::Ollama),
-            issues,
-            budget,
-        ) {
-            return Some(text);
-        }
-    }
-    // 3. Ollama local ($0, offline). Background model check with guidance.
-    chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
-}
-
-/// Explicit provider: only that one, with Ollama fallback on quota errors
-/// (user requirement: alert + switch to Ollama) — not other errors, unless
-/// the provider IS ollama.
-fn single_provider_chain(
-    transcript: &str,
-    cfg: &crate::core::config::Config,
-    providers: &[Provider],
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    let p = providers[0];
-    match try_provider_with_retry(p, cfg, transcript, budget) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            if p != Provider::Ollama && is_quota_error(&e) {
-                issues.push(p.quota_issue(&e, Provider::Ollama));
-                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-                chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
-            } else {
-                issues.push(format!("{} failed: {e}", p.name()));
-                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-                None
-            }
-        }
-    }
-}
-
-/// Provider for one edit: the configured one, or for "auto" the first with a
-/// key (Groq, then OpenRouter), else local Ollama.
-fn edit_provider(provider: &str, has_groq: bool, has_openrouter: bool) -> Provider {
-    match provider {
-        "groq" => Provider::Groq,
-        "openrouter" => Provider::OpenRouter,
-        "ollama" => Provider::Ollama,
-        _ if has_groq => Provider::Groq,
-        _ if has_openrouter => Provider::OpenRouter,
-        _ => Provider::Ollama,
-    }
-}
-
-/// One edit request to the configured provider. No fallback chain: a failed
-/// edit leaves the user's text alone and says why.
+/// One edit, routed like dictation cleanup (skipped keys left out, the
+/// fallback setting applies). A failed edit leaves the user's text alone
+/// and says why.
 pub fn edit_chat(
     system: &str,
     user: &str,
     cfg: &crate::core::config::Config,
 ) -> Result<String, String> {
-    let p = edit_provider(
-        &cfg.cleanup_provider,
-        groq_key().is_some(),
-        openrouter_key().is_some(),
-    );
-    try_provider_model(
-        p,
-        provider_model(p, cfg),
-        user,
-        Some(system),
-        &CleanupBudget::for_edit(),
+    let budget = CleanupBudget::for_edit();
+    let (order, strict) = route_for(cfg);
+    walk(
+        &order,
+        strict,
+        &mut Vec::new(),
+        |p| try_provider_model(p, provider_model(p, cfg), user, Some(system), &budget),
+        start_skip,
     )
-    .map_err(|e| format!("{} edit failed: {e}{}", p.name(), key_hint(&e)))
+    .map_err(|(p, e)| format!("{} edit failed: {e}{}", p.name(), key_hint(&e)))
 }
 
 /// One line per provider for the "Test API Keys" menu item: does each saved
@@ -721,7 +700,6 @@ const MAX_SKIP: Duration = Duration::from_secs(3600);
 
 /// How long to skip a provider after this error: only token or credit
 /// limits (429/402) count; a rejected key (401) does not fix itself in time.
-#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
 fn skip_for(err: &str) -> Option<Duration> {
     if !(status_is(err, 429) || status_is(err, 402)) {
         return None;
@@ -735,14 +713,12 @@ fn skip_for(err: &str) -> Option<Duration> {
 
 /// Cloud providers skipped after a token limit, until the limit resets,
 /// plus the one notice to show when a skip period starts. Memory only.
-#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
 #[derive(Debug, Default)]
 struct Skips {
     until: Vec<(Provider, Instant)>,
     notice: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
 impl Skips {
     fn is_skipped(&self, p: Provider, now: Instant) -> bool {
         self.until.iter().any(|&(q, t)| q == p && now < t)
@@ -764,13 +740,11 @@ impl Skips {
     }
 }
 
-#[allow(dead_code)] // used from Task 3
 static SKIPS: std::sync::Mutex<Skips> = std::sync::Mutex::new(Skips {
     until: Vec::new(),
     notice: None,
 });
 
-#[allow(dead_code)] // used from Task 3
 fn skips() -> std::sync::MutexGuard<'static, Skips> {
     SKIPS
         .lock()
@@ -1303,17 +1277,110 @@ mod tests {
         );
     }
 
+    use Provider::{Groq, Ollama, OpenRouter};
+
     #[test]
-    fn edit_provider_follows_config_then_keys() {
-        assert_eq!(edit_provider("groq", false, false), Provider::Groq);
+    fn route_without_limits_matches_todays_order() {
+        let keys = |_: Provider| true;
+        let no_keys = |_: Provider| false;
+        let free = |_: Provider| false;
         assert_eq!(
-            edit_provider("openrouter", false, false),
-            Provider::OpenRouter
+            route("auto", "ollama", keys, free),
+            (vec![Groq, OpenRouter, Ollama], false)
         );
-        assert_eq!(edit_provider("ollama", true, true), Provider::Ollama);
-        assert_eq!(edit_provider("auto", true, true), Provider::Groq);
-        assert_eq!(edit_provider("", false, true), Provider::OpenRouter);
-        assert_eq!(edit_provider("auto", false, false), Provider::Ollama);
+        assert_eq!(route("", "auto", no_keys, free), (vec![Ollama], false));
+        assert_eq!(
+            route("groq", "ollama", keys, free),
+            (vec![Groq, Ollama], true)
+        );
+        assert_eq!(route("ollama", "auto", keys, free), (vec![Ollama], true));
+        assert_eq!(
+            route("openrouter", "auto", keys, free),
+            (vec![OpenRouter, Groq, Ollama], true)
+        );
+        assert_eq!(
+            route("groq", "bogus", keys, free),
+            (vec![Groq, Ollama], true)
+        );
+    }
+
+    #[test]
+    fn route_leaves_out_skipped_providers() {
+        let keys = |_: Provider| true;
+        let groq_limited = |p: Provider| p == Groq;
+        assert_eq!(
+            route("groq", "ollama", keys, groq_limited),
+            (vec![Ollama], false)
+        );
+        assert_eq!(
+            route("groq", "auto", keys, groq_limited),
+            (vec![OpenRouter, Ollama], false)
+        );
+        assert_eq!(
+            route("auto", "ollama", keys, groq_limited),
+            (vec![OpenRouter, Ollama], false)
+        );
+        assert_eq!(
+            route("groq", "auto", |p| p != OpenRouter, groq_limited),
+            (vec![Ollama], false)
+        );
+    }
+
+    #[test]
+    fn walk_records_limits_and_keeps_issue_texts() {
+        let mut issues = Vec::new();
+        let mut limits = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            false,
+            &mut issues,
+            |p| match p {
+                Groq => Err("HTTP 429 (retry after 12s)".into()),
+                _ => Ok("clean".into()),
+            },
+            |p, d, next| limits.push((p, d, next)),
+        );
+        assert_eq!(out, Ok("clean".to_string()));
+        assert_eq!(limits, [(Groq, Duration::from_secs(12), Ollama)]);
+        assert_eq!(
+            issues,
+            ["Groq tokens/rate limit exhausted — falling back to Ollama"]
+        );
+    }
+
+    #[test]
+    fn walk_explicit_provider_falls_back_only_on_key_or_limit_errors() {
+        let mut tried = Vec::new();
+        let mut issues = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            true,
+            &mut issues,
+            |p| {
+                tried.push(p);
+                Err("HTTP 500".into())
+            },
+            |_, _, _| panic!("500 is not a limit"),
+        );
+        assert_eq!(out, Err((Groq, "HTTP 500".to_string())));
+        assert_eq!(tried, [Groq]);
+        assert_eq!(issues, ["Groq failed: HTTP 500"]);
+
+        let mut issues = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            true,
+            &mut issues,
+            |p| match p {
+                Groq => Err("HTTP 401".into()),
+                _ => Err("down".into()),
+            },
+            |_, _, _| panic!("401 starts no skip"),
+        );
+        assert_eq!(out, Err((Ollama, "down".to_string())));
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].contains("API key"), "{issues:?}");
+        assert_eq!(issues[1], "Ollama fallback failed: down");
     }
 
     #[test]
