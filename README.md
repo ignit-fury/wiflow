@@ -63,7 +63,9 @@ choose local Ollama. Cloud providers require your own credentials.
 Add API keys from the menu bar under **AI Keys & Models**. Saving a key
 checks it, and **Test API Keys** checks both again later; the result
 appears as a notification ("works", "not set" or "rejected"). The check
-uses no tokens. Wiflow also reads `GROQ_API_KEY` and
+uses no tokens. **Get Groq Key…** opens console.groq.com/keys; sign in,
+create a key and click Copy within 2 minutes, and Wiflow offers to save
+it, clears it from the clipboard and checks it. Wiflow also reads `GROQ_API_KEY` and
 `OPENROUTER_API_KEY`; nonempty environment values override saved keys.
 Keep credentials outside the repository.
 

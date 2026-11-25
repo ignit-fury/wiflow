@@ -346,6 +346,28 @@ pub fn prompt_for_key(title: &str, prompt: &str) -> Option<String> {
     parse_dialog_text(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Where Groq API keys are created (needs the user's own sign-in).
+pub const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
+
+/// A Groq API key as copied from the Groq console: "gsk_" then 40–80
+/// letters and digits, nothing around it. Callers trim first.
+pub fn looks_like_groq_key(s: &str) -> bool {
+    s.strip_prefix("gsk_").is_some_and(|rest| {
+        (40..=80).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Save/Cancel dialog; true only when the user clicks Save.
+pub fn confirm_save(prompt: &str) -> bool {
+    let script = format!(
+        "display dialog \"{prompt}\" buttons {{\"Cancel\", \"Save\"}} default button \"Save\" with title \"Wiflow\""
+    );
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Parse osascript dialog stdout (`text returned:secret, button
 /// returned:OK`). None when canceled or empty.
 pub fn parse_dialog_text(out: &str) -> Option<String> {
@@ -1655,6 +1677,23 @@ mod tests {
         let verdict = check_keys();
         println!("{verdict}");
         assert!(verdict.starts_with("Groq: ") && verdict.contains("\nOpenRouter: "));
+    }
+
+    #[test]
+    fn copied_groq_keys_are_recognised() {
+        let key = format!("gsk_{}", "aB3".repeat(17) + "x");
+        assert_eq!(key.len(), 56);
+        assert!(looks_like_groq_key(&key));
+        for not_a_key in [
+            "gsk_short",
+            "sk-or-v1-0123456789abcdef0123456789abcdef0123456789",
+            "the gsk_ key is below",
+            &format!("{key} and more"),
+            &format!("gsk_{}", "a-b".repeat(18)),
+            "",
+        ] {
+            assert!(!looks_like_groq_key(not_a_key), "{not_a_key}");
+        }
     }
 
     #[test]
