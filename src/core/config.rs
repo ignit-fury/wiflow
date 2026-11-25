@@ -42,6 +42,11 @@ pub struct Config {
     /// quota errors).
     #[serde(default)]
     pub cleanup_provider: String,
+    /// Used while a cloud key is skipped after a token limit (HTTP 429/402):
+    /// "ollama" (default) or "auto" (the other cloud provider with a key,
+    /// then Ollama). Any other value behaves as "ollama".
+    #[serde(default = "default_limit_fallback")]
+    pub cleanup_limit_fallback: String,
     /// Post-Processing Fallback: when the primary model fails on a cloud
     /// provider (Groq, OpenRouter), the SAME provider is retried with this
     /// model before moving down the chain. Ollama never retries with it.
@@ -87,6 +92,9 @@ fn default_fallback_model() -> String {
 fn default_context_model() -> String {
     "qwen/qwen3.8-27b".into()
 }
+fn default_limit_fallback() -> String {
+    "ollama".into()
+}
 fn default_stt_provider() -> String {
     "local".into()
 }
@@ -108,6 +116,7 @@ impl Default for Config {
             cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_limit_fallback: "ollama".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
@@ -326,6 +335,7 @@ mod tests {
             cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_limit_fallback: "auto".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
@@ -373,6 +383,13 @@ mod tests {
     #[test]
     fn test_default_cleanup_provider_is_auto() {
         assert_eq!(Config::default().cleanup_provider, "auto");
+    }
+
+    #[test]
+    fn old_config_falls_back_to_ollama_on_key_limits() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.cleanup_limit_fallback, "ollama");
+        assert_eq!(Config::default().cleanup_limit_fallback, "ollama");
     }
 
     #[test]

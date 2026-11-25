@@ -681,7 +681,7 @@ impl DaemonApp {
                 // paths; a stale staged copy must never undo them.
                 cfg.hotkey_preset = self.preset;
                 cfg.launch_at_login = self.config.launch_at_login;
-                self.config = cfg;
+                self.config = *cfg;
                 self.save();
                 self.menu_dirty = true;
                 tracing::info!("settings saved (apply to the next hold)");

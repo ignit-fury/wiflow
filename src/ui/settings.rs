@@ -109,7 +109,7 @@ pub fn format_test_record_result(rms: f32, samples: usize, sample_rate: u32) -> 
 #[derive(Debug, Clone)]
 pub enum SettingsIntent {
     /// Persist the staged config (H24: applies to the next hold).
-    Save(Config),
+    Save(Box<Config>),
     /// Switch the PTT preset (existing menu path).
     SwitchHotkey(HotkeyPreset),
     /// Copy a history entry to the clipboard (App owns arboard).
@@ -401,7 +401,7 @@ impl SettingsWindow {
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {
-                                intents.push(SettingsIntent::Save(vm.config.clone()));
+                                intents.push(SettingsIntent::Save(Box::new(vm.config.clone())));
                                 *save_msg = Some("saved — applies to the next hold".into());
                             }
                             if ui.button("Revert").clicked() {
@@ -699,6 +699,16 @@ impl SettingsWindow {
                     ("ollama", "Ollama"),
                 ] {
                     ui.radio_value(&mut vm.config.cleanup_provider, value.to_string(), name);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("When an API key runs out of tokens:");
+                for (value, name) in [("ollama", "Local Ollama"), ("auto", "Auto chain")] {
+                    ui.radio_value(
+                        &mut vm.config.cleanup_limit_fallback,
+                        value.to_string(),
+                        name,
+                    );
                 }
             });
             ui.horizontal(|ui| {
