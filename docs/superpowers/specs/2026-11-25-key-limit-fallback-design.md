@@ -25,8 +25,9 @@ follow it. The user's saved provider never changes.
 ### What counts as out of tokens
 
 HTTP 429 (rate or token limit) and HTTP 402 (no credits). The key is
-then skipped for the time in the response's `Retry-After` header (whole
-seconds). Without a usable header the time is 60 s. It is capped at
+then skipped. For 429 the time is the response's `Retry-After` header
+(whole seconds), never less than 60 s (also when the header is missing,
+0 or a date) and capped at 1 hour. For 402 (no credits) it is always
 1 hour.
 
 HTTP 401 (rejected key) is not a limit. That one dictation or edit uses
@@ -64,8 +65,8 @@ Voice-edit uses the same order. It keeps its own budget (8 s) and its
 ### Messages
 
 - When a skip period starts, one notification: for example "Groq is out
-  of tokens; using Ollama for about 1 min." The tray note shows the
-  same text.
+  of tokens; using Ollama for about 1 min." The banner shows this
+  notice; the tray note keeps the existing per-dictation issue text.
 - While the provider stays skipped, no further messages.
 - When the time is up, the next dictation tries the provider again. If it
   is still limited, a new skip period starts with a new notification.
@@ -75,8 +76,8 @@ Voice-edit uses the same order. It keeps its own budget (8 s) and its
 | Piece | Change |
 |---|---|
 | `core/cleanup.rs` | A small in-memory store of skipped providers: provider to "skip until" instant, behind a `Mutex`. Functions to start a skip period, ask whether a provider is skipped (with an injectable "now" for tests), and take the pending notice. |
-| `core/cleanup.rs` | `chat_completion` keeps the `Retry-After` value in its error string, for example `HTTP 429 (retry after 12s)`. A pure `skip_for(err) -> Option<Duration>` turns an error string into a skip period (429/402 only, default 60 s, cap 1 h). |
-| `core/cleanup.rs` | `full_chain`, `single_provider_chain` and `edit_chat` consult the store and the fallback setting as described above. |
+| `core/cleanup.rs` | `chat_completion` keeps the `Retry-After` value in its error string, for example `HTTP 429 (retry after 12s)`. A pure `skip_for(err) -> Option<Duration>` turns an error string into a skip period (429/402 only; 429: Retry-After, 60 s to 1 h; 402: 1 h). |
+| `core/cleanup.rs` | `route` picks the provider order from the setting and the skip store; `walk` tries them in order. `clean_chain` and `edit_chat` both use them. |
 | `core/config.rs` | `cleanup_limit_fallback: String`, default `"ollama"`, serde default for old config files. |
 | `ui/settings.rs` | The radio pair. |
 | `daemon.rs` | After a cleanup or edit, take the pending notice and send it as `DaemonEvent::Notice` (a banner), so the existing tray-only `CleanupIssue` path is unchanged. |
@@ -118,3 +119,10 @@ dictation does not call the skipped provider.
 - The live check is an ignored test (`live_skipped_groq_uses_ollama`)
   that starts a skip period in code; the banner uses the existing
   `DaemonEvent::Notice` path.
+- A same-provider model retry keeps the primary's limit error when the
+  retry fails otherwise (`retry_error`), so the skip still starts; no
+  retry follows a 402.
+- `walk` returns every failure; a voice-edit error names each provider
+  that failed (`edit_error`), so a rejected Groq key still shows its hint.
+- Skip time is at least 60 s (user decision); 402 is 1 hour.
+- Context synthesis (Groq) returns no context while Groq is skipped.

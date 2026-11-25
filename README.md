@@ -68,10 +68,13 @@ uses no tokens. Wiflow also reads `GROQ_API_KEY` and
 Keep credentials outside the repository.
 
 When Groq or OpenRouter says a key is out of tokens (HTTP 429 or 402),
-Wiflow stops using it until the limit resets (the provider's wait time,
-or 1 minute) and shows one notification. Meanwhile dictation and
+Wiflow stops using it until the limit resets (at least 1 minute, or the
+provider's longer wait; 1 hour when credits run out) and shows one
+notification. Meanwhile dictation and
 voice-edit use the fallback chosen in Settings under "When an API key
-runs out of tokens": local Ollama (default) or the auto chain.
+runs out of tokens": local Ollama (default) or the auto chain. Voice-edit's
+selected text follows the same routing, so with "Auto chain" a limited or
+rejected Groq key sends the selection to OpenRouter.
 
 | Data | Location |
 | --- | --- |

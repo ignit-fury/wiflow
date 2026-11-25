@@ -38,8 +38,8 @@ pub struct Config {
     #[serde(default = "default_openrouter_model")]
     pub cleanup_openrouter_model: String,
     /// "auto" = Groq → OpenRouter → Ollama chain; explicit "groq" /
-    /// "openrouter" / "ollama" = only that provider (with Ollama fallback on
-    /// quota errors).
+    /// "openrouter" / "ollama" = only that provider; on key or limit errors an
+    /// explicit provider falls back per `cleanup_limit_fallback`.
     #[serde(default)]
     pub cleanup_provider: String,
     /// Used while a cloud key is skipped after a token limit (HTTP 429/402):

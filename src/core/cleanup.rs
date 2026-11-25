@@ -474,14 +474,27 @@ fn try_provider_with_retry(
         .map(|t| sanitize_llm_response(&t, transcript))
     {
         Ok(t) => Ok(t),
+        // 402 is account-wide: another model on the same key cannot help.
+        Err(e) if status_is(&e, 402) => Err(e),
         Err(e) => match retry_model(p, primary, &cfg.cleanup_fallback_model) {
             Some(fallback) => {
                 tracing::warn!("retry with fallback model {fallback}: {e}");
                 try_provider_model(p, fallback, transcript, None, budget)
                     .map(|t| sanitize_llm_response(&t, transcript))
+                    .map_err(|r| retry_error(e, r))
             }
             None => Err(e),
         },
+    }
+}
+
+/// The error to report after a model retry also failed: a token limit on
+/// the primary stays visible so `walk` can start a skip.
+fn retry_error(primary: String, retry: String) -> String {
+    if skip_for(&primary).is_some() && skip_for(&retry).is_none() {
+        primary
+    } else {
+        retry
     }
 }
 
@@ -532,15 +545,15 @@ fn route(
 /// Try `order` until one provider succeeds. A token limit (429/402) calls
 /// `on_limit(provider, skip time, next provider)`. With `strict`, the first
 /// provider falls back only on key or limit errors. Issue texts match the
-/// old chain. Err carries the last provider tried and its error.
+/// old chain. Err carries every failure, in order.
 fn walk(
     order: &[Provider],
     strict: bool,
     issues: &mut Vec<String>,
     mut try_one: impl FnMut(Provider) -> Result<String, String>,
     mut on_limit: impl FnMut(Provider, Duration, Provider),
-) -> Result<String, (Provider, String)> {
-    let mut last = (Provider::Ollama, String::from("no provider to try"));
+) -> Result<String, Vec<(Provider, String)>> {
+    let mut failures = Vec::new();
     for (i, &p) in order.iter().enumerate() {
         let e = match try_one(p) {
             Ok(text) => return Ok(text),
@@ -565,12 +578,12 @@ fn walk(
             None if first_strict => issues.push(format!("{} failed: {e}", p.name())),
             None => issues.push(format!("{} fallback failed: {e}", p.name())),
         }
-        last = (p, e);
+        failures.push((p, e));
         if next.is_none() {
             break;
         }
     }
-    Err(last)
+    Err(failures)
 }
 
 fn start_skip(p: Provider, d: Duration, next: Provider) {
@@ -630,7 +643,15 @@ pub fn edit_chat(
         |p| try_provider_model(p, provider_model(p, cfg), user, Some(system), &budget),
         start_skip,
     )
-    .map_err(|(p, e)| format!("{} edit failed: {e}{}", p.name(), key_hint(&e)))
+    .map_err(|f| edit_error(&f))
+}
+
+fn edit_error(failures: &[(Provider, String)]) -> String {
+    failures
+        .iter()
+        .map(|(p, e)| format!("{} edit failed: {e}{}", p.name(), key_hint(e)))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One line per provider for the "Test API Keys" menu item: does each saved
@@ -700,15 +721,22 @@ const MAX_SKIP: Duration = Duration::from_secs(3600);
 
 /// How long to skip a provider after this error: only token or credit
 /// limits (429/402) count; a rejected key (401) does not fix itself in time.
+/// 429: its Retry-After, at least 60 s; 402 (no credits): the maximum.
 fn skip_for(err: &str) -> Option<Duration> {
     if !(status_is(err, 429) || status_is(err, 402)) {
         return None;
+    }
+    if status_is(err, 402) {
+        return Some(MAX_SKIP);
     }
     let secs = err
         .split_once("(retry after ")
         .and_then(|(_, rest)| rest.split_once("s)"))
         .and_then(|(n, _)| n.parse::<u64>().ok());
-    Some(secs.map_or(DEFAULT_SKIP, Duration::from_secs).min(MAX_SKIP))
+    Some(
+        secs.map_or(DEFAULT_SKIP, Duration::from_secs)
+            .clamp(DEFAULT_SKIP, MAX_SKIP),
+    )
 }
 
 /// Cloud providers skipped after a token limit, until the limit resets,
@@ -1212,6 +1240,9 @@ fn synthesize_context_with_key(
     let Some(key) = key else {
         return String::new();
     };
+    if skips().is_skipped(Provider::Groq, Instant::now()) {
+        return String::new();
+    }
     // The answer depends only on (app, model), so each pair costs one call
     // per process. Failures are not cached; the next dictation retries.
     static CACHE: std::sync::Mutex<Vec<(String, String, String)>> =
@@ -1326,6 +1357,37 @@ mod tests {
     }
 
     #[test]
+    fn route_auto_with_only_a_groq_key() {
+        assert_eq!(
+            route("auto", "ollama", |p| p == Groq, |_| false),
+            (vec![Groq, Ollama], false)
+        );
+    }
+
+    #[test]
+    fn retry_error_keeps_a_limit_from_the_primary() {
+        let limit = "HTTP 429 (retry after 90s)".to_string();
+        assert_eq!(retry_error(limit.clone(), "timeout".into()), limit);
+        assert_eq!(retry_error("HTTP 500".into(), "timeout".into()), "timeout");
+        assert_eq!(
+            retry_error(limit, "HTTP 402".into()),
+            "HTTP 402".to_string()
+        );
+    }
+
+    #[test]
+    fn edit_error_names_every_failed_provider() {
+        let e = edit_error(&[
+            (Groq, "HTTP 401".into()),
+            (Ollama, "Ollama not running".into()),
+        ]);
+        assert_eq!(
+            e,
+            "Groq edit failed: HTTP 401 (API key rejected; update it in AI Keys & Models in the menu bar); Ollama edit failed: Ollama not running"
+        );
+    }
+
+    #[test]
     fn walk_records_limits_and_keeps_issue_texts() {
         let mut issues = Vec::new();
         let mut limits = Vec::new();
@@ -1340,7 +1402,7 @@ mod tests {
             |p, d, next| limits.push((p, d, next)),
         );
         assert_eq!(out, Ok("clean".to_string()));
-        assert_eq!(limits, [(Groq, Duration::from_secs(12), Ollama)]);
+        assert_eq!(limits, [(Groq, Duration::from_secs(60), Ollama)]);
         assert_eq!(
             issues,
             ["Groq tokens/rate limit exhausted — falling back to Ollama"]
@@ -1361,7 +1423,7 @@ mod tests {
             },
             |_, _, _| panic!("500 is not a limit"),
         );
-        assert_eq!(out, Err((Groq, "HTTP 500".to_string())));
+        assert_eq!(out, Err(vec![(Groq, "HTTP 500".to_string())]));
         assert_eq!(tried, [Groq]);
         assert_eq!(issues, ["Groq failed: HTTP 500"]);
 
@@ -1376,7 +1438,13 @@ mod tests {
             },
             |_, _, _| panic!("401 starts no skip"),
         );
-        assert_eq!(out, Err((Ollama, "down".to_string())));
+        assert_eq!(
+            out,
+            Err(vec![
+                (Groq, "HTTP 401".to_string()),
+                (Ollama, "down".to_string())
+            ])
+        );
         assert_eq!(issues.len(), 2);
         assert!(issues[0].contains("API key"), "{issues:?}");
         assert_eq!(issues[1], "Ollama fallback failed: down");
@@ -1506,16 +1574,17 @@ mod tests {
 
     #[test]
     fn limit_errors_set_a_skip_time() {
-        assert_eq!(
-            skip_for("HTTP 429 (retry after 12s)"),
-            Some(Duration::from_secs(12))
-        );
-        assert_eq!(skip_for("HTTP 429"), Some(Duration::from_secs(60)));
-        assert_eq!(skip_for("HTTP 402"), Some(Duration::from_secs(60)));
-        assert_eq!(
-            skip_for("HTTP 429 (retry after 99999s)"),
-            Some(Duration::from_secs(3600))
-        );
+        for (e, secs) in [
+            ("HTTP 429 (retry after 12s)", 60),
+            ("HTTP 429 (retry after 90s)", 90),
+            ("HTTP 429", 60),
+            ("HTTP 429 (retry after 0s)", 60),
+            ("HTTP 429 (retry after 99999s)", 3600),
+            ("HTTP 402", 3600),
+            ("HTTP 402 (retry after 30s)", 3600),
+        ] {
+            assert_eq!(skip_for(e), Some(Duration::from_secs(secs)), "{e}");
+        }
         for e in ["HTTP 401", "HTTP 500", "timeout", "model not installed"] {
             assert_eq!(skip_for(e), None, "{e}");
         }
