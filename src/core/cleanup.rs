@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The literal dictation cleanup layer system prompt (verbatim, user-provided).
 const SYSTEM_PROMPT: &str = include_str!("../cleanup_prompt.txt");
@@ -388,7 +388,7 @@ impl Provider {
     /// A 401 is a rejected key, not a quota, so it says what to fix instead.
     fn quota_issue(self, err: &str, fallback: Provider) -> String {
         let detail = match self {
-            _ if err.contains("401") => {
+            _ if status_is(err, 401) => {
                 "rejected the API key (HTTP 401); update it in AI Keys & Models in the menu bar"
             }
             Provider::Groq => "tokens/rate limit exhausted",
@@ -654,15 +654,6 @@ pub fn edit_chat(
     .map_err(|e| format!("{} edit failed: {e}{}", p.name(), key_hint(&e)))
 }
 
-/// Tells the user what to fix when a provider rejects the API key.
-fn key_hint(err: &str) -> &'static str {
-    if err.contains("401") {
-        " (API key rejected; update it in AI Keys & Models in the menu bar)"
-    } else {
-        ""
-    }
-}
-
 /// One line per provider for the "Test API Keys" menu item: does each saved
 /// key work? Makes a free authenticated GET (no tokens used); blocking, so
 /// call it off the event loop.
@@ -705,9 +696,100 @@ fn key_verdict(name: &str, result: Option<Result<(), String>>) -> String {
     }
 }
 
+/// True when `err` carries this HTTP status ("HTTP 429 …"). Matching the
+/// prefix keeps a Retry-After of 401 s from reading as a rejected key.
+fn status_is(err: &str, code: u16) -> bool {
+    err.contains(&format!("HTTP {code}"))
+}
+
 /// 429 (rate limit), 402 (payment/credits), or 401 (quota/auth exhausted).
 pub fn is_quota_error(err: &str) -> bool {
-    err.contains("429") || err.contains("402") || err.contains("401")
+    status_is(err, 429) || status_is(err, 402) || status_is(err, 401)
+}
+
+/// Error text for an HTTP status. A numeric Retry-After is kept so the
+/// skip period can use it; a date form is ignored (60 s default applies).
+fn status_error(code: u16, retry_after: Option<&str>) -> String {
+    match retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(s) => format!("HTTP {code} (retry after {s}s)"),
+        None => format!("HTTP {code}"),
+    }
+}
+
+const DEFAULT_SKIP: Duration = Duration::from_secs(60);
+const MAX_SKIP: Duration = Duration::from_secs(3600);
+
+/// How long to skip a provider after this error: only token or credit
+/// limits (429/402) count; a rejected key (401) does not fix itself in time.
+#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
+fn skip_for(err: &str) -> Option<Duration> {
+    if !(status_is(err, 429) || status_is(err, 402)) {
+        return None;
+    }
+    let secs = err
+        .split_once("(retry after ")
+        .and_then(|(_, rest)| rest.split_once("s)"))
+        .and_then(|(n, _)| n.parse::<u64>().ok());
+    Some(secs.map_or(DEFAULT_SKIP, Duration::from_secs).min(MAX_SKIP))
+}
+
+/// Cloud providers skipped after a token limit, until the limit resets,
+/// plus the one notice to show when a skip period starts. Memory only.
+#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
+#[derive(Debug, Default)]
+struct Skips {
+    until: Vec<(Provider, Instant)>,
+    notice: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // used from Task 3
+impl Skips {
+    fn is_skipped(&self, p: Provider, now: Instant) -> bool {
+        self.until.iter().any(|&(q, t)| q == p && now < t)
+    }
+
+    /// Skip `p` for `d` from `now`; `next` is what is used meanwhile.
+    fn start(&mut self, p: Provider, d: Duration, now: Instant, next: Provider) {
+        if p == Provider::Ollama {
+            return;
+        }
+        self.until.retain(|&(q, _)| q != p);
+        self.until.push((p, now + d));
+        self.notice = Some(format!(
+            "{} is out of tokens; using {} for about {} min.",
+            p.name(),
+            next.name(),
+            d.as_secs().div_ceil(60).max(1)
+        ));
+    }
+}
+
+#[allow(dead_code)] // used from Task 3
+static SKIPS: std::sync::Mutex<Skips> = std::sync::Mutex::new(Skips {
+    until: Vec::new(),
+    notice: None,
+});
+
+#[allow(dead_code)] // used from Task 3
+fn skips() -> std::sync::MutexGuard<'static, Skips> {
+    SKIPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The notice from a skip period that just started, once.
+#[allow(dead_code)] // used from Task 4
+pub fn take_limit_notice() -> Option<String> {
+    skips().notice.take()
+}
+
+/// Tells the user what to fix when a provider rejects the API key.
+fn key_hint(err: &str) -> &'static str {
+    if status_is(err, 401) {
+        " (API key rejected; update it in AI Keys & Models in the menu bar)"
+    } else {
+        ""
+    }
 }
 
 /// OpenAI-compatible chat completion (Groq + OpenRouter share the shape).
@@ -739,7 +821,7 @@ fn chat_completion(
         .set("Content-Type", "application/json")
         .send_json(body)
         .map_err(|e| match e {
-            ureq::Error::Status(code, _) => format!("HTTP {code}"),
+            ureq::Error::Status(code, resp) => status_error(code, resp.header("retry-after")),
             other => format!("{other}"),
         })?;
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {e:?}"))?;
@@ -1354,6 +1436,80 @@ mod tests {
         assert!(is_quota_error("HTTP 401"));
         assert!(!is_quota_error("HTTP 500"));
         assert!(!is_quota_error("network down"));
+    }
+
+    #[test]
+    fn limit_errors_set_a_skip_time() {
+        assert_eq!(
+            skip_for("HTTP 429 (retry after 12s)"),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(skip_for("HTTP 429"), Some(Duration::from_secs(60)));
+        assert_eq!(skip_for("HTTP 402"), Some(Duration::from_secs(60)));
+        assert_eq!(
+            skip_for("HTTP 429 (retry after 99999s)"),
+            Some(Duration::from_secs(3600))
+        );
+        for e in ["HTTP 401", "HTTP 500", "timeout", "model not installed"] {
+            assert_eq!(skip_for(e), None, "{e}");
+        }
+    }
+
+    #[test]
+    fn status_errors_keep_retry_after_seconds_only() {
+        assert_eq!(
+            status_error(429, Some(" 12 ")),
+            "HTTP 429 (retry after 12s)"
+        );
+        assert_eq!(
+            status_error(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            "HTTP 429"
+        );
+        assert_eq!(status_error(500, None), "HTTP 500");
+        // A wait of 401 s is a limit, not a rejected key.
+        let e = status_error(429, Some("401"));
+        assert!(!status_is(&e, 401) && status_is(&e, 429), "{e}");
+        assert!(!Provider::Groq
+            .quota_issue(&e, Provider::Ollama)
+            .contains("API key"));
+    }
+
+    #[test]
+    fn skip_period_ends_and_names_the_fallback() {
+        let now = Instant::now();
+        let mut s = Skips::default();
+        s.start(
+            Provider::Groq,
+            Duration::from_secs(12),
+            now,
+            Provider::Ollama,
+        );
+        assert!(s.is_skipped(Provider::Groq, now + Duration::from_secs(11)));
+        assert!(!s.is_skipped(Provider::Groq, now + Duration::from_secs(12)));
+        assert!(!s.is_skipped(Provider::OpenRouter, now));
+        assert_eq!(
+            s.notice.take().as_deref(),
+            Some("Groq is out of tokens; using Ollama for about 1 min.")
+        );
+        s.start(
+            Provider::OpenRouter,
+            Duration::from_secs(150),
+            now,
+            Provider::Groq,
+        );
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("OpenRouter is out of tokens; using Groq for about 3 min.")
+        );
+        s.notice = None;
+        s.start(
+            Provider::Ollama,
+            Duration::from_secs(60),
+            now,
+            Provider::Ollama,
+        );
+        assert!(!s.is_skipped(Provider::Ollama, now));
+        assert_eq!(s.notice, None);
     }
 
     /// Network: checks the real saved keys. Prints only the verdict.
