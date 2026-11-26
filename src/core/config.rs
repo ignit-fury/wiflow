@@ -233,13 +233,16 @@ pub mod permissions {
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
     pub const ACCESSIBILITY_PRIVACY: &str =
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
-    // Space for a future Input Monitoring menu row (brief reserves the URL).
-    #[allow(dead_code)]
     pub const INPUT_MONITORING_PRIVACY: &str =
         "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent";
 
     pub fn open_mic_settings() {
         if open::that(MIC_PRIVACY).is_err() {
+            let _ = open::that("x-apple.systempreferences:com.apple.preference.security");
+        }
+    }
+    pub fn open_input_monitoring_settings() {
+        if open::that(INPUT_MONITORING_PRIVACY).is_err() {
             let _ = open::that("x-apple.systempreferences:com.apple.preference.security");
         }
     }
