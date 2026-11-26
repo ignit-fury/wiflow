@@ -29,6 +29,7 @@ fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
         DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
         DaemonEvent::OpenWindow => "OpenWindow",
         DaemonEvent::Notice(_) => "Notice",
+        DaemonEvent::LivePreview(_) => "LivePreview",
     }
 }
 
@@ -154,6 +155,8 @@ pub struct MenuIds {
     key_openrouter: MenuId,
     key_groq_clear: MenuId,
     key_or_clear: MenuId,
+    key_test: MenuId,
+    key_groq_get: MenuId,
     ollama_models: Vec<(String, MenuId)>,
     ollama_refresh: MenuId,
     show_logs: MenuId,
@@ -203,6 +206,8 @@ fn ids_for(devices: &[String], history: &[HistoryEntry], ollama_models: &[String
         key_openrouter: MenuId::new("wiflow:key:openrouter"),
         key_groq_clear: MenuId::new("wiflow:key:groq:clear"),
         key_or_clear: MenuId::new("wiflow:key:or:clear"),
+        key_test: MenuId::new("wiflow:key:test"),
+        key_groq_get: MenuId::new("wiflow:key:groq:get"),
         ollama_models: ollama_models
             .iter()
             .enumerate()
@@ -436,8 +441,22 @@ pub fn build_menu(
         or_set,
         None,
     );
+    let key_groq_get = MenuItem::with_id(ids.key_groq_get.clone(), "Get Groq Key…", true, None);
+    let key_test = MenuItem::with_id(
+        ids.key_test.clone(),
+        "Test API Keys",
+        groq_set || or_set,
+        None,
+    );
     ai_menu
-        .append_items(&[&key_groq, &key_openrouter, &key_groq_clear, &key_or_clear])
+        .append_items(&[
+            &key_groq_get,
+            &key_groq,
+            &key_openrouter,
+            &key_groq_clear,
+            &key_or_clear,
+            &key_test,
+        ])
         .expect("menu append");
     ai_menu
         .append(&PredefinedMenuItem::separator())
@@ -666,7 +685,7 @@ impl DaemonApp {
                 // paths; a stale staged copy must never undo them.
                 cfg.hotkey_preset = self.preset;
                 cfg.launch_at_login = self.config.launch_at_login;
-                self.config = cfg;
+                self.config = *cfg;
                 self.save();
                 self.menu_dirty = true;
                 tracing::info!("settings saved (apply to the next hold)");
@@ -771,6 +790,39 @@ impl DaemonApp {
     }
 
     /// Note only when it won't clobber the recording indicator.
+    /// Check the saved API keys off the event loop; the verdict arrives as a
+    /// notification (keys are never logged, only the verdict).
+    fn test_api_keys(&self) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let verdict = crate::core::cleanup::check_keys();
+            tracing::info!("api key check: {}", verdict.replace('\n', "; "));
+            let _ = proxy.send_event(DaemonEvent::Notice(verdict));
+        });
+    }
+
+    /// "Get Groq Key…": open the Groq keys page, then for up to 2 minutes
+    /// watch the clipboard for a newly copied Groq key. On Save, store it,
+    /// clear it from the clipboard and test it. The key is never logged.
+    fn get_groq_key(&self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WATCHING: AtomicBool = AtomicBool::new(false);
+        let _ = std::process::Command::new("open")
+            .arg(crate::core::cleanup::GROQ_KEYS_URL)
+            .status();
+        if WATCHING.swap(true, Ordering::SeqCst) {
+            return; // A watcher from an earlier click is still running.
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let notice = watch_for_groq_key();
+            WATCHING.store(false, Ordering::SeqCst);
+            if let Some(n) = notice {
+                let _ = proxy.send_event(DaemonEvent::Notice(n));
+            }
+        });
+    }
+
     fn warn_note(&mut self, msg: String) {
         tracing::warn!("{msg}");
         if self.state != AppState::Recording {
@@ -991,6 +1043,7 @@ impl DaemonApp {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("groq api key saved");
+                        self.test_api_keys();
                     }
                     Err(e) => self.warn_note(format!("save groq key failed: {e}")),
                 },
@@ -1004,11 +1057,20 @@ impl DaemonApp {
                     Ok(()) => {
                         self.menu_dirty = true;
                         tracing::info!("openrouter api key saved");
+                        self.test_api_keys();
                     }
                     Err(e) => self.warn_note(format!("save openrouter key failed: {e}")),
                 },
                 None => tracing::debug!("openrouter key dialog cancelled"),
             }
+            return;
+        }
+        if *id == ids.key_groq_get {
+            self.get_groq_key();
+            return;
+        }
+        if *id == ids.key_test {
+            self.test_api_keys();
             return;
         }
         if *id == ids.key_groq_clear {
@@ -1163,6 +1225,16 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
         if matches!(event, DaemonEvent::OpenWindow) {
             // Opened in about_to_wait, which runs right after this.
             self.open_settings_requested = true;
+            return;
+        }
+        // A key saved off the event loop (Get Groq Key) changes the key menu
+        // labels; notices are rare, so refresh the menu on each one.
+        if matches!(event, DaemonEvent::Notice(_)) {
+            self.menu_dirty = true;
+        }
+        // Live preview is display-only: straight to the pill, no lifecycle.
+        if let DaemonEvent::LivePreview(text) = &event {
+            self.pill.set_live_text(text.clone());
             return;
         }
         let before = self.orchestrator.phase();
@@ -1550,6 +1622,38 @@ fn app_main(
     std::process::exit(0);
 }
 
+/// Clipboard watch for "Get Groq Key…" (blocking; run on its own thread).
+/// Returns the notice to show, or None when nothing was copied in time.
+fn watch_for_groq_key() -> Option<String> {
+    use crate::core::cleanup::{check_keys, confirm_save, looks_like_groq_key, save_key};
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let before = cb.get_text().unwrap_or_default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let text = cb.get_text().unwrap_or_default();
+        let key = text.trim();
+        if text == before || !looks_like_groq_key(key) {
+            continue;
+        }
+        if !confirm_save("Save the Groq key you just copied?") {
+            tracing::info!("copied groq key not saved (cancelled)");
+            return None;
+        }
+        if let Err(e) = save_key("groq_api_key", key) {
+            return Some(format!("Saving the Groq key failed: {e}"));
+        }
+        // Don't leave the secret on the clipboard.
+        if cb.get_text().ok().as_deref() == Some(text.as_str()) {
+            let _ = cb.clear();
+        }
+        tracing::info!("groq api key saved from clipboard");
+        return Some(check_keys());
+    }
+    tracing::info!("get groq key: nothing copied within 2 minutes");
+    None
+}
+
 /// `open_window`: show the main window at start (Finder/Dock launch);
 /// `--app` (login item, scripts) starts in the menu bar only.
 fn instance_socket() -> std::path::PathBuf {
@@ -1560,6 +1664,9 @@ pub fn run(initial: Config, open_window: bool) -> ! {
     if instance::already_running(&instance_socket()) {
         println!("Wiflow is already running — showing its window.");
         std::process::exit(0);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        crate::core::config::repair_launch_agent(&exe);
     }
     let event_loop = EventLoop::<DaemonEvent>::with_user_event()
         .build()
@@ -1734,6 +1841,8 @@ mod tests {
             ids.key_openrouter,
             ids.key_groq_clear,
             ids.key_or_clear,
+            ids.key_test,
+            ids.key_groq_get,
             ids.ollama_refresh,
             ids.show_logs,
             ids.settings_window,

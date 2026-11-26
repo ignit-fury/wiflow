@@ -38,13 +38,18 @@ pub struct Config {
     #[serde(default = "default_openrouter_model")]
     pub cleanup_openrouter_model: String,
     /// "auto" = Groq → OpenRouter → Ollama chain; explicit "groq" /
-    /// "openrouter" / "ollama" = only that provider (with Ollama fallback on
-    /// quota errors).
+    /// "openrouter" / "ollama" = only that provider; on key or limit errors an
+    /// explicit provider falls back per `cleanup_limit_fallback`.
     #[serde(default)]
     pub cleanup_provider: String,
-    /// Post-Processing Fallback: when the primary model fails on a provider,
-    /// the SAME provider is retried with this model before moving down the
-    /// chain.
+    /// Used while a cloud key is skipped after a token limit (HTTP 429/402):
+    /// "ollama" (default) or "auto" (the other cloud provider with a key,
+    /// then Ollama). Any other value behaves as "ollama".
+    #[serde(default = "default_limit_fallback")]
+    pub cleanup_limit_fallback: String,
+    /// Post-Processing Fallback: when the primary model fails on a cloud
+    /// provider (Groq, OpenRouter), the SAME provider is retried with this
+    /// model before moving down the chain. Ollama never retries with it.
     #[serde(default = "default_fallback_model")]
     pub cleanup_fallback_model: String,
     /// Context-synthesis layer (focused app → 2-sentence context hint).
@@ -54,6 +59,9 @@ pub struct Config {
     /// + delayed Music/Spotify pause, both restored exactly after).
     #[serde(default = "default_true")]
     pub duck_audio: bool,
+    /// Show the words heard so far in the recording pill while the key is held.
+    #[serde(default = "default_true")]
+    pub live_preview: bool,
     /// Small model for context synthesis.
     #[serde(default = "default_context_model")]
     pub context_model: String,
@@ -84,6 +92,9 @@ fn default_fallback_model() -> String {
 fn default_context_model() -> String {
     "qwen/qwen3.8-27b".into()
 }
+fn default_limit_fallback() -> String {
+    "ollama".into()
+}
 fn default_stt_provider() -> String {
     "local".into()
 }
@@ -105,9 +116,11 @@ impl Default for Config {
             cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_limit_fallback: "ollama".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
+            live_preview: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -192,11 +205,7 @@ pub fn set_launch_at_login(enable: bool, exe_path: &Path, apply_now: bool) -> Re
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir agents: {e:?}"))?;
     }
-    let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCH_AGENT_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--app</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n",
-        exe_path.display()
-    );
-    atomic_write_raw(&path, &plist)?;
+    atomic_write_raw(&path, &launch_agent_plist(&launch_target(exe_path)))?;
     if apply_now {
         let _ = std::process::Command::new("launchctl")
             .args([
@@ -207,6 +216,64 @@ pub fn set_launch_at_login(enable: bool, exe_path: &Path, apply_now: bool) -> Re
             .status();
     }
     Ok(())
+}
+
+fn launch_agent_plist(exe: &Path) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCH_AGENT_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--app</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n",
+        exe.display()
+    )
+}
+
+fn in_app_bundle(exe: &Path) -> bool {
+    exe.parent().and_then(Path::file_name) == Some("MacOS".as_ref())
+}
+
+/// The binary the login item should start. A bare build
+/// (`target/release/wiflow-dictation`) is signed ad hoc, so macOS treats it
+/// as a different app from the signed `Wiflow.app` and it has none of the
+/// bundle's permissions; prefer the bundle `build-app.sh` puts beside it.
+pub fn launch_target(exe: &Path) -> PathBuf {
+    if !in_app_bundle(exe) {
+        if let (Some(dir), Some(name)) = (exe.parent().and_then(Path::parent), exe.file_name()) {
+            let bundled = dir.join("Wiflow.app/Contents/MacOS").join(name);
+            if bundled.is_file() {
+                return bundled;
+            }
+        }
+    }
+    exe.to_path_buf()
+}
+
+/// Re-point an existing login item at this app when it names another binary
+/// (written by an older or bare build). Runs only from inside the bundle, so
+/// a dev run never takes the login item away from the signed app. It starts
+/// nothing: launchd reads the file at the next login.
+pub fn repair_launch_agent(exe: &Path) {
+    repair_launch_agent_at(&launch_agent_path(), exe);
+}
+
+fn repair_launch_agent_at(agent: &Path, exe: &Path) -> bool {
+    if !in_app_bundle(exe) {
+        return false;
+    }
+    let Ok(current) = std::fs::read_to_string(agent) else {
+        return false;
+    };
+    let want = launch_agent_plist(exe);
+    if current == want {
+        return false;
+    }
+    match atomic_write_raw(agent, &want) {
+        Ok(()) => {
+            tracing::info!("login item now starts {}", exe.display());
+            true
+        }
+        Err(e) => {
+            tracing::warn!("login item repair failed: {e}");
+            false
+        }
+    }
 }
 
 fn atomic_write_raw(path: &Path, content: &str) -> Result<(), String> {
@@ -268,9 +335,11 @@ mod tests {
             cleanup_groq_model: "openai/gpt-oss-20b".into(),
             cleanup_openrouter_model: "meta-llama/llama-3.3-70b:free".into(),
             cleanup_provider: "auto".into(),
+            cleanup_limit_fallback: "auto".into(),
             cleanup_fallback_model: "qwen/qwen3.8-27b".into(),
             context_enabled: true,
             duck_audio: true,
+            live_preview: true,
             context_model: "qwen/qwen3.8-27b".into(),
             stt_provider: "local".into(),
             stt_language: "auto".into(),
@@ -302,6 +371,11 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_defaults_on() {
+        assert!(Config::default().live_preview);
+    }
+
+    #[test]
     fn test_duck_audio_defaults_on() {
         assert!(Config::default().duck_audio);
     }
@@ -309,6 +383,13 @@ mod tests {
     #[test]
     fn test_default_cleanup_provider_is_auto() {
         assert_eq!(Config::default().cleanup_provider, "auto");
+    }
+
+    #[test]
+    fn old_config_falls_back_to_ollama_on_key_limits() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.cleanup_limit_fallback, "ollama");
+        assert_eq!(Config::default().cleanup_limit_fallback, "ollama");
     }
 
     #[test]
@@ -346,5 +427,53 @@ mod tests {
             launch_agent_path().file_name().unwrap().to_string_lossy(),
             format!("{LAUNCH_AGENT_LABEL}.plist")
         );
+    }
+
+    fn fake_build(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("wiflow_launch_{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let bare = root.join("release/wiflow-dictation");
+        let bundled = root.join("Wiflow.app/Contents/MacOS/wiflow-dictation");
+        for p in [&bare, &bundled] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        (root, bare, bundled)
+    }
+
+    #[test]
+    fn login_item_prefers_the_signed_bundle_over_a_bare_build() {
+        let (root, bare, bundled) = fake_build("target");
+        assert_eq!(launch_target(&bare), bundled);
+        assert_eq!(launch_target(&bundled), bundled);
+        std::fs::remove_file(&bundled).unwrap();
+        assert_eq!(launch_target(&bare), bare, "no bundle: keep the bare build");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_login_item_is_repointed_only_from_the_bundle() {
+        let (root, bare, bundled) = fake_build("repair");
+        let agent = root.join("agent.plist");
+        std::fs::write(&agent, launch_agent_plist(&bare)).unwrap();
+
+        assert!(
+            !repair_launch_agent_at(&agent, &bare),
+            "bare build never rewrites"
+        );
+        assert!(repair_launch_agent_at(&agent, &bundled));
+        assert_eq!(
+            std::fs::read_to_string(&agent).unwrap(),
+            launch_agent_plist(&bundled)
+        );
+        assert!(!repair_launch_agent_at(&agent, &bundled), "already right");
+
+        std::fs::remove_file(&agent).unwrap();
+        assert!(
+            !repair_launch_agent_at(&agent, &bundled),
+            "login item off stays off"
+        );
+        assert!(!agent.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

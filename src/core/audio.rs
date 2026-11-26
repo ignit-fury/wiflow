@@ -131,6 +131,8 @@ pub struct AudioCapture {
     started: std::time::Instant,
     sample_rate: u32,
     dropped: Arc<AtomicUsize>,
+    /// Samples already moved out of the ring by `snapshot` (live preview).
+    taken: Vec<f32>,
 }
 
 impl AudioCapture {
@@ -212,7 +214,19 @@ impl AudioCapture {
             started: std::time::Instant::now(),
             sample_rate,
             dropped,
+            taken: Vec::new(),
         })
+    }
+
+    /// Everything captured so far, without stopping (live preview). Moves new
+    /// samples out of the realtime ring; `stop` returns them too.
+    pub fn snapshot(&mut self) -> &[f32] {
+        self.taken.extend(self.consumer.pop_iter());
+        &self.taken
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     pub fn stop(mut self) -> CapturedAudio {
@@ -225,7 +239,8 @@ impl AudioCapture {
         if dropped > 0 {
             warn!("dropped {dropped} samples (ring full)");
         }
-        let samples: Vec<f32> = self.consumer.pop_iter().collect();
+        let mut samples = std::mem::take(&mut self.taken);
+        samples.extend(self.consumer.pop_iter());
         let duration_ms = self.started.elapsed().as_millis() as u64;
         info!(
             "audio stream dropped — mic released, flushed {} samples over {duration_ms}ms",
@@ -241,6 +256,24 @@ impl AudioCapture {
 
 #[cfg(test)]
 mod tests {
+    /// Needs a mic. Run: cargo test snapshot_keeps -- --ignored
+    #[test]
+    #[ignore]
+    fn snapshot_keeps_audio_for_stop() {
+        let mut cap = AudioCapture::start(None).expect("a mic");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let early = cap.snapshot().to_vec();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let out = cap.stop();
+        assert!(!early.is_empty());
+        assert!(out.samples_mono.len() > early.len());
+        assert_eq!(
+            &out.samples_mono[..early.len()],
+            &early[..],
+            "stop keeps the snapshot"
+        );
+    }
+
     use super::*;
 
     #[test]

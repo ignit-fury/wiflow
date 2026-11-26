@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The literal dictation cleanup layer system prompt (verbatim, user-provided).
 const SYSTEM_PROMPT: &str = include_str!("../cleanup_prompt.txt");
@@ -13,6 +13,17 @@ pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
 pub const EMPTY_SENTINEL: &str = "EMPTY";
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+/// Extra cleanup time per 10 dictated words: long dictations take longer to
+/// tidy, and a fixed 1.5 s timed out on 50+ words and pasted raw text.
+const PER_10_WORDS: Duration = Duration::from_millis(400);
+/// Most a dictation ever waits for cleanup.
+const DICTATION_CAP: Duration = Duration::from_secs(6);
+
+/// `base` plus 0.4 s per whole 10 words, capped at 6 s.
+fn scaled_for(base: Duration, words: usize) -> Duration {
+    (base + PER_10_WORDS * (words / 10) as u32).min(DICTATION_CAP)
+}
+
 /// Time limit for one voice-edit request (rewrites take longer than cleanup).
 const EDIT_BUDGET: Duration = Duration::from_secs(8);
 /// Context runs before the cleanup budget starts, so it gets its own short cap.
@@ -39,10 +50,11 @@ struct CleanupBudget {
 const DICTATION_STOP: &[&str] = &["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"];
 
 impl CleanupBudget {
-    fn new() -> Self {
+    /// Dictation cleanup; limits grow with the transcript's word count.
+    fn new(words: usize) -> Self {
         Self {
-            deadline: std::time::Instant::now() + CLEANUP_BUDGET,
-            ollama_timeout: OLLAMA_TIMEOUT,
+            deadline: std::time::Instant::now() + scaled_for(CLEANUP_BUDGET, words),
+            ollama_timeout: scaled_for(OLLAMA_TIMEOUT, words),
             ollama_stop: DICTATION_STOP,
             ollama_token_cap: None,
         }
@@ -334,6 +346,28 @@ pub fn prompt_for_key(title: &str, prompt: &str) -> Option<String> {
     parse_dialog_text(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Where Groq API keys are created (needs the user's own sign-in).
+pub const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
+
+/// A Groq API key as copied from the Groq console: "gsk_" then 40–80
+/// letters and digits, nothing around it. Callers trim first.
+pub fn looks_like_groq_key(s: &str) -> bool {
+    s.strip_prefix("gsk_").is_some_and(|rest| {
+        (40..=80).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Save/Cancel dialog; true only when the user clicks Save.
+pub fn confirm_save(prompt: &str) -> bool {
+    let script = format!(
+        "display dialog \"{prompt}\" buttons {{\"Cancel\", \"Save\"}} default button \"Save\" with title \"Wiflow\""
+    );
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// Parse osascript dialog stdout (`text returned:secret, button
 /// returned:OK`). None when canceled or empty.
 pub fn parse_dialog_text(out: &str) -> Option<String> {
@@ -373,8 +407,12 @@ impl Provider {
     }
 
     /// Quota-exhausted wording (differs per provider: rate limit vs credits).
-    fn quota_issue(self, fallback: Provider) -> String {
+    /// A 401 is a rejected key, not a quota, so it says what to fix instead.
+    fn quota_issue(self, err: &str, fallback: Provider) -> String {
         let detail = match self {
+            _ if status_is(err, 401) => {
+                "rejected the API key (HTTP 401); update it in AI Keys & Models in the menu bar"
+            }
             Provider::Groq => "tokens/rate limit exhausted",
             Provider::OpenRouter => "tokens/credits exhausted",
             Provider::Ollama => "quota exhausted",
@@ -436,9 +474,17 @@ fn try_provider_model(
     }
 }
 
+/// Model to retry with after the primary fails, if any. Ollama never retries:
+/// the shared fallback setting holds a cloud model id (default
+/// `qwen/qwen3.8-27b`) that is not installed locally.
+fn retry_model<'a>(p: Provider, primary: &str, fallback: &'a str) -> Option<&'a str> {
+    (p != Provider::Ollama && fallback != primary).then_some(fallback)
+}
+
 /// Explicit retry: after the primary model fails on a provider, retry the
 /// SAME provider with `cleanup_fallback_model` before moving down the chain.
 /// The fallback error stands when the fallback equals the primary.
+/// Ollama never retries with the fallback model (see `retry_model`).
 fn try_provider_with_retry(
     p: Provider,
     cfg: &crate::core::config::Config,
@@ -450,26 +496,130 @@ fn try_provider_with_retry(
         .map(|t| sanitize_llm_response(&t, transcript))
     {
         Ok(t) => Ok(t),
-        Err(e) => {
-            let fallback = cfg.cleanup_fallback_model.as_str();
-            if fallback != primary {
+        // 402 is account-wide: another model on the same key cannot help.
+        Err(e) if status_is(&e, 402) => Err(e),
+        Err(e) => match retry_model(p, primary, &cfg.cleanup_fallback_model) {
+            Some(fallback) => {
                 tracing::warn!("retry with fallback model {fallback}: {e}");
                 try_provider_model(p, fallback, transcript, None, budget)
                     .map(|t| sanitize_llm_response(&t, transcript))
-                    // The default fallback is a cloud model id; on Ollama a
-                    // missing fallback must not mask the primary error.
-                    .map_err(|fe| {
-                        if p == Provider::Ollama && fe.starts_with("model not installed") {
-                            e
-                        } else {
-                            fe
-                        }
-                    })
-            } else {
-                Err(e)
+                    .map_err(|r| retry_error(e, r))
             }
+            None => Err(e),
+        },
+    }
+}
+
+/// The error to report after a model retry also failed: a token limit on
+/// the primary stays visible so `walk` can start a skip.
+fn retry_error(primary: String, retry: String) -> String {
+    if skip_for(&primary).is_some() && skip_for(&retry).is_none() {
+        primary
+    } else {
+        retry
+    }
+}
+
+fn has_key(p: Provider) -> bool {
+    match p {
+        Provider::Groq => groq_key().is_some(),
+        Provider::OpenRouter => openrouter_key().is_some(),
+        Provider::Ollama => true,
+    }
+}
+
+/// Providers to try, in order, for one cleanup or edit. `configured` is
+/// `cleanup_provider`, `fallback` is `cleanup_limit_fallback`. Skipped
+/// providers are left out; Ollama is never skipped and always last. The
+/// bool is true when the first entry is the explicitly chosen provider:
+/// its non-key, non-limit errors end the call (today's rule).
+fn route(
+    configured: &str,
+    fallback: &str,
+    has_key: impl Fn(Provider) -> bool,
+    skipped: impl Fn(Provider) -> bool,
+) -> (Vec<Provider>, bool) {
+    let auto = |leave_out: Option<Provider>| -> Vec<Provider> {
+        [Provider::Groq, Provider::OpenRouter]
+            .into_iter()
+            .filter(|&p| Some(p) != leave_out && has_key(p) && !skipped(p))
+            .chain([Provider::Ollama])
+            .collect()
+    };
+    let chosen = match configured {
+        "groq" => Provider::Groq,
+        "openrouter" => Provider::OpenRouter,
+        "ollama" => return (vec![Provider::Ollama], true),
+        _ => return (auto(None), false),
+    };
+    let rest = if fallback == "auto" {
+        auto(Some(chosen))
+    } else {
+        vec![Provider::Ollama]
+    };
+    if skipped(chosen) {
+        (rest, false)
+    } else {
+        (std::iter::once(chosen).chain(rest).collect(), true)
+    }
+}
+
+/// Try `order` until one provider succeeds. A token limit (429/402) calls
+/// `on_limit(provider, skip time, next provider)`. With `strict`, the first
+/// provider falls back only on key or limit errors. Issue texts match the
+/// old chain. Err carries every failure, in order.
+fn walk(
+    order: &[Provider],
+    strict: bool,
+    issues: &mut Vec<String>,
+    mut try_one: impl FnMut(Provider) -> Result<String, String>,
+    mut on_limit: impl FnMut(Provider, Duration, Provider),
+) -> Result<String, Vec<(Provider, String)>> {
+    let mut failures = Vec::new();
+    for (i, &p) in order.iter().enumerate() {
+        let e = match try_one(p) {
+            Ok(text) => return Ok(text),
+            Err(e) => e,
+        };
+        tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
+        let first_strict = strict && i == 0;
+        let next = order
+            .get(i + 1)
+            .copied()
+            .filter(|_| !first_strict || is_quota_error(&e));
+        if let Some(d) = skip_for(&e) {
+            on_limit(p, d, next.unwrap_or(Provider::Ollama));
+        }
+        match next {
+            Some(n) if is_quota_error(&e) => issues.push(p.quota_issue(&e, n)),
+            Some(n) => issues.push(format!(
+                "{} failed ({e}) — falling back to {}",
+                p.name(),
+                n.name()
+            )),
+            None if first_strict => issues.push(format!("{} failed: {e}", p.name())),
+            None => issues.push(format!("{} fallback failed: {e}", p.name())),
+        }
+        failures.push((p, e));
+        if next.is_none() {
+            break;
         }
     }
+    Err(failures)
+}
+
+fn start_skip(p: Provider, d: Duration, next: Provider) {
+    skips().start(p, d, Instant::now(), next);
+}
+
+fn route_for(cfg: &crate::core::config::Config) -> (Vec<Provider>, bool) {
+    let now = Instant::now();
+    route(
+        &cfg.cleanup_provider,
+        &cfg.cleanup_limit_fallback,
+        has_key,
+        |p| skips().is_skipped(p, now),
+    )
 }
 
 /// Run the full provider chain. Never fails: worst case the input is
@@ -482,168 +632,187 @@ pub fn clean_chain(transcript: &str, cfg: &crate::core::config::Config) -> Clean
             issues,
         };
     }
-    let budget = CleanupBudget::new();
-    let provider = if cfg.cleanup_provider.is_empty() {
-        "auto"
-    } else {
-        cfg.cleanup_provider.as_str()
-    };
-    let text = match provider {
-        "groq" => single_provider_chain(transcript, cfg, &[Provider::Groq], &mut issues, &budget),
-        "openrouter" => single_provider_chain(
-            transcript,
-            cfg,
-            &[Provider::OpenRouter],
-            &mut issues,
-            &budget,
-        ),
-        "ollama" => {
-            single_provider_chain(transcript, cfg, &[Provider::Ollama], &mut issues, &budget)
-        }
-        _ => full_chain(transcript, cfg, &mut issues, &budget),
-    };
+    let budget = CleanupBudget::new(plain_transcript_of(transcript).split_whitespace().count());
+    let (order, strict) = route_for(cfg);
+    let text = walk(
+        &order,
+        strict,
+        &mut issues,
+        |p| try_provider_with_retry(p, cfg, transcript, &budget),
+        start_skip,
+    )
+    .ok();
     CleanupOutcome {
         text: text.unwrap_or_else(|| transcript.to_string()),
         issues,
     }
 }
 
-/// One chain step: try `p`; on failure push the user-facing issue and fall
-/// back to `next` (when present). Returns Some(cleaned) on success.
-fn chain_step(
-    p: Provider,
-    cfg: &crate::core::config::Config,
-    transcript: &str,
-    next: Option<Provider>,
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    match try_provider_with_retry(p, cfg, transcript, budget) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            match next {
-                Some(n) => {
-                    if is_quota_error(&e) {
-                        issues.push(p.quota_issue(n));
-                    } else {
-                        issues.push(format!(
-                            "{} failed ({e}) — falling back to {}",
-                            p.name(),
-                            n.name()
-                        ));
-                    }
-                }
-                None => issues.push(format!("{} fallback failed: {e}", p.name())),
-            }
-            tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-            None
-        }
-    }
-}
-
-/// Auto chain (existing behavior): Groq → OpenRouter → Ollama, silently
-/// skipping cloud providers with no key.
-fn full_chain(
-    transcript: &str,
-    cfg: &crate::core::config::Config,
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    // 1. Groq (fastest cloud, generous free tier). No key → skip silently.
-    if groq_key().is_some() {
-        if let Some(text) = chain_step(
-            Provider::Groq,
-            cfg,
-            transcript,
-            Some(Provider::OpenRouter),
-            issues,
-            budget,
-        ) {
-            return Some(text);
-        }
-    }
-    // 2. OpenRouter (free-tier models available).
-    if openrouter_key().is_some() {
-        if let Some(text) = chain_step(
-            Provider::OpenRouter,
-            cfg,
-            transcript,
-            Some(Provider::Ollama),
-            issues,
-            budget,
-        ) {
-            return Some(text);
-        }
-    }
-    // 3. Ollama local ($0, offline). Background model check with guidance.
-    chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
-}
-
-/// Explicit provider: only that one, with Ollama fallback on quota errors
-/// (user requirement: alert + switch to Ollama) — not other errors, unless
-/// the provider IS ollama.
-fn single_provider_chain(
-    transcript: &str,
-    cfg: &crate::core::config::Config,
-    providers: &[Provider],
-    issues: &mut Vec<String>,
-    budget: &CleanupBudget,
-) -> Option<String> {
-    let p = providers[0];
-    match try_provider_with_retry(p, cfg, transcript, budget) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            if p != Provider::Ollama && is_quota_error(&e) {
-                issues.push(p.quota_issue(Provider::Ollama));
-                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-                chain_step(Provider::Ollama, cfg, transcript, None, issues, budget)
-            } else {
-                issues.push(format!("{} failed: {e}", p.name()));
-                tracing::warn!("{} cleanup failed: {e}", p.name().to_lowercase());
-                None
-            }
-        }
-    }
-}
-
-/// Provider for one edit: the configured one, or for "auto" the first with a
-/// key (Groq, then OpenRouter), else local Ollama.
-fn edit_provider(provider: &str, has_groq: bool, has_openrouter: bool) -> Provider {
-    match provider {
-        "groq" => Provider::Groq,
-        "openrouter" => Provider::OpenRouter,
-        "ollama" => Provider::Ollama,
-        _ if has_groq => Provider::Groq,
-        _ if has_openrouter => Provider::OpenRouter,
-        _ => Provider::Ollama,
-    }
-}
-
-/// One edit request to the configured provider. No fallback chain: a failed
-/// edit leaves the user's text alone and says why.
+/// One edit, routed like dictation cleanup (skipped keys left out, the
+/// fallback setting applies). A failed edit leaves the user's text alone
+/// and says why.
 pub fn edit_chat(
     system: &str,
     user: &str,
     cfg: &crate::core::config::Config,
 ) -> Result<String, String> {
-    let p = edit_provider(
-        &cfg.cleanup_provider,
-        groq_key().is_some(),
-        openrouter_key().is_some(),
-    );
-    try_provider_model(
-        p,
-        provider_model(p, cfg),
-        user,
-        Some(system),
-        &CleanupBudget::for_edit(),
+    let budget = CleanupBudget::for_edit();
+    let (order, strict) = route_for(cfg);
+    walk(
+        &order,
+        strict,
+        &mut Vec::new(),
+        |p| try_provider_model(p, provider_model(p, cfg), user, Some(system), &budget),
+        start_skip,
     )
-    .map_err(|e| format!("{} edit failed: {e}", p.name()))
+    .map_err(|f| edit_error(&f))
+}
+
+fn edit_error(failures: &[(Provider, String)]) -> String {
+    failures
+        .iter()
+        .map(|(p, e)| format!("{} edit failed: {e}{}", p.name(), key_hint(e)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// One line per provider for the "Test API Keys" menu item: does each saved
+/// key work? Makes a free authenticated GET (no tokens used); blocking, so
+/// call it off the event loop.
+pub fn check_keys() -> String {
+    let probe = |url: &str, key: Option<String>| {
+        key.map(|k| {
+            http()
+                .get(url)
+                .timeout(Duration::from_secs(8))
+                .set("Authorization", &format!("Bearer {k}"))
+                .call()
+                .map(|_| ())
+                .map_err(|e| match e {
+                    ureq::Error::Status(code, _) => format!("HTTP {code}"),
+                    other => format!("{other}"),
+                })
+        })
+    };
+    [
+        key_verdict(
+            "Groq",
+            probe("https://api.groq.com/openai/v1/models", groq_key()),
+        ),
+        key_verdict(
+            "OpenRouter",
+            probe("https://openrouter.ai/api/v1/key", openrouter_key()),
+        ),
+    ]
+    .join("\n")
+}
+
+fn key_verdict(name: &str, result: Option<Result<(), String>>) -> String {
+    match result {
+        None => format!("{name}: not set"),
+        Some(Ok(())) => format!("{name}: works"),
+        Some(Err(e)) if e.contains("401") || e.contains("403") => {
+            format!("{name}: rejected, paste a new key")
+        }
+        Some(Err(e)) => format!("{name}: couldn't check ({})", truncate(&e)),
+    }
+}
+
+/// True when `err` carries this HTTP status ("HTTP 429 …"). Matching the
+/// prefix keeps a Retry-After of 401 s from reading as a rejected key.
+fn status_is(err: &str, code: u16) -> bool {
+    err.contains(&format!("HTTP {code}"))
 }
 
 /// 429 (rate limit), 402 (payment/credits), or 401 (quota/auth exhausted).
 pub fn is_quota_error(err: &str) -> bool {
-    err.contains("429") || err.contains("402") || err.contains("401")
+    status_is(err, 429) || status_is(err, 402) || status_is(err, 401)
+}
+
+/// Error text for an HTTP status. A numeric Retry-After is kept so the
+/// skip period can use it; a date form is ignored (60 s default applies).
+fn status_error(code: u16, retry_after: Option<&str>) -> String {
+    match retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(s) => format!("HTTP {code} (retry after {s}s)"),
+        None => format!("HTTP {code}"),
+    }
+}
+
+const DEFAULT_SKIP: Duration = Duration::from_secs(60);
+const MAX_SKIP: Duration = Duration::from_secs(3600);
+
+/// How long to skip a provider after this error: only token or credit
+/// limits (429/402) count; a rejected key (401) does not fix itself in time.
+/// 429: its Retry-After, at least 60 s; 402 (no credits): the maximum.
+fn skip_for(err: &str) -> Option<Duration> {
+    if !(status_is(err, 429) || status_is(err, 402)) {
+        return None;
+    }
+    if status_is(err, 402) {
+        return Some(MAX_SKIP);
+    }
+    let secs = err
+        .split_once("(retry after ")
+        .and_then(|(_, rest)| rest.split_once("s)"))
+        .and_then(|(n, _)| n.parse::<u64>().ok());
+    Some(
+        secs.map_or(DEFAULT_SKIP, Duration::from_secs)
+            .clamp(DEFAULT_SKIP, MAX_SKIP),
+    )
+}
+
+/// Cloud providers skipped after a token limit, until the limit resets,
+/// plus the one notice to show when a skip period starts. Memory only.
+#[derive(Debug, Default)]
+struct Skips {
+    until: Vec<(Provider, Instant)>,
+    notice: Option<String>,
+}
+
+impl Skips {
+    fn is_skipped(&self, p: Provider, now: Instant) -> bool {
+        self.until.iter().any(|&(q, t)| q == p && now < t)
+    }
+
+    /// Skip `p` for `d` from `now`; `next` is what is used meanwhile.
+    fn start(&mut self, p: Provider, d: Duration, now: Instant, next: Provider) {
+        if p == Provider::Ollama {
+            return;
+        }
+        self.until.retain(|&(q, _)| q != p);
+        self.until.push((p, now + d));
+        self.notice = Some(format!(
+            "{} is out of tokens; using {} for about {} min.",
+            p.name(),
+            next.name(),
+            d.as_secs().div_ceil(60).max(1)
+        ));
+    }
+}
+
+static SKIPS: std::sync::Mutex<Skips> = std::sync::Mutex::new(Skips {
+    until: Vec::new(),
+    notice: None,
+});
+
+fn skips() -> std::sync::MutexGuard<'static, Skips> {
+    SKIPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The notice from a skip period that just started, once.
+pub fn take_limit_notice() -> Option<String> {
+    skips().notice.take()
+}
+
+/// Tells the user what to fix when a provider rejects the API key.
+fn key_hint(err: &str) -> &'static str {
+    if status_is(err, 401) {
+        " (API key rejected; update it in AI Keys & Models in the menu bar)"
+    } else {
+        ""
+    }
 }
 
 /// OpenAI-compatible chat completion (Groq + OpenRouter share the shape).
@@ -675,7 +844,7 @@ fn chat_completion(
         .set("Content-Type", "application/json")
         .send_json(body)
         .map_err(|e| match e {
-            ureq::Error::Status(code, _) => format!("HTTP {code}"),
+            ureq::Error::Status(code, resp) => status_error(code, resp.header("retry-after")),
             other => format!("{other}"),
         })?;
     let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {e:?}"))?;
@@ -1093,6 +1262,9 @@ fn synthesize_context_with_key(
     let Some(key) = key else {
         return String::new();
     };
+    if skips().is_skipped(Provider::Groq, Instant::now()) {
+        return String::new();
+    }
     // The answer depends only on (app, model), so each pair costs one call
     // per process. Failures are not cached; the next dictation retries.
     static CACHE: std::sync::Mutex<Vec<(String, String, String)>> =
@@ -1142,16 +1314,162 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_provider_follows_config_then_keys() {
-        assert_eq!(edit_provider("groq", false, false), Provider::Groq);
+    fn only_cloud_providers_retry_with_the_fallback_model() {
+        assert_eq!(retry_model(Provider::Groq, "a", "b"), Some("b"));
+        assert_eq!(retry_model(Provider::OpenRouter, "a", "b"), Some("b"));
         assert_eq!(
-            edit_provider("openrouter", false, false),
-            Provider::OpenRouter
+            retry_model(Provider::Groq, "a", "a"),
+            None,
+            "same model: no retry"
         );
-        assert_eq!(edit_provider("ollama", true, true), Provider::Ollama);
-        assert_eq!(edit_provider("auto", true, true), Provider::Groq);
-        assert_eq!(edit_provider("", false, true), Provider::OpenRouter);
-        assert_eq!(edit_provider("auto", false, false), Provider::Ollama);
+        assert_eq!(
+            retry_model(Provider::Ollama, "llama3.2:3b", "qwen/qwen3.8-27b"),
+            None,
+            "the shared fallback is a cloud model id, never installed in Ollama"
+        );
+    }
+
+    use Provider::{Groq, Ollama, OpenRouter};
+
+    #[test]
+    fn route_without_limits_matches_todays_order() {
+        let keys = |_: Provider| true;
+        let no_keys = |_: Provider| false;
+        let free = |_: Provider| false;
+        assert_eq!(
+            route("auto", "ollama", keys, free),
+            (vec![Groq, OpenRouter, Ollama], false)
+        );
+        assert_eq!(route("", "auto", no_keys, free), (vec![Ollama], false));
+        assert_eq!(
+            route("groq", "ollama", keys, free),
+            (vec![Groq, Ollama], true)
+        );
+        assert_eq!(route("ollama", "auto", keys, free), (vec![Ollama], true));
+        assert_eq!(
+            route("openrouter", "auto", keys, free),
+            (vec![OpenRouter, Groq, Ollama], true)
+        );
+        assert_eq!(
+            route("groq", "bogus", keys, free),
+            (vec![Groq, Ollama], true)
+        );
+    }
+
+    #[test]
+    fn route_leaves_out_skipped_providers() {
+        let keys = |_: Provider| true;
+        let groq_limited = |p: Provider| p == Groq;
+        assert_eq!(
+            route("groq", "ollama", keys, groq_limited),
+            (vec![Ollama], false)
+        );
+        assert_eq!(
+            route("groq", "auto", keys, groq_limited),
+            (vec![OpenRouter, Ollama], false)
+        );
+        assert_eq!(
+            route("auto", "ollama", keys, groq_limited),
+            (vec![OpenRouter, Ollama], false)
+        );
+        assert_eq!(
+            route("groq", "auto", |p| p != OpenRouter, groq_limited),
+            (vec![Ollama], false)
+        );
+    }
+
+    #[test]
+    fn route_auto_with_only_a_groq_key() {
+        assert_eq!(
+            route("auto", "ollama", |p| p == Groq, |_| false),
+            (vec![Groq, Ollama], false)
+        );
+    }
+
+    #[test]
+    fn retry_error_keeps_a_limit_from_the_primary() {
+        let limit = "HTTP 429 (retry after 90s)".to_string();
+        assert_eq!(retry_error(limit.clone(), "timeout".into()), limit);
+        assert_eq!(retry_error("HTTP 500".into(), "timeout".into()), "timeout");
+        assert_eq!(
+            retry_error(limit, "HTTP 402".into()),
+            "HTTP 402".to_string()
+        );
+    }
+
+    #[test]
+    fn edit_error_names_every_failed_provider() {
+        let e = edit_error(&[
+            (Groq, "HTTP 401".into()),
+            (Ollama, "Ollama not running".into()),
+        ]);
+        assert_eq!(
+            e,
+            "Groq edit failed: HTTP 401 (API key rejected; update it in AI Keys & Models in the menu bar); Ollama edit failed: Ollama not running"
+        );
+    }
+
+    #[test]
+    fn walk_records_limits_and_keeps_issue_texts() {
+        let mut issues = Vec::new();
+        let mut limits = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            false,
+            &mut issues,
+            |p| match p {
+                Groq => Err("HTTP 429 (retry after 12s)".into()),
+                _ => Ok("clean".into()),
+            },
+            |p, d, next| limits.push((p, d, next)),
+        );
+        assert_eq!(out, Ok("clean".to_string()));
+        assert_eq!(limits, [(Groq, Duration::from_secs(60), Ollama)]);
+        assert_eq!(
+            issues,
+            ["Groq tokens/rate limit exhausted — falling back to Ollama"]
+        );
+    }
+
+    #[test]
+    fn walk_explicit_provider_falls_back_only_on_key_or_limit_errors() {
+        let mut tried = Vec::new();
+        let mut issues = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            true,
+            &mut issues,
+            |p| {
+                tried.push(p);
+                Err("HTTP 500".into())
+            },
+            |_, _, _| panic!("500 is not a limit"),
+        );
+        assert_eq!(out, Err(vec![(Groq, "HTTP 500".to_string())]));
+        assert_eq!(tried, [Groq]);
+        assert_eq!(issues, ["Groq failed: HTTP 500"]);
+
+        let mut issues = Vec::new();
+        let out = walk(
+            &[Groq, Ollama],
+            true,
+            &mut issues,
+            |p| match p {
+                Groq => Err("HTTP 401".into()),
+                _ => Err("down".into()),
+            },
+            |_, _, _| panic!("401 starts no skip"),
+        );
+        assert_eq!(
+            out,
+            Err(vec![
+                (Groq, "HTTP 401".to_string()),
+                (Ollama, "down".to_string())
+            ])
+        );
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].contains("API key"), "{issues:?}");
+        assert_eq!(issues[1], "Ollama fallback failed: down");
     }
 
     #[test]
@@ -1159,7 +1477,7 @@ mod tests {
         let edit = CleanupBudget::for_edit();
         assert!(edit.remaining().unwrap() > Duration::from_secs(5));
         assert_eq!(edit.ollama_timeout, EDIT_BUDGET);
-        assert_eq!(CleanupBudget::new().ollama_timeout, OLLAMA_TIMEOUT);
+        assert_eq!(CleanupBudget::new(0).ollama_timeout, OLLAMA_TIMEOUT);
     }
 
     #[test]
@@ -1168,7 +1486,7 @@ mod tests {
         let edit = CleanupBudget::for_edit().ollama_options(short);
         assert_eq!(edit["num_predict"], 400);
         assert_eq!(edit["stop"], json!([]));
-        let dict = CleanupBudget::new().ollama_options(short);
+        let dict = CleanupBudget::new(0).ollama_options(short);
         assert_eq!(dict["num_predict"], 100);
         assert_eq!(dict["stop"][4], "Context:");
         assert_eq!(dict["stop"].as_array().unwrap().len(), 5);
@@ -1176,7 +1494,7 @@ mod tests {
 
     #[test]
     fn cleanup_budget_is_shared_and_exhaustion_is_explicit() {
-        let budget = CleanupBudget::new();
+        let budget = CleanupBudget::new(0);
         let first = budget.remaining().unwrap();
         assert!(first <= CLEANUP_BUDGET);
         assert!(budget.remaining().unwrap() <= first);
@@ -1190,6 +1508,32 @@ mod tests {
             expired.remaining().unwrap_err(),
             "cleanup time budget exhausted"
         );
+    }
+
+    #[test]
+    fn dictation_time_grows_with_length_and_caps() {
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 0), OLLAMA_TIMEOUT);
+        assert_eq!(
+            scaled_for(OLLAMA_TIMEOUT, 9),
+            OLLAMA_TIMEOUT,
+            "under 10 words: unchanged"
+        );
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 50), Duration::from_millis(3500));
+        assert_eq!(scaled_for(CLEANUP_BUDGET, 50), Duration::from_millis(4000));
+        assert_eq!(scaled_for(OLLAMA_TIMEOUT, 500), DICTATION_CAP);
+        let long = CleanupBudget::new(150);
+        assert_eq!(long.ollama_timeout, DICTATION_CAP);
+        assert!(long.remaining().unwrap() > Duration::from_secs(5));
+        assert_eq!(CleanupBudget::new(3).ollama_timeout, OLLAMA_TIMEOUT);
+    }
+
+    #[test]
+    fn cleanup_time_counts_only_dictated_words() {
+        let input = format_cleanup_input(
+            Some("The user is writing an email to a colleague about the budget."),
+            "ship it",
+        );
+        assert_eq!(plain_transcript_of(&input).split_whitespace().count(), 2);
     }
 
     #[test]
@@ -1248,6 +1592,136 @@ mod tests {
         assert!(is_quota_error("HTTP 401"));
         assert!(!is_quota_error("HTTP 500"));
         assert!(!is_quota_error("network down"));
+    }
+
+    #[test]
+    fn limit_errors_set_a_skip_time() {
+        for (e, secs) in [
+            ("HTTP 429 (retry after 12s)", 60),
+            ("HTTP 429 (retry after 90s)", 90),
+            ("HTTP 429", 60),
+            ("HTTP 429 (retry after 0s)", 60),
+            ("HTTP 429 (retry after 99999s)", 3600),
+            ("HTTP 402", 3600),
+            ("HTTP 402 (retry after 30s)", 3600),
+        ] {
+            assert_eq!(skip_for(e), Some(Duration::from_secs(secs)), "{e}");
+        }
+        for e in ["HTTP 401", "HTTP 500", "timeout", "model not installed"] {
+            assert_eq!(skip_for(e), None, "{e}");
+        }
+    }
+
+    #[test]
+    fn status_errors_keep_retry_after_seconds_only() {
+        assert_eq!(
+            status_error(429, Some(" 12 ")),
+            "HTTP 429 (retry after 12s)"
+        );
+        assert_eq!(
+            status_error(429, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            "HTTP 429"
+        );
+        assert_eq!(status_error(500, None), "HTTP 500");
+        // A wait of 401 s is a limit, not a rejected key.
+        let e = status_error(429, Some("401"));
+        assert!(!status_is(&e, 401) && status_is(&e, 429), "{e}");
+        assert!(!Provider::Groq
+            .quota_issue(&e, Provider::Ollama)
+            .contains("API key"));
+    }
+
+    #[test]
+    fn skip_period_ends_and_names_the_fallback() {
+        let now = Instant::now();
+        let mut s = Skips::default();
+        s.start(
+            Provider::Groq,
+            Duration::from_secs(12),
+            now,
+            Provider::Ollama,
+        );
+        assert!(s.is_skipped(Provider::Groq, now + Duration::from_secs(11)));
+        assert!(!s.is_skipped(Provider::Groq, now + Duration::from_secs(12)));
+        assert!(!s.is_skipped(Provider::OpenRouter, now));
+        assert_eq!(
+            s.notice.take().as_deref(),
+            Some("Groq is out of tokens; using Ollama for about 1 min.")
+        );
+        s.start(
+            Provider::OpenRouter,
+            Duration::from_secs(150),
+            now,
+            Provider::Groq,
+        );
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("OpenRouter is out of tokens; using Groq for about 3 min.")
+        );
+        s.notice = None;
+        s.start(
+            Provider::Ollama,
+            Duration::from_secs(60),
+            now,
+            Provider::Ollama,
+        );
+        assert!(!s.is_skipped(Provider::Ollama, now));
+        assert_eq!(s.notice, None);
+    }
+
+    /// Network: checks the real saved keys. Prints only the verdict.
+    /// `cargo test live_key_check -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_key_check() {
+        let verdict = check_keys();
+        println!("{verdict}");
+        assert!(verdict.starts_with("Groq: ") && verdict.contains("\nOpenRouter: "));
+    }
+
+    #[test]
+    fn copied_groq_keys_are_recognised() {
+        let key = format!("gsk_{}", "aB3".repeat(17) + "x");
+        assert_eq!(key.len(), 56);
+        assert!(looks_like_groq_key(&key));
+        for not_a_key in [
+            "gsk_short",
+            "sk-or-v1-0123456789abcdef0123456789abcdef0123456789",
+            "the gsk_ key is below",
+            &format!("{key} and more"),
+            &format!("gsk_{}", "a-b".repeat(18)),
+            "",
+        ] {
+            assert!(!looks_like_groq_key(not_a_key), "{not_a_key}");
+        }
+    }
+
+    #[test]
+    fn key_check_says_what_to_do() {
+        assert_eq!(key_verdict("Groq", None), "Groq: not set");
+        assert_eq!(key_verdict("Groq", Some(Ok(()))), "Groq: works");
+        for code in ["HTTP 401", "HTTP 403"] {
+            assert_eq!(
+                key_verdict("Groq", Some(Err(code.into()))),
+                "Groq: rejected, paste a new key"
+            );
+        }
+        assert_eq!(
+            key_verdict("OpenRouter", Some(Err("HTTP 503".into()))),
+            "OpenRouter: couldn't check (HTTP 503)"
+        );
+    }
+
+    #[test]
+    fn rejected_key_is_not_reported_as_rate_limit() {
+        let msg = Provider::Groq.quota_issue("HTTP 401", Provider::Ollama);
+        assert!(msg.contains("API key"), "{msg}");
+        assert!(!msg.contains("rate limit"), "{msg}");
+        assert!(msg.ends_with("falling back to Ollama"), "{msg}");
+        let msg = Provider::Groq.quota_issue("HTTP 429", Provider::Ollama);
+        assert!(msg.contains("rate limit"), "{msg}");
+        assert!(key_hint("HTTP 401").contains("AI Keys"));
+        assert_eq!(key_hint("HTTP 500"), "");
     }
 
     #[test]
@@ -1542,5 +2016,26 @@ mod tests {
             Ok(()) => {} // running + model installed
             Err(e) => eprintln!("skipped (ollama not ready here): {e}"),
         }
+    }
+
+    /// Needs Ollama running. A skipped Groq is never called: with a working
+    /// or a rejected Groq key alike, the only provider used is Ollama.
+    /// `cargo test live_skipped_groq_uses_ollama -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_skipped_groq_uses_ollama() {
+        start_skip(Groq, Duration::from_secs(30), Ollama);
+        assert_eq!(
+            take_limit_notice().as_deref(),
+            Some("Groq is out of tokens; using Ollama for about 1 min.")
+        );
+        let cfg = crate::core::config::Config {
+            cleanup_provider: "groq".into(),
+            ..Default::default()
+        };
+        let out = clean_chain("um so the meeting is on friday", &cfg);
+        println!("{out:?}");
+        assert!(out.issues.is_empty(), "Groq was called: {:?}", out.issues);
+        assert!(!out.text.trim().is_empty());
     }
 }

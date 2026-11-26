@@ -2,7 +2,9 @@
 
 Local and cloud transcripts pass through the same correction stage before
 injection. English cleanup removes simple fillers (`um`, `uh`, `erm`) and
-obvious repeated function words such as `the the`. It preserves paragraphs,
+obvious repeated function words such as `the the`. A run of five or more identical
+words (a Whisper decoding loop such as `test test … test`) collapses to
+one word before routing; three or four repeats are kept as spoken. It preserves paragraphs,
 grammatical repetitions such as `had had`, quoted text, commands, paths,
 URLs, identifiers, acronyms, and numeric literals. Existing capitalization
 and spoken math cleanup run here too.
@@ -12,10 +14,12 @@ use the configured AI cleanup chain. Its result is checked for changed
 protected content, negation, unsupported numbers, added vocabulary, and
 discarded text. A rejected result or provider failure returns the local
 corrections. These checks are conservative heuristics, not a complete
-semantic guarantee.
+semantic guarantee. A provider that reports a token limit is skipped until
+the limit resets; see the README.
 
-Cleanup provider requests share a two-second budget; Ollama generation
-also retains its 800 ms timeout. Context synthesis has its existing,
+Cleanup provider requests share a budget of two seconds plus 0.4 s per ten
+dictated words (at most six seconds); the Ollama request timeout grows the
+same way from 1.5 s. Context synthesis has its existing,
 separate timeout. Recording, Fn handling, STT provider selection, history,
 and clipboard fallback keep their existing lifecycle.
 

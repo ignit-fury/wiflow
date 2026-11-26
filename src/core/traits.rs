@@ -153,7 +153,10 @@ impl CleanupProvider for ChainProvider {
 impl ChainProvider {
     /// Apply user-confirmed replacements once, then decide whether AI adds value.
     pub fn prepare_route(&self, text: &str, cfg: &Config) -> crate::core::analyze::CleanupRoute {
-        let corrected = crate::core::correction::apply_saved_corrections(text, cfg);
+        // A decoder loop ("test test … test") is never speech: drop it first,
+        // so neither cleanup route sees it and no AI call is spent on it.
+        let text = crate::core::correction::collapse_runaway_repeats(text);
+        let corrected = crate::core::correction::apply_saved_corrections(&text, cfg);
         crate::core::analyze::decide_route(&corrected, cfg)
     }
 
@@ -581,5 +584,16 @@ mod tests {
         let outcome = cleaner.clean(&transcript.text, None, &cfg);
         let report = injector.inject(&outcome.text);
         assert!(report.is_ok());
+    }
+
+    #[test]
+    fn prepare_route_drops_runaway_repeats() {
+        let route = ChainProvider.prepare_route(
+            "this is the testing of test test test test test test test",
+            &Config::default(),
+        );
+        let (crate::core::analyze::CleanupRoute::Direct(a)
+        | crate::core::analyze::CleanupRoute::Llm(a)) = route;
+        assert!(!a.text.to_lowercase().contains("test test"), "{}", a.text);
     }
 }

@@ -94,6 +94,8 @@ pub enum DaemonEvent {
     /// User-facing message from the worker (voice-edit could not run): shown
     /// as a native notification; the session state is untouched.
     Notice(String),
+    /// Words heard so far while the key is held (live preview for the pill).
+    LivePreview(String),
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.
@@ -386,6 +388,9 @@ fn pipeline_on_worker(
     for issue in &issues {
         let _ = proxy.send_event(DaemonEvent::CleanupIssue(issue.clone()));
     }
+    if let Some(notice) = crate::core::cleanup::take_limit_notice() {
+        let _ = proxy.send_event(DaemonEvent::Notice(notice));
+    }
     if crate::core::cleanup::is_filler_result(&cleaned) {
         // Filler-only transcript (or "EMPTY" sentinel) — nothing to inject.
         tracing::info!("transcript empty or filler-only after cleanup");
@@ -450,7 +455,11 @@ fn finish_edit(
         return end(String::new());
     }
     let t0 = Instant::now();
-    match crate::core::edit::run(instruction, selected.as_deref(), cfg) {
+    let result = crate::core::edit::run(instruction, selected.as_deref(), cfg);
+    if let Some(notice) = crate::core::cleanup::take_limit_notice() {
+        let _ = proxy.send_event(DaemonEvent::Notice(notice));
+    }
+    match result {
         Ok(_) if selection_moved(selected.as_deref(), recheck()) => {
             let notice = "The selection changed, so the edit was not applied.".to_string();
             tracing::warn!("edit not applied: {notice}");
@@ -618,6 +627,54 @@ fn watchdog(
     }
 }
 
+/// How often the pill's live text refreshes while the key is held.
+const PREVIEW_EVERY: Duration = Duration::from_millis(1000);
+/// No preview starts this close to the watchdog: a pass would delay it past
+/// the app's own supervision tick, which would then error the session.
+const PREVIEW_DEADLINE_MARGIN: Duration = Duration::from_secs(2);
+
+fn preview_allowed(now: Instant, deadline: Instant) -> bool {
+    deadline.saturating_duration_since(now) > PREVIEW_DEADLINE_MARGIN
+}
+/// Most recent audio one preview pass transcribes: keeps passes short on
+/// long holds (about 0.1–0.3 s).
+const PREVIEW_TAIL_SECS: usize = 15;
+
+/// One live-preview pass while the key is held: transcribe the latest audio
+/// and show it in the pill. Never affects the final transcript.
+fn live_preview(
+    capture: &mut Option<crate::core::audio::AudioCapture>,
+    proxy: &EventLoopProxy<DaemonEvent>,
+) {
+    let Some(cap) = capture.as_mut() else { return };
+    // Re-read each pass so the Settings toggle applies mid-session too.
+    let cfg = crate::core::config::load_config();
+    // Preview is local-only: Groq users may have no local model loaded.
+    if !cfg.live_preview || cfg.stt_provider == "groq" {
+        return;
+    }
+    let rate = cap.sample_rate();
+    let all = cap.snapshot();
+    let tail = &all[all.len().saturating_sub(rate as usize * PREVIEW_TAIL_SECS)..];
+    if !crate::core::vad::has_speech_energy(tail, rate) {
+        return;
+    }
+    let audio = crate::core::vad::resample_to_16k(tail, rate);
+    let t0 = Instant::now();
+    match crate::core::stt::transcribe_preview(&audio, &cfg.stt_language) {
+        Ok(text) if !text.is_empty() => {
+            tracing::info!(
+                "live preview: {} words in {}ms",
+                text.split_whitespace().count(),
+                t0.elapsed().as_millis()
+            );
+            let _ = proxy.send_event(DaemonEvent::LivePreview(text));
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("live preview failed: {e}"),
+    }
+}
+
 /// Worker entry: owns `PushToTalk` + the live `AudioCapture`, so every
 /// `Duration`-blocking call (device open, capture stop, model download,
 /// transcribe, inject) runs here, never on the winit thread.
@@ -641,6 +698,8 @@ pub fn worker_main(
         "[session={}] worker started (recording watchdog max {max_ms}ms)",
         current_session()
     );
+    // Next live-preview time while the mic is open (None between holds).
+    let mut preview_at: Option<Instant> = None;
     loop {
         // Mic closed → block normally. Mic open → block only until the
         // watchdog deadline; on expiry the watchdog fires instead.
@@ -659,26 +718,39 @@ pub fn worker_main(
                     );
                     continue;
                 }
-                match rx.recv_timeout(deadline - now) {
+                // Wake at the earlier of the watchdog and the next preview.
+                let preview_due = *preview_at.get_or_insert(start + PREVIEW_EVERY);
+                let wake = deadline.min(preview_due);
+                match rx.recv_timeout(wake.saturating_duration_since(now)) {
                     Ok(c) => c,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        watchdog(
-                            &mut ptt,
-                            &mut capture,
-                            &mut capture_start,
-                            &proxy,
-                            max_ms,
-                            &duck,
-                        );
+                        if Instant::now() >= deadline {
+                            watchdog(
+                                &mut ptt,
+                                &mut capture,
+                                &mut capture_start,
+                                &proxy,
+                                max_ms,
+                                &duck,
+                            );
+                        } else {
+                            if preview_allowed(Instant::now(), deadline) {
+                                live_preview(&mut capture, &proxy);
+                            }
+                            preview_at = Some(Instant::now() + PREVIEW_EVERY);
+                        }
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-            None => match rx.recv() {
-                Ok(c) => c,
-                Err(_) => break,
-            },
+            None => {
+                preview_at = None;
+                match rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                }
+            }
         };
         match ctl {
             Control::Down => {
@@ -782,6 +854,15 @@ pub fn worker_main(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_skipped_near_watchdog_deadline() {
+        let now = Instant::now();
+        assert!(preview_allowed(now, now + Duration::from_secs(30)));
+        assert!(!preview_allowed(now, now + Duration::from_millis(1999)));
+        assert!(!preview_allowed(now, now + PREVIEW_DEADLINE_MARGIN));
+        assert!(!preview_allowed(now + Duration::from_secs(1), now));
+    }
+
     #[derive(Default)]
     struct Recorder(std::sync::Mutex<Vec<String>>);
 
