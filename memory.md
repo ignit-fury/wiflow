@@ -188,3 +188,9 @@ all targets with warnings denied, formatting, and diff checks passed.
   is the backup (not trusted alone: Terminal's Secure Keyboard Entry keeps it
   on). Verified live: macOS password dialog and a Safari password input
   blocked; a normal dialog text field still typed.
+
+- 2026-11-14 — Voice-edit of selected text: hold PTT key + Shift, speak an
+  instruction, selection replaced via the cleanup provider (no fallback chain,
+  8 s budget, edits not saved to history). Why: usage is short chat
+  dictations; rewriting existing text saves the most steps. Ctrl+Space preset
+  excluded (not on the event tap).

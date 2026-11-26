@@ -13,6 +13,8 @@ pub const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 /// Filler-only sentinel the system prompt returns for empty/filler input.
 pub const EMPTY_SENTINEL: &str = "EMPTY";
 const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+/// Time limit for one voice-edit request (rewrites take longer than cleanup).
+const EDIT_BUDGET: Duration = Duration::from_secs(8);
 /// Context runs before the cleanup budget starts, so it gets its own short cap.
 const CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -25,13 +27,42 @@ pub(crate) fn http() -> &'static ureq::Agent {
 
 struct CleanupBudget {
     deadline: std::time::Instant,
+    /// Per-request cap for the local Ollama call.
+    ollama_timeout: Duration,
+    /// Stop sequences for Ollama; dictation only (an edit may legitimately
+    /// contain "Context:" or blank lines).
+    ollama_stop: &'static [&'static str],
+    /// Fixed Ollama output cap; `None` scales with the prompt (dictation).
+    ollama_token_cap: Option<usize>,
 }
+
+const DICTATION_STOP: &[&str] = &["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"];
 
 impl CleanupBudget {
     fn new() -> Self {
         Self {
             deadline: std::time::Instant::now() + CLEANUP_BUDGET,
+            ollama_timeout: OLLAMA_TIMEOUT,
+            ollama_stop: DICTATION_STOP,
+            ollama_token_cap: None,
         }
+    }
+    /// Edits rewrite a whole selection: far longer than tidying a sentence.
+    fn for_edit() -> Self {
+        Self {
+            deadline: std::time::Instant::now() + EDIT_BUDGET,
+            ollama_timeout: EDIT_BUDGET,
+            ollama_stop: &[],
+            ollama_token_cap: Some(400),
+        }
+    }
+    fn ollama_options(&self, prompt: &str) -> serde_json::Value {
+        json!({
+            "temperature": 0.0,
+            "num_predict": self.ollama_token_cap.unwrap_or_else(|| ollama_token_cap(prompt)),
+            "num_ctx": OLLAMA_NUM_CTX,
+            "stop": self.ollama_stop,
+        })
     }
     fn remaining(&self) -> Result<Duration, String> {
         let remaining = self
@@ -371,6 +402,7 @@ fn try_provider_model(
     p: Provider,
     model: &str,
     transcript: &str,
+    system: Option<&str>,
     budget: &CleanupBudget,
 ) -> Result<String, String> {
     let timeout = budget.remaining()?;
@@ -383,7 +415,7 @@ fn try_provider_model(
                 &key,
                 model,
                 transcript,
-                None,
+                system,
                 timeout,
             )
         }
@@ -396,11 +428,11 @@ fn try_provider_model(
                 &key,
                 model,
                 transcript,
-                None,
+                system,
                 timeout,
             )
         }
-        Provider::Ollama => ollama_chat(transcript, None, model, budget),
+        Provider::Ollama => ollama_chat(transcript, system, model, budget),
     }
 }
 
@@ -414,7 +446,7 @@ fn try_provider_with_retry(
     budget: &CleanupBudget,
 ) -> Result<String, String> {
     let primary = provider_model(p, cfg);
-    match try_provider_model(p, primary, transcript, budget)
+    match try_provider_model(p, primary, transcript, None, budget)
         .map(|t| sanitize_llm_response(&t, transcript))
     {
         Ok(t) => Ok(t),
@@ -422,7 +454,7 @@ fn try_provider_with_retry(
             let fallback = cfg.cleanup_fallback_model.as_str();
             if fallback != primary {
                 tracing::warn!("retry with fallback model {fallback}: {e}");
-                try_provider_model(p, fallback, transcript, budget)
+                try_provider_model(p, fallback, transcript, None, budget)
                     .map(|t| sanitize_llm_response(&t, transcript))
                     // The default fallback is a cloud model id; on Ollama a
                     // missing fallback must not mask the primary error.
@@ -574,6 +606,41 @@ fn single_provider_chain(
     }
 }
 
+/// Provider for one edit: the configured one, or for "auto" the first with a
+/// key (Groq, then OpenRouter), else local Ollama.
+fn edit_provider(provider: &str, has_groq: bool, has_openrouter: bool) -> Provider {
+    match provider {
+        "groq" => Provider::Groq,
+        "openrouter" => Provider::OpenRouter,
+        "ollama" => Provider::Ollama,
+        _ if has_groq => Provider::Groq,
+        _ if has_openrouter => Provider::OpenRouter,
+        _ => Provider::Ollama,
+    }
+}
+
+/// One edit request to the configured provider. No fallback chain: a failed
+/// edit leaves the user's text alone and says why.
+pub fn edit_chat(
+    system: &str,
+    user: &str,
+    cfg: &crate::core::config::Config,
+) -> Result<String, String> {
+    let p = edit_provider(
+        &cfg.cleanup_provider,
+        groq_key().is_some(),
+        openrouter_key().is_some(),
+    );
+    try_provider_model(
+        p,
+        provider_model(p, cfg),
+        user,
+        Some(system),
+        &CleanupBudget::for_edit(),
+    )
+    .map_err(|e| format!("{} edit failed: {e}", p.name()))
+}
+
 /// 429 (rate limit), 402 (payment/credits), or 401 (quota/auth exhausted).
 pub fn is_quota_error(err: &str) -> bool {
     err.contains("429") || err.contains("402") || err.contains("401")
@@ -643,7 +710,7 @@ fn ollama_chat(
     }
     let resp = http()
         .post(&format!("{OLLAMA_ENDPOINT}/api/generate"))
-        .timeout(budget.remaining()?.min(OLLAMA_TIMEOUT))
+        .timeout(budget.remaining()?.min(budget.ollama_timeout))
         .set("Content-Type", "application/json")
         .send_json(json!({
             "model": model,
@@ -652,12 +719,7 @@ fn ollama_chat(
             "stream": false,
             // Hardened for 1B SLMs: deterministic, generation-capped, stops
             // the moment the model reaches for XML or a new section.
-            "options": {
-                "temperature": 0.0,
-                "num_predict": ollama_token_cap(prompt),
-                "num_ctx": OLLAMA_NUM_CTX,
-                "stop": ["</transcript>", "</Input>", "<Input>", "\n\n\n", "Context:"],
-            },
+            "options": budget.ollama_options(prompt),
             // Keep weights resident in unified memory (no reload latency).
             "keep_alive": -1,
         }))
@@ -972,7 +1034,7 @@ fn strip_flat_header(s: &str) -> String {
 }
 
 /// Strip one pair of surrounding quotes: "…" '…' “…” ‘…’.
-fn strip_surrounding_quotes(s: &str) -> String {
+pub(crate) fn strip_surrounding_quotes(s: &str) -> String {
     let t = s.trim();
     let pairs: &[(&str, &str)] = &[("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’")];
     for (o, c) in pairs {
@@ -1080,6 +1142,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edit_provider_follows_config_then_keys() {
+        assert_eq!(edit_provider("groq", false, false), Provider::Groq);
+        assert_eq!(
+            edit_provider("openrouter", false, false),
+            Provider::OpenRouter
+        );
+        assert_eq!(edit_provider("ollama", true, true), Provider::Ollama);
+        assert_eq!(edit_provider("auto", true, true), Provider::Groq);
+        assert_eq!(edit_provider("", false, true), Provider::OpenRouter);
+        assert_eq!(edit_provider("auto", false, false), Provider::Ollama);
+    }
+
+    #[test]
+    fn edit_budget_allows_long_rewrites_and_dictation_keeps_its_limits() {
+        let edit = CleanupBudget::for_edit();
+        assert!(edit.remaining().unwrap() > Duration::from_secs(5));
+        assert_eq!(edit.ollama_timeout, EDIT_BUDGET);
+        assert_eq!(CleanupBudget::new().ollama_timeout, OLLAMA_TIMEOUT);
+    }
+
+    #[test]
+    fn edit_ollama_options_have_no_stop_list_and_full_cap() {
+        let short = "ship it";
+        let edit = CleanupBudget::for_edit().ollama_options(short);
+        assert_eq!(edit["num_predict"], 400);
+        assert_eq!(edit["stop"], json!([]));
+        let dict = CleanupBudget::new().ollama_options(short);
+        assert_eq!(dict["num_predict"], 100);
+        assert_eq!(dict["stop"][4], "Context:");
+        assert_eq!(dict["stop"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
     fn cleanup_budget_is_shared_and_exhaustion_is_explicit() {
         let budget = CleanupBudget::new();
         let first = budget.remaining().unwrap();
@@ -1087,6 +1182,9 @@ mod tests {
         assert!(budget.remaining().unwrap() <= first);
         let expired = CleanupBudget {
             deadline: std::time::Instant::now() - Duration::from_millis(1),
+            ollama_timeout: OLLAMA_TIMEOUT,
+            ollama_stop: DICTATION_STOP,
+            ollama_token_cap: None,
         };
         assert_eq!(
             expired.remaining().unwrap_err(),

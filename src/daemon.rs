@@ -91,6 +91,9 @@ pub enum DaemonEvent {
     CleanupIssue(String),
     /// Wiflow was launched again while running: show the main window.
     OpenWindow,
+    /// User-facing message from the worker (voice-edit could not run): shown
+    /// as a native notification; the session state is untouched.
+    Notice(String),
 }
 
 /// Register the preferred preset; fall back when the OS swallows it.
@@ -272,6 +275,9 @@ fn pipeline_on_worker(
         context_ms: 0,
         cleanup_ms: 0,
     };
+    // Taken at release, before the (slow) stop, so a quick re-press cannot
+    // set a flag this hold would consume: true when the hold had Shift.
+    let edit_mode = crate::platform::macos::tap::take_edit_held();
     let out = capture.stop();
     let mut vad = crate::core::vad::Vad::new();
     let kept = crate::core::vad::transcribe_ready(&out.samples_mono, out.sample_rate, &mut vad);
@@ -293,6 +299,10 @@ fn pipeline_on_worker(
         return;
     }
     let cfg = crate::core::config::load_config();
+    // Voice-edit hold: read the selection while the instruction is transcribed.
+    // Skipped when cleanup is off: the edit is refused then, so no Cmd+C.
+    let selection = (edit_mode && cfg.cleanup_enabled)
+        .then(|| std::thread::spawn(crate::platform::macos::selection::selected_text));
     // Context needs the focused app (~200 ms osascript); read it while STT
     // runs instead of after. Same gate as the context step below.
     let key_present = crate::core::cleanup::groq_key().is_some();
@@ -323,6 +333,18 @@ fn pipeline_on_worker(
         text.split_whitespace().count(),
         kept_ms / 1000.0
     );
+    if edit_mode {
+        finish_edit(
+            selection,
+            &text,
+            &cfg,
+            duration_ms,
+            rtf,
+            proxy,
+            crate::platform::macos::selection::selected_text_ax,
+        );
+        return;
+    }
     // Cleanup via trait (route decision + context gate + chain).
     let cleanup_provider = crate::core::traits::ChainProvider;
     // Context gate: transcript must carry value AND app must be
@@ -400,6 +422,62 @@ fn pipeline_on_worker(
         duration_ms,
         rtf,
     });
+}
+
+/// Voice-edit tail of the pipeline: spoken instruction + selection in, edited
+/// text out. Every failure leaves the user's text alone: a notice goes out and
+/// the session ends with an empty `Done`.
+fn finish_edit(
+    selection: Option<std::thread::JoinHandle<Option<String>>>,
+    instruction: &str,
+    cfg: &crate::core::config::Config,
+    duration_ms: u64,
+    rtf: f64,
+    proxy: &impl DaemonEventSender,
+    // AX-only read of the current selection, to catch a moved selection.
+    recheck: impl FnOnce() -> Option<String>,
+) {
+    let selected = selection.and_then(|h| h.join().ok().flatten());
+    let end = |text: String| {
+        let _ = proxy.send_event(DaemonEvent::Done {
+            text,
+            duration_ms,
+            rtf,
+        });
+    };
+    if instruction.trim().is_empty() {
+        tracing::info!("edit hold: no instruction heard");
+        return end(String::new());
+    }
+    let t0 = Instant::now();
+    match crate::core::edit::run(instruction, selected.as_deref(), cfg) {
+        Ok(_) if selection_moved(selected.as_deref(), recheck()) => {
+            let notice = "The selection changed, so the edit was not applied.".to_string();
+            tracing::warn!("edit not applied: {notice}");
+            let _ = proxy.send_event(DaemonEvent::Notice(notice));
+            end(String::new())
+        }
+        Ok(text) => {
+            tracing::info!(
+                "edit done in {}ms ({} -> {} chars)",
+                t0.elapsed().as_millis(),
+                selected.as_deref().map_or(0, |s| s.chars().count()),
+                text.chars().count()
+            );
+            end(text)
+        }
+        Err(notice) => {
+            tracing::warn!("edit not applied: {notice}");
+            let _ = proxy.send_event(DaemonEvent::Notice(notice));
+            end(String::new())
+        }
+    }
+}
+
+/// True when AX can read the selection now and it is no longer the text that
+/// was edited. AX `None` (original came from Cmd+C) proceeds as before.
+fn selection_moved(original: Option<&str>, now: Option<String>) -> bool {
+    matches!((original, now), (Some(o), Some(n)) if o != n)
 }
 
 trait DaemonEventSender {
@@ -704,6 +782,47 @@ pub fn worker_main(
 }
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+
+    impl DaemonEventSender for Recorder {
+        fn send_event(&self, event: DaemonEvent) -> Result<(), ()> {
+            self.0.lock().unwrap().push(match event {
+                DaemonEvent::Notice(m) => format!("notice:{m}"),
+                DaemonEvent::Done { text, .. } => format!("done:{text}"),
+                _ => "other".into(),
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn edit_without_selection_notices_then_ends_empty() {
+        let rec = Recorder::default();
+        let cfg = crate::core::config::Config::default();
+        finish_edit(None, "make it shorter", &cfg, 1, 0.0, &rec, || None);
+        let ev = rec.0.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].starts_with("notice:") && ev[0].contains("Select text first"));
+        assert_eq!(ev[1], "done:");
+    }
+
+    #[test]
+    fn edit_without_instruction_only_ends_empty() {
+        let rec = Recorder::default();
+        let cfg = crate::core::config::Config::default();
+        finish_edit(None, "  ", &cfg, 1, 0.0, &rec, || None);
+        assert_eq!(*rec.0.lock().unwrap(), vec!["done:".to_string()]);
+    }
+
+    #[test]
+    fn selection_moved_only_when_ax_disagrees() {
+        assert!(selection_moved(Some("a"), Some("b".into())));
+        assert!(!selection_moved(Some("a"), Some("a".into())));
+        assert!(!selection_moved(Some("a"), None));
+        assert!(!selection_moved(None, Some("b".into())));
+    }
+
     #[test]
     fn stage_times_line_lists_every_stage() {
         let t = super::StageTimes {

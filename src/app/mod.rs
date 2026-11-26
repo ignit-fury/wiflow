@@ -28,6 +28,7 @@ fn daemon_event_variant_name(ev: &DaemonEvent) -> &'static str {
         DaemonEvent::Failed { .. } => "Failed",
         DaemonEvent::CleanupIssue { .. } => "CleanupIssue",
         DaemonEvent::OpenWindow => "OpenWindow",
+        DaemonEvent::Notice(_) => "Notice",
     }
 }
 
@@ -1258,6 +1259,10 @@ impl winit::application::ApplicationHandler<DaemonEvent> for DaemonApp {
             }
             DaemonEvent::TapIssue(msg) => match crate::ui::notify::notify("wiflow", msg) {
                 Ok(()) => tracing::info!("notification posted (tap issue)"),
+                Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
+            },
+            DaemonEvent::Notice(msg) => match crate::ui::notify::notify("wiflow", msg) {
+                Ok(()) => tracing::info!("notification posted (notice)"),
                 Err(e) => tracing::info!("notification failed ({e}) — tray note stands"),
             },
             _ => {}
