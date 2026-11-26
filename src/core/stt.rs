@@ -175,11 +175,38 @@ pub fn transcribe_shared(
     if !hit {
         *guard = Some((model_path.to_path_buf(), Stt::load(model_path)?));
     }
+    STT_USED_MS.store(
+        crate::core::cleanup::now_ms(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     guard
         .as_mut()
         .expect("slot just filled")
         .1
         .transcribe(samples, initial_prompt, language)
+}
+
+/// When the shared model last ran, in ms since the epoch (0 = never).
+static STT_USED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run one throwaway transcription so the next real one is fast: the first
+/// run after model load or a long break is 2-5x slower (cold Metal state).
+/// The clip is 2 s of faint noise, not silence: digital silence sends the
+/// decoder into a ~3 s retry loop, faint noise returns in ~35 ms.
+pub fn warm(model_path: &Path, language: &str) -> Result<(), String> {
+    let noise: Vec<f32> = (0..32_000)
+        .map(|i| 0.002 * ((i * 7919 % 1000) as f32 / 500.0 - 1.0))
+        .collect();
+    transcribe_shared(model_path, &noise, "", language).map(|_| ())
+}
+
+/// True when the model has not run for a while (same break length as the
+/// Ollama wake-up).
+pub fn idle() -> bool {
+    crate::core::cleanup::idle_long(
+        STT_USED_MS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::core::cleanup::now_ms(),
+    )
 }
 
 /// Read the initial-prompt vocabulary (prompt.txt); missing file → empty.

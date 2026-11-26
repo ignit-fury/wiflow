@@ -16,6 +16,19 @@ Phases (user-specified):
       pass; 20-cycle manual physical Fn test → AWAITING USER)
 
 ## Root cause
+**Update 2026-11-13: found and fixed (cpal bug).** With a mic chosen by name
+(menu or Settings, e.g. "MacBook Air Microphone"), cpal 0.15.3 registered a
+device-disconnect listener whose closure held a strong clone of the stream,
+stored inside the stream itself. That reference cycle meant dropping the
+stream never stopped the AudioUnit: the mic stayed on (orange dot), kept
+recording, and leaked a ~4.5 MB ring buffer on every hold. The log still
+said "mic released" because that line is printed after our drop, not by
+CoreAudio. "System default" mic was unaffected (cpal adds no listener there),
+which is why it came and went with the mic setting. Fix: cpal 0.16 (the
+listener holds a weak reference). Hardware test:
+`cargo test named_mic -- --ignored` (fails on 0.15.3, passes on 0.16).
+
+Older notes below.
 TBD — working hypothesis under test (see evidence). Established so far:
 PttUp is lost **before** `user_event` (tray stays `Recording`, worker keeps
 `capture` → mic stuck). Every automatable layer of the chain is proven

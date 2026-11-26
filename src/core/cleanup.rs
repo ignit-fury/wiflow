@@ -102,7 +102,7 @@ static OLLAMA_USED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// against 0.2–0.3 s back to back, even with the model pinned.
 const OLLAMA_IDLE_MS: u64 = 5 * 60 * 1000;
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -136,7 +136,7 @@ pub fn wake_ollama_if_idle(cfg: &crate::core::config::Config) {
     }
 }
 
-fn idle_long(last_ms: u64, now_ms: u64) -> bool {
+pub(crate) fn idle_long(last_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(last_ms) > OLLAMA_IDLE_MS
 }
 

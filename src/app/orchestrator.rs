@@ -120,6 +120,8 @@ impl<M: MediaController> Orchestrator<M> {
             } => self.handle_done(text, *duration_ms, *rtf),
             DaemonEvent::Failed(msg) => self.handle_failed(msg),
             DaemonEvent::CleanupIssue(msg) => self.handle_cleanup_issue(msg),
+            // App-shell concern, never reaches the dictation lifecycle.
+            DaemonEvent::OpenWindow => Vec::new(),
         }
     }
 
